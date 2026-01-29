@@ -362,10 +362,16 @@ def animate_ice_ship(
     bonds: list,
     ship_outline: np.ndarray,
     ship_pos: np.ndarray,
+    initial_centroids: np.ndarray,
     output_file: str = 'dpdem_ice_ship.gif',
     fps: int = 20,
 ):
-    """Create animation of ice-ship interaction."""
+    """
+    Create animation of ice-ship interaction.
+    
+    The ice starts as one solid coherent sheet (level ice).
+    Cracks appear only where bonds have broken.
+    """
     
     n_frames = len(positions_history)
     n_floes = len(polygons)
@@ -388,19 +394,19 @@ def animate_ice_ship(
     
     # Colors
     water_color = '#1A4D70'
-    ice_color = '#C8E4F0'
-    ice_edge = '#4080A0'
-    broken_ice = '#E0E8EC'
-    bond_color = '#2060A0'
+    ice_color = '#D8EAF3'          # Solid ice
+    ice_edge_intact = '#D8EAF3'    # No visible edge when bonded
+    ice_edge_broken = '#4080A0'    # Visible edge when broken
+    crack_color = '#1A4D70'        # Cracks show water underneath
     ship_color = '#404040'
     
-    def get_bonded_floes(intact):
-        bonded = set()
+    def get_broken_edges(intact):
+        """Find which floe pairs have broken bonds (show as cracks)."""
+        broken_pairs = set()
         for b, (i, j) in enumerate(bonds):
-            if intact[b]:
-                bonded.add(i)
-                bonded.add(j)
-        return bonded
+            if not intact[b]:
+                broken_pairs.add((min(i, j), max(i, j)))
+        return broken_pairs
     
     def rotate_polygon(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -417,38 +423,81 @@ def animate_ice_ship(
         positions = positions_history[frame]
         rotations = rotations_history[frame]
         intact = bonds_history[frame]
-        bonded_floes = get_bonded_floes(intact)
+        broken_edges = get_broken_edges(intact)
+        n_broken = len(broken_edges)
         
-        # Draw bonds
-        bond_lines = []
-        for b, (i, j) in enumerate(bonds):
-            if intact[b]:
-                p1, p2 = positions[i], positions[j]
-                bond_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+        # Check which floes have separated significantly
+        def is_separated(i):
+            """Check if floe has moved away from neighbors."""
+            for b, (bi, bj) in enumerate(bonds):
+                if bi == i or bj == i:
+                    other = bj if bi == i else bi
+                    init_dist = np.linalg.norm(initial_centroids[i] - initial_centroids[other])
+                    curr_dist = np.linalg.norm(positions[i] - positions[other])
+                    if curr_dist > init_dist * 1.5:  # Moved apart by 50%
+                        return True
+            return False
         
-        if bond_lines:
-            lc = LineCollection(bond_lines, colors=bond_color,
-                              linewidths=2.5, alpha=0.8, zorder=2)
-            ax.add_collection(lc)
-        
-        # Draw ice floes as polygons
+        # First pass: Draw solid ice background (convex hull of all floes)
+        # This fills gaps between Voronoi cells
+        from scipy.spatial import ConvexHull
+        all_vertices = []
         for i in range(n_floes):
-            # Rotate and translate polygon
+            rotated = rotate_polygon(local_polys[i], rotations[i])
+            world_poly = rotated + positions[i]
+            all_vertices.extend(world_poly)
+        all_vertices = np.array(all_vertices)
+        
+        try:
+            hull = ConvexHull(all_vertices)
+            hull_points = all_vertices[hull.vertices]
+            hull_patch = MplPolygon(
+                hull_points,
+                facecolor=ice_color,
+                edgecolor=ice_color,
+                linewidth=0,
+                zorder=1,
+                alpha=1.0
+            )
+            ax.add_patch(hull_patch)
+        except:
+            pass
+        
+        # Second pass: Draw individual floes on top
+        # Only show edges for separated floes
+        for i in range(n_floes):
             rotated = rotate_polygon(local_polys[i], rotations[i])
             world_poly = rotated + positions[i]
             
-            is_bonded = i in bonded_floes
-            color = ice_color if is_bonded else broken_ice
+            separated = is_separated(i)
             
-            patch = MplPolygon(
-                world_poly,
-                facecolor=color,
-                edgecolor=ice_edge,
-                linewidth=1.5,
-                zorder=3,
-                alpha=0.9
-            )
-            ax.add_patch(patch)
+            if separated:
+                # Separated floe - show distinct edges
+                patch = MplPolygon(
+                    world_poly,
+                    facecolor=ice_color,
+                    edgecolor='#5090B0',
+                    linewidth=1.5,
+                    zorder=5,
+                    alpha=1.0
+                )
+                ax.add_patch(patch)
+        
+        # Draw cracks where bonds have broken
+        crack_lines = []
+        for b, (i, j) in enumerate(bonds):
+            if not intact[b]:
+                p1, p2 = positions[i], positions[j]
+                # Only draw crack if floes haven't fully separated
+                dist = np.linalg.norm(p1 - p2)
+                init_dist = np.linalg.norm(initial_centroids[i] - initial_centroids[j])
+                if dist < init_dist * 2.0:  # Still close enough to show crack
+                    crack_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+        
+        if crack_lines:
+            lc = LineCollection(crack_lines, colors='#1A4D70',
+                              linewidths=2.5, alpha=0.9, zorder=4)
+            ax.add_collection(lc)
         
         # Draw ship
         ship_patch = MplPolygon(
@@ -463,17 +512,18 @@ def animate_ice_ship(
         # Stats
         n_intact = int(intact.sum())
         n_total = len(intact)
-        pct = 100 * n_intact / n_total if n_total > 0 else 0
+        n_broken = n_total - n_intact
+        pct_broken = 100 * n_broken / n_total if n_total > 0 else 0
         
         ax.set_xlabel('X [m]', fontsize=11)
         ax.set_ylabel('Y [m]', fontsize=11)
         ax.set_title(
-            f'DPDEM: Ice-Ship Interaction (Voronoi Ice Floes)\n'
+            f'DPDEM: Level Ice Fracture on Ship Impact\n'
             f'Frame {frame}/{n_frames-1} | '
-            f'Intact bonds: {n_intact}/{n_total} ({pct:.0f}%)',
+            f'Cracks: {n_broken}/{n_total} ({pct_broken:.0f}%)',
             fontsize=13, fontweight='bold'
         )
-        ax.grid(True, alpha=0.2, color='white', linestyle='--')
+        ax.grid(True, alpha=0.15, color='white', linestyle='--')
         
         return []
     
@@ -542,6 +592,7 @@ def main():
         bonds=bonds,
         ship_outline=ship_outline,
         ship_pos=ship_pos,
+        initial_centroids=centroids,
         output_file='dpdem_ice_ship.gif',
         fps=20,
     )
