@@ -231,13 +231,16 @@ def simulate_ice_ship_interaction(
     # Bond state
     bond_intact = np.ones(len(bonds), dtype=bool)
     
+    # Track which floes have contacted the ship
+    has_contacted_ship = np.zeros(n, dtype=bool)
+    
     # Compute floe masses and radii
     masses = np.array([compute_floe_area(p) * 0.5 * 920 for p in polygons])
     radii = np.array([np.sqrt(compute_floe_area(p) / np.pi) for p in polygons])
     
-    # Bond properties
-    bond_stiffness = 1e6
-    bond_strength = 1e5
+    # Bond properties - very strong bonds that only break on ship impact
+    bond_stiffness = 5e6   # Stiffer bonds
+    bond_strength = 5e6    # Very high - won't break from drift alone
     
     positions_history = [positions.copy()]
     rotations_history = [rotations.copy()]
@@ -245,8 +248,58 @@ def simulate_ice_ship_interaction(
     
     for frame in range(n_frames):
         forces = np.zeros_like(positions)
+        ship_contact_force = np.zeros(n)  # Track ship collision force per floe
         
-        # 1. Bond forces
+        # 1. Ship collision FIRST - to know which floes are being stressed
+        ship_left = ship_pos[0] - ship_length/2
+        ship_right = ship_pos[0] + ship_length/2
+        ship_bottom = ship_pos[1] - ship_beam/2
+        ship_top = ship_pos[1] + ship_beam/2
+        
+        for i in range(n):
+            px, py = positions[i]
+            r = radii[i]
+            
+            # Simple AABB collision
+            if (px + r > ship_left and px - r < ship_right and
+                py + r > ship_bottom and py - r < ship_top):
+                
+                has_contacted_ship[i] = True
+                
+                # Find penetration direction
+                dx_left = (px + r) - ship_left
+                dx_right = ship_right - (px - r)
+                dy_bottom = (py + r) - ship_bottom
+                dy_top = ship_top - (py - r)
+                
+                pen = min(dx_left, dx_right, dy_bottom, dy_top)
+                
+                if pen > 0:
+                    ship_contact_force[i] = 5e6 * pen
+                    # Push away from closest edge
+                    if pen == dx_left:
+                        forces[i, 0] -= 5e6 * pen
+                    elif pen == dx_right:
+                        forces[i, 0] += 5e6 * pen
+                    elif pen == dy_bottom:
+                        forces[i, 1] -= 5e6 * pen
+                    else:
+                        forces[i, 1] += 5e6 * pen
+        
+        # Propagate "contacted" status through bonds
+        changed = True
+        while changed:
+            changed = False
+            for b, (i, j) in enumerate(bonds):
+                if bond_intact[b]:
+                    if has_contacted_ship[i] and not has_contacted_ship[j]:
+                        has_contacted_ship[j] = True
+                        changed = True
+                    elif has_contacted_ship[j] and not has_contacted_ship[i]:
+                        has_contacted_ship[i] = True
+                        changed = True
+        
+        # 2. Bond forces - only check fracture for floes that have contacted ship
         for b, (i, j) in enumerate(bonds):
             if not bond_intact[b]:
                 continue
@@ -262,46 +315,17 @@ def simulate_ice_ship_interaction(
             stretch = dist - rest_len
             force_mag = bond_stiffness * stretch
             
-            # Check fracture
-            if abs(force_mag) > bond_strength:
-                bond_intact[b] = False
-                continue
+            # Only check fracture if at least one floe has contacted ship
+            # and there's actual stress in the bond
+            if has_contacted_ship[i] or has_contacted_ship[j]:
+                # Fracture threshold is lower when under ship stress
+                effective_strength = bond_strength * 0.02  # Much weaker when ship contact
+                if abs(force_mag) > effective_strength:
+                    bond_intact[b] = False
+                    continue
             
             forces[i] += force_mag * direction
             forces[j] -= force_mag * direction
-        
-        # 2. Ship collision
-        ship_left = ship_pos[0] - ship_length/2
-        ship_right = ship_pos[0] + ship_length/2
-        ship_bottom = ship_pos[1] - ship_beam/2
-        ship_top = ship_pos[1] + ship_beam/2
-        
-        for i in range(n):
-            px, py = positions[i]
-            r = radii[i]
-            
-            # Simple AABB collision
-            if (px + r > ship_left and px - r < ship_right and
-                py + r > ship_bottom and py - r < ship_top):
-                
-                # Find penetration direction
-                dx_left = (px + r) - ship_left
-                dx_right = ship_right - (px - r)
-                dy_bottom = (py + r) - ship_bottom
-                dy_top = ship_top - (py - r)
-                
-                pen = min(dx_left, dx_right, dy_bottom, dy_top)
-                
-                if pen > 0:
-                    # Push away from closest edge
-                    if pen == dx_left:
-                        forces[i, 0] -= 5e6 * pen
-                    elif pen == dx_right:
-                        forces[i, 0] += 5e6 * pen
-                    elif pen == dy_bottom:
-                        forces[i, 1] -= 5e6 * pen
-                    else:
-                        forces[i, 1] += 5e6 * pen
         
         # 3. Inter-floe contact (simple)
         for i in range(n):
@@ -554,7 +578,8 @@ def main():
     # Ship parameters (similar to R/V Xuelong proportions)
     ship_length = 35.0
     ship_beam = 8.0
-    ship_pos = np.array([field_width + ship_length/2 + 5, field_height / 2])
+    # Position ship closer to ice field
+    ship_pos = np.array([field_width + 8, field_height / 2])
     
     # Create ice field
     print("Generating Voronoi ice field...", flush=True)
@@ -566,7 +591,7 @@ def main():
     # Create ship hull with bow facing left (toward incoming ice)
     ship_outline = create_ship_hull(ship_length, ship_beam, 3.0, ship_pos, bow_direction='left')
     
-    # Run simulation
+    # Run simulation - longer to ensure ice reaches and impacts ship
     print("Running simulation...", flush=True)
     positions, rotations, bonds_intact = simulate_ice_ship_interaction(
         polygons=polygons,
@@ -575,9 +600,9 @@ def main():
         ship_pos=ship_pos,
         ship_length=ship_length,
         ship_beam=ship_beam,
-        n_frames=200,
+        n_frames=300,
         dt=0.05,
-        drift_vel=0.8,
+        drift_vel=1.2,  # Faster drift
     )
     
     n_final = bonds_intact[-1].sum()
