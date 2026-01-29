@@ -248,6 +248,80 @@ def find_connected_components(n, bonds, intact):
     return components
 
 
+def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_start=0.6):
+    """
+    Compute collision with ship hull including tapered bow.
+    Bow is at LEFT (negative x direction from ship center).
+    
+    Returns: (penetration_depth, normal_x, normal_y) or (0, 0, 0) if no collision
+    """
+    cx, cy = ship_pos
+    half_len = ship_length / 2
+    half_beam = ship_beam / 2
+    
+    # Ship spans from cx - half_len (bow tip) to cx + half_len (stern)
+    bow_x = cx - half_len
+    stern_x = cx + half_len
+    
+    # Relative position from ship center
+    rel_x = px - cx
+    rel_y = py - cy
+    
+    # x_rel: -1 at bow, +1 at stern
+    x_rel = rel_x / half_len
+    
+    # Compute local beam at this x position (taper at bow = left side = negative x_rel)
+    if x_rel < -bow_taper_start:  # Bow region (left side, x_rel < -0.6)
+        # t goes from 0 at taper start to 1 at bow tip
+        t = (-x_rel - bow_taper_start) / (1 - bow_taper_start)
+        t = min(t, 1.0)
+        local_half_beam = half_beam * (1 - 0.9 * t ** 1.5)
+        local_half_beam = max(local_half_beam, half_beam * 0.05)
+    else:
+        local_half_beam = half_beam
+    
+    # Check if outside ship x-bounds
+    if rel_x < -half_len or rel_x > half_len:
+        return 0, 0, 0
+    
+    # Check if outside ship y-bounds (accounting for taper)
+    if abs(rel_y) > local_half_beam:
+        return 0, 0, 0
+    
+    # Inside ship - compute penetration and push direction
+    # Distance to bow (left edge)
+    dist_to_bow = rel_x - (-half_len)  # How far from bow tip
+    # Distance to side
+    dist_to_side = local_half_beam - abs(rel_y)
+    
+    if x_rel < -bow_taper_start:
+        # In bow region - push along angled bow surface
+        t = (-x_rel - bow_taper_start) / (1 - bow_taper_start)
+        t = min(t, 1.0)
+        # Bow surface angle (steeper toward tip)
+        bow_angle = 0.3 + 0.5 * t  # Radians, roughly 20-45 degrees
+        
+        # Normal points outward from bow surface
+        if rel_y >= 0:
+            nx = -np.cos(bow_angle)
+            ny = np.sin(bow_angle)
+        else:
+            nx = -np.cos(bow_angle)
+            ny = -np.sin(bow_angle)
+        
+        pen = min(dist_to_bow, dist_to_side) + 0.5  # Add small offset
+    else:
+        # In main hull body - push to nearest edge
+        if dist_to_bow < dist_to_side:
+            nx, ny = -1, 0  # Push toward bow (left)
+            pen = dist_to_bow
+        else:
+            nx, ny = 0, 1 if rel_y > 0 else -1  # Push to side
+            pen = dist_to_side
+    
+    return max(pen, 0), nx, ny
+
+
 def simulate_ice_ship_interaction(
     polygons, centroids, bonds, ship_pos, ship_length, ship_beam,
     n_frames, dt, drift_vel
@@ -285,7 +359,8 @@ def simulate_ice_ship_interaction(
     bonds_history = [bond_intact.copy()]
     
     # Bond strength (from paper Table 1: σ = 0.6 MPa, C = 1.8 MPa)
-    bond_strength = 1e6  # Threshold force for fracture
+    # Lowered for demo to show more visible fracture
+    bond_strength = 5e5  # Threshold force for fracture
     
     for frame in range(n_frames):
         # 1. Find connected components (groups that move together)
@@ -295,43 +370,69 @@ def simulate_ice_ship_interaction(
         forces = np.zeros_like(positions)
         bond_stresses = np.zeros(len(bonds))
         
-        # Ship collision forces
-        ship_left = ship_pos[0] - ship_length/2
-        ship_right = ship_pos[0] + ship_length/2
-        ship_bottom = ship_pos[1] - ship_beam/2
-        ship_top = ship_pos[1] + ship_beam/2
-        
         ship_collision_force = np.zeros(n)
         
         for i in range(n):
             px, py = positions[i]
             r = radii[i]
             
-            # Check collision with ship bow (left side)
-            if px + r > ship_left and px - r < ship_right:
-                if py + r > ship_bottom and py - r < ship_top:
-                    # Penetration depth
-                    pen_x = (px + r) - ship_left
-                    
-                    if pen_x > 0:
-                        # Strong repulsion force from ship
-                        force_mag = 5e6 * pen_x
-                        forces[i, 0] -= force_mag
-                        ship_collision_force[i] = force_mag
+            # Check collision with ship using actual hull shape
+            # Check multiple points around the element
+            pen, nx, ny = point_to_ship_collision(
+                px, py, ship_pos, ship_length, ship_beam
+            )
+            
+            # Also check element boundary
+            if pen <= 0:
+                pen, nx, ny = point_to_ship_collision(
+                    px + r, py, ship_pos, ship_length, ship_beam
+                )
+            
+            if pen > 0:
+                # Strong repulsion force along hull normal
+                force_mag = 1e7 * pen
+                forces[i, 0] += force_mag * nx
+                forces[i, 1] += force_mag * ny
+                ship_collision_force[i] = force_mag
+                
+                # Extra sideways force to encourage flow around hull
+                # Push ice toward nearest side of ship
+                rel_y = py - ship_pos[1]
+                side_direction = 1 if rel_y > 0 else -1
+                side_push = 5e6 * pen * side_direction
+                forces[i, 1] += side_push
+                
+                # Apply torque to encourage rotation/flow
+                angular_vels[i] += 0.2 * side_direction * pen
+        
+        # Inter-element repulsion (prevents overlap, allows flow around obstacles)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = positions[j] - positions[i]
+                dist = np.linalg.norm(d)
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist and dist > 1e-6:
+                    overlap = min_dist - dist
+                    direction = d / dist
+                    # Repulsion force
+                    f = 2e5 * overlap ** 1.5 * direction
+                    forces[i] -= f
+                    forces[j] += f
         
         # Drift force (ice drifting toward ship)
         for comp in components:
             # Apply drift force to component center of mass
             total_mass = sum(masses[i] for i in comp)
-            drift_force = drift_vel * total_mass * 10
+            drift_force = drift_vel * total_mass * 8
             
             # Distribute to elements
             for i in comp:
                 forces[i, 0] += drift_force * masses[i] / total_mass
         
-        # Water drag
+        # Water drag (higher to slow down pileup)
         for i in range(n):
-            forces[i] -= 0.3 * velocities[i] * masses[i]
+            forces[i] -= 0.5 * velocities[i] * masses[i]
         
         # 3. Move connected components together
         new_velocities = velocities.copy()
@@ -389,14 +490,20 @@ def simulate_ice_ship_interaction(
             # Force transmitted through bond
             bond_force = 1e6 * stretch
             
-            # Add contribution from ship collision forces
-            if ship_collision_force[i] > 0 or ship_collision_force[j] > 0:
-                bond_force += max(ship_collision_force[i], ship_collision_force[j])
+            # Ship collision causes much easier fracture
+            # (ice is crushed/bent when hitting ship)
+            ship_force_on_bond = max(ship_collision_force[i], ship_collision_force[j])
+            if ship_force_on_bond > 0:
+                # Lower threshold when ship contact is involved
+                effective_strength = bond_strength * 0.1
+                bond_force += ship_force_on_bond * 0.5
+            else:
+                effective_strength = bond_strength
             
             bond_stresses[b] = bond_force
             
             # Fracture criterion (simplified version of Eq. 14)
-            if bond_force > bond_strength:
+            if bond_force > effective_strength:
                 bond_intact[b] = False
         
         # 5. Small rotation for visual effect
@@ -570,13 +677,14 @@ def main():
     
     # Ice field parameters
     n_elements = 100
-    field_width = 50.0
-    field_height = 40.0
+    field_width = 45.0
+    field_height = 35.0
     
     # Ship parameters
-    ship_length = 35.0
-    ship_beam = 8.0
-    ship_pos = np.array([field_width + 10, field_height / 2])
+    ship_length = 30.0
+    ship_beam = 7.0
+    # Start ship further away so we see approach
+    ship_pos = np.array([field_width + 25, field_height / 2])
     
     # Create Voronoi ice field
     print("Generating Voronoi ice field...", flush=True)
@@ -588,7 +696,7 @@ def main():
     # Create ship hull (bow facing left toward ice)
     ship_outline = create_ship_hull(ship_length, ship_beam, ship_pos, bow_direction='left')
     
-    # Run simulation
+    # Run simulation (longer to see full interaction)
     print("Running simulation...", flush=True)
     positions, rotations, bonds_intact = simulate_ice_ship_interaction(
         polygons=polygons,
@@ -597,9 +705,9 @@ def main():
         ship_pos=ship_pos,
         ship_length=ship_length,
         ship_beam=ship_beam,
-        n_frames=250,
+        n_frames=350,
         dt=0.05,
-        drift_vel=1.5,
+        drift_vel=2.0,  # Faster drift
     )
     
     n_final = bonds_intact[-1].sum()
