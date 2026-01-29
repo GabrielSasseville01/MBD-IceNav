@@ -43,82 +43,86 @@ def create_ice_field(
     seed: int = 42,
 ) -> tuple:
     """
-    Create ice field using Voronoi tessellation.
+    Create ice field as a grid of rectangular cells that perfectly tessellate.
+    Adds small random perturbation for natural look.
     
     Returns:
         polygons: List of (N, 2) polygon vertex arrays
         centroids: (n_floes, 2) centroid positions
         bonds: List of (i, j) tuples for adjacent floes
     """
-    from scipy.spatial import Voronoi
-    
     np.random.seed(seed)
     
-    # Generate seed points
-    points = np.random.rand(n_floes, 2)
-    points[:, 0] *= field_width
-    points[:, 1] *= field_height
+    # Create a grid that approximately gives n_floes cells
+    aspect = field_width / field_height
+    n_y = int(np.sqrt(n_floes / aspect))
+    n_x = int(n_floes / n_y)
     
-    # Add mirror points to bound all cells
-    mirrors = []
-    for dx in [-1, 0, 1]:
-        for dy in [-1, 0, 1]:
-            if dx == 0 and dy == 0:
-                continue
-            shifted = points.copy()
-            shifted[:, 0] += dx * field_width
-            shifted[:, 1] += dy * field_height
-            mirrors.append(shifted)
+    cell_w = field_width / n_x
+    cell_h = field_height / n_y
     
-    all_points = np.vstack([points] + mirrors)
-    vor = Voronoi(all_points)
-    
-    # Extract polygons for original points
     polygons = []
     centroids = []
+    grid_to_idx = {}  # (ix, iy) -> index
     
-    for i in range(n_floes):
-        region_idx = vor.point_region[i]
-        region = vor.regions[region_idx]
-        
-        if -1 in region or len(region) < 3:
-            continue
-        
-        vertices = vor.vertices[region]
-        
-        # Simple clip to domain
-        clipped = []
-        for v in vertices:
-            cx = np.clip(v[0], 0, field_width)
-            cy = np.clip(v[1], 0, field_height)
-            clipped.append([cx, cy])
-        clipped = np.array(clipped)
-        
-        if len(clipped) >= 3:
-            # Order vertices counter-clockwise
-            centroid = np.mean(clipped, axis=0)
-            angles = np.arctan2(clipped[:, 1] - centroid[1], 
-                              clipped[:, 0] - centroid[0])
-            order = np.argsort(angles)
-            clipped = clipped[order]
+    for iy in range(n_y):
+        for ix in range(n_x):
+            # Base rectangle corners
+            x0 = ix * cell_w
+            y0 = iy * cell_h
+            x1 = (ix + 1) * cell_w
+            y1 = (iy + 1) * cell_h
             
-            polygons.append(clipped)
-            centroids.append(centroid)
+            # Add small random perturbation to interior vertices for natural look
+            # But keep edges aligned for perfect tessellation
+            perturb = 0.15 * min(cell_w, cell_h)
+            
+            # Create polygon (rectangle with slight variation)
+            poly = np.array([
+                [x0, y0],
+                [x1, y0],
+                [x1, y1],
+                [x0, y1],
+            ])
+            
+            # Add centroid perturbation
+            cx = (x0 + x1) / 2 + np.random.uniform(-perturb, perturb)
+            cy = (y0 + y1) / 2 + np.random.uniform(-perturb, perturb)
+            
+            polygons.append(poly)
+            centroids.append([cx, cy])
+            grid_to_idx[(ix, iy)] = len(polygons) - 1
     
     centroids = np.array(centroids)
     
-    # Find adjacent floes
-    n = len(polygons)
+    # Create bonds between adjacent cells (4-connectivity)
     bonds = []
-    bond_threshold = max(field_width, field_height) / np.sqrt(n_floes) * 1.5
+    for iy in range(n_y):
+        for ix in range(n_x):
+            idx = grid_to_idx.get((ix, iy))
+            if idx is None:
+                continue
+            
+            # Right neighbor
+            right = grid_to_idx.get((ix + 1, iy))
+            if right is not None:
+                bonds.append((idx, right))
+            
+            # Top neighbor
+            top = grid_to_idx.get((ix, iy + 1))
+            if top is not None:
+                bonds.append((idx, top))
+            
+            # Diagonal neighbors for stronger bonding
+            top_right = grid_to_idx.get((ix + 1, iy + 1))
+            if top_right is not None:
+                bonds.append((idx, top_right))
+            
+            top_left = grid_to_idx.get((ix - 1, iy + 1))
+            if top_left is not None:
+                bonds.append((idx, top_left))
     
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.linalg.norm(centroids[i] - centroids[j])
-            if dist < bond_threshold:
-                bonds.append((i, j))
-    
-    print(f"  Generated {n} Voronoi cells, {len(bonds)} bonds", flush=True)
+    print(f"  Generated {len(polygons)} grid cells ({n_x}x{n_y}), {len(bonds)} bonds", flush=True)
     return polygons, centroids, bonds
 
 
@@ -462,33 +466,33 @@ def animate_ice_ship(
                         return True
             return False
         
-        # First pass: Draw solid ice background (convex hull of all floes)
-        # This fills gaps between Voronoi cells
-        from scipy.spatial import ConvexHull
-        all_vertices = []
-        for i in range(n_floes):
-            rotated = rotate_polygon(local_polys[i], rotations[i])
-            world_poly = rotated + positions[i]
-            all_vertices.extend(world_poly)
-        all_vertices = np.array(all_vertices)
+        # Draw ice: solid background rectangle, then individual floes on top
         
-        try:
-            hull = ConvexHull(all_vertices)
-            hull_points = all_vertices[hull.vertices]
-            hull_patch = MplPolygon(
-                hull_points,
+        # 1. Draw solid ice background (bounding box of all floes)
+        all_x = [positions[i][0] for i in range(n_floes)]
+        all_y = [positions[i][1] for i in range(n_floes)]
+        # Add cell size margin
+        cell_margin = 5
+        ice_bounds = np.array([
+            [min(all_x) - cell_margin, min(all_y) - cell_margin],
+            [max(all_x) + cell_margin, min(all_y) - cell_margin],
+            [max(all_x) + cell_margin, max(all_y) + cell_margin],
+            [min(all_x) - cell_margin, max(all_y) + cell_margin],
+        ])
+        
+        # Only draw solid background if ice sheet is mostly intact
+        if n_broken < len(bonds) * 0.3:
+            bg_patch = MplPolygon(
+                ice_bounds,
                 facecolor=ice_color,
                 edgecolor=ice_color,
                 linewidth=0,
-                zorder=1,
+                zorder=2,
                 alpha=1.0
             )
-            ax.add_patch(hull_patch)
-        except:
-            pass
+            ax.add_patch(bg_patch)
         
-        # Second pass: Draw individual floes on top
-        # Only show edges for separated floes
+        # 2. Draw separated floes with visible edges
         for i in range(n_floes):
             rotated = rotate_polygon(local_polys[i], rotations[i])
             world_poly = rotated + positions[i]
@@ -503,25 +507,26 @@ def animate_ice_ship(
                     edgecolor='#5090B0',
                     linewidth=1.5,
                     zorder=5,
-                    alpha=1.0
+                    alpha=0.95
                 )
                 ax.add_patch(patch)
         
-        # Draw cracks where bonds have broken
-        crack_lines = []
-        for b, (i, j) in enumerate(bonds):
-            if not intact[b]:
-                p1, p2 = positions[i], positions[j]
-                # Only draw crack if floes haven't fully separated
-                dist = np.linalg.norm(p1 - p2)
-                init_dist = np.linalg.norm(initial_centroids[i] - initial_centroids[j])
-                if dist < init_dist * 2.0:  # Still close enough to show crack
-                    crack_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
-        
-        if crack_lines:
-            lc = LineCollection(crack_lines, colors='#1A4D70',
-                              linewidths=2.5, alpha=0.9, zorder=4)
-            ax.add_collection(lc)
+        # Draw cracks where bonds have broken (only after first contact)
+        if n_broken > 5:  # Only show cracks after significant fracture
+            crack_lines = []
+            for b, (i, j) in enumerate(bonds):
+                if not intact[b]:
+                    p1, p2 = positions[i], positions[j]
+                    # Only draw crack if floes haven't fully separated
+                    dist = np.linalg.norm(p1 - p2)
+                    init_dist = np.linalg.norm(initial_centroids[i] - initial_centroids[j])
+                    if dist < init_dist * 2.0:  # Still close enough to show crack
+                        crack_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+            
+            if crack_lines:
+                lc = LineCollection(crack_lines, colors='#1A4D70',
+                                  linewidths=2.5, alpha=0.9, zorder=4)
+                ax.add_collection(lc)
         
         # Draw ship
         ship_patch = MplPolygon(
