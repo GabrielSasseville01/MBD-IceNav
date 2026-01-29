@@ -2,10 +2,13 @@
 """
 DPDEM Ice-Ship Interaction Visualization
 
-Visualizes ice floes (Voronoi polygons) drifting toward and colliding with a ship.
-Shows bond fracture when ice impacts the hull.
-
 Based on Wang et al. (2024) - Dilated-polyhedron-based DEM for ice-structure interactions.
+
+Key concepts from the paper:
+- Sea ice elements are irregular polygons generated via Voronoi tessellation (Fig. 2)
+- Adjacent elements are bonded together to represent frozen state (Section 2.1, Fig. 3)
+- Bonded elements move together as one mass until bonds break under stress
+- Fracture occurs when stress exceeds strength criterion (Eq. 14)
 """
 
 import numpy as np
@@ -13,161 +16,170 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
-from matplotlib.patches import Polygon as MplPolygon, FancyBboxPatch
-from matplotlib.collections import PatchCollection, LineCollection
-from mpl_toolkits.mplot3d import Axes3D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
-import sys
-import importlib.util
-
-# Import voronoi module directly to avoid broken dpdem/__init__.py
-spec = importlib.util.spec_from_file_location(
-    "voronoi", 
-    "dpdem/geometry/voronoi.py"
-)
-voronoi = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(voronoi)
-
-generate_voronoi_polygons = voronoi.generate_voronoi_polygons
-compute_polygon_centroid = voronoi.compute_polygon_centroid
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import LineCollection
+from scipy.spatial import Voronoi
+from scipy.ndimage import label
 
 
 # ============================================================================
-# Ice Floe Generation (Voronoi)
+# Voronoi Ice Field Generation (as per paper Section 2.1, Fig. 2)
 # ============================================================================
 
-def create_ice_field(
-    n_floes: int,
+def create_voronoi_ice_field(
+    n_elements: int,
     field_width: float,
     field_height: float,
     seed: int = 42,
 ) -> tuple:
     """
-    Create ice field as a grid of rectangular cells that perfectly tessellate.
-    Adds small random perturbation for natural look.
+    Create ice field using Voronoi tessellation as described in the paper.
+    
+    From paper Section 2.1:
+    "To replicate arbitrary morphological features of natural sea ice, 
+    a Voronoi cutting algorithm was employed to parametrically divide 
+    a two-dimensional plane into polygons."
     
     Returns:
         polygons: List of (N, 2) polygon vertex arrays
-        centroids: (n_floes, 2) centroid positions
-        bonds: List of (i, j) tuples for adjacent floes
+        centroids: (n, 2) array of element centers
+        bonds: List of (i, j) tuples for adjacent elements
     """
     np.random.seed(seed)
     
-    # Create a grid that approximately gives n_floes cells
-    aspect = field_width / field_height
-    n_y = int(np.sqrt(n_floes / aspect))
-    n_x = int(n_floes / n_y)
+    # Generate seed points with some regularity (jittered grid)
+    nx = int(np.sqrt(n_elements * field_width / field_height))
+    ny = int(n_elements / nx)
     
-    cell_w = field_width / n_x
-    cell_h = field_height / n_y
+    points = []
+    dx = field_width / nx
+    dy = field_height / ny
     
+    for i in range(nx):
+        for j in range(ny):
+            x = (i + 0.5) * dx + np.random.uniform(-0.3*dx, 0.3*dx)
+            y = (j + 0.5) * dy + np.random.uniform(-0.3*dy, 0.3*dy)
+            x = np.clip(x, 0.1, field_width - 0.1)
+            y = np.clip(y, 0.1, field_height - 0.1)
+            points.append([x, y])
+    
+    points = np.array(points)
+    n_actual = len(points)
+    
+    # Add mirror points to bound the Voronoi cells
+    mirrors = []
+    for dx_mult in [-1, 0, 1]:
+        for dy_mult in [-1, 0, 1]:
+            if dx_mult == 0 and dy_mult == 0:
+                continue
+            shifted = points.copy()
+            shifted[:, 0] += dx_mult * field_width
+            shifted[:, 1] += dy_mult * field_height
+            mirrors.append(shifted)
+    
+    all_points = np.vstack([points] + mirrors)
+    vor = Voronoi(all_points)
+    
+    # Extract polygons for original points only
     polygons = []
     centroids = []
-    grid_to_idx = {}  # (ix, iy) -> index
+    valid_idx = []  # Map from original index to polygon list index
     
-    for iy in range(n_y):
-        for ix in range(n_x):
-            # Base rectangle corners
-            x0 = ix * cell_w
-            y0 = iy * cell_h
-            x1 = (ix + 1) * cell_w
-            y1 = (iy + 1) * cell_h
-            
-            # Add small random perturbation to interior vertices for natural look
-            # But keep edges aligned for perfect tessellation
-            perturb = 0.15 * min(cell_w, cell_h)
-            
-            # Create polygon (rectangle with slight variation)
-            poly = np.array([
-                [x0, y0],
-                [x1, y0],
-                [x1, y1],
-                [x0, y1],
-            ])
-            
-            # Add centroid perturbation
-            cx = (x0 + x1) / 2 + np.random.uniform(-perturb, perturb)
-            cy = (y0 + y1) / 2 + np.random.uniform(-perturb, perturb)
-            
-            polygons.append(poly)
-            centroids.append([cx, cy])
-            grid_to_idx[(ix, iy)] = len(polygons) - 1
+    for i in range(n_actual):
+        region_idx = vor.point_region[i]
+        region = vor.regions[region_idx]
+        
+        if -1 in region or len(region) < 3:
+            continue
+        
+        verts = vor.vertices[region]
+        
+        # Clip to domain
+        clipped_verts = []
+        for v in verts:
+            cx = np.clip(v[0], 0, field_width)
+            cy = np.clip(v[1], 0, field_height)
+            clipped_verts.append([cx, cy])
+        clipped_verts = np.array(clipped_verts)
+        
+        if len(clipped_verts) < 3:
+            continue
+        
+        # Order vertices counter-clockwise
+        centroid = np.mean(clipped_verts, axis=0)
+        angles = np.arctan2(clipped_verts[:, 1] - centroid[1],
+                          clipped_verts[:, 0] - centroid[0])
+        order = np.argsort(angles)
+        clipped_verts = clipped_verts[order]
+        
+        # Check polygon area is reasonable
+        area = polygon_area(clipped_verts)
+        if area < 0.5:  # Skip tiny polygons
+            continue
+        
+        valid_idx.append(i)
+        polygons.append(clipped_verts)
+        centroids.append(centroid)
     
     centroids = np.array(centroids)
+    n_valid = len(polygons)
     
-    # Create bonds between adjacent cells (4-connectivity)
-    bonds = []
-    for iy in range(n_y):
-        for ix in range(n_x):
-            idx = grid_to_idx.get((ix, iy))
-            if idx is None:
-                continue
-            
-            # Right neighbor
-            right = grid_to_idx.get((ix + 1, iy))
-            if right is not None:
-                bonds.append((idx, right))
-            
-            # Top neighbor
-            top = grid_to_idx.get((ix, iy + 1))
-            if top is not None:
-                bonds.append((idx, top))
-            
-            # Diagonal neighbors for stronger bonding
-            top_right = grid_to_idx.get((ix + 1, iy + 1))
-            if top_right is not None:
-                bonds.append((idx, top_right))
-            
-            top_left = grid_to_idx.get((ix - 1, iy + 1))
-            if top_left is not None:
-                bonds.append((idx, top_left))
+    # Create bonds between adjacent elements (using ridge info from Voronoi)
+    # Two elements are adjacent if they share a Voronoi ridge
+    idx_to_poly = {valid_idx[i]: i for i in range(n_valid)}
+    bonds = set()
     
-    print(f"  Generated {len(polygons)} grid cells ({n_x}x{n_y}), {len(bonds)} bonds", flush=True)
+    for ridge_points in vor.ridge_points:
+        i, j = ridge_points
+        if i < n_actual and j < n_actual:
+            if i in idx_to_poly and j in idx_to_poly:
+                pi, pj = idx_to_poly[i], idx_to_poly[j]
+                bonds.add((min(pi, pj), max(pi, pj)))
+    
+    bonds = list(bonds)
+    
+    print(f"  Generated {n_valid} Voronoi elements, {len(bonds)} bonds", flush=True)
     return polygons, centroids, bonds
 
 
+def polygon_area(verts):
+    """Compute signed area of polygon using shoelace formula."""
+    n = len(verts)
+    area = 0
+    for i in range(n):
+        j = (i + 1) % n
+        area += verts[i, 0] * verts[j, 1]
+        area -= verts[j, 0] * verts[i, 1]
+    return abs(area) / 2
+
+
+def polygon_centroid(verts):
+    """Compute centroid of polygon."""
+    return np.mean(verts, axis=0)
+
+
 # ============================================================================
-# Ship Hull Generation
+# Ship Hull
 # ============================================================================
 
-def create_ship_hull(
-    length: float,
-    beam: float,
-    draft: float,
-    position: np.ndarray,
-    bow_direction: str = 'left',
-) -> tuple:
-    """
-    Create a simple icebreaker hull shape.
-    
-    Args:
-        bow_direction: 'left' or 'right' - which way the bow points
-    
-    Returns:
-        hull_outline: (N, 2) array for 2D top-down view
-    """
+def create_ship_hull(length, beam, position, bow_direction='left'):
+    """Create ship hull outline (2D top-down view)."""
     cx, cy = position
-    
-    # 2D hull outline (top-down view) with bow taper
     n_pts = 30
-    hull_x = []
-    hull_y = []
+    hull_x, hull_y = [], []
     
-    # Starboard side (positive y)
+    # Starboard side
     for i in range(n_pts + 1):
-        t = i / n_pts  # 0 to 1 from stern to bow
-        
+        t = i / n_pts
         if bow_direction == 'left':
-            # Bow at negative x (left side)
             x = cx + length/2 - t * length
-            x_rel = -(x - cx) / (length/2)  # Flip relative position
+            x_rel = -(x - cx) / (length/2)
         else:
-            # Bow at positive x (right side)
             x = cx - length/2 + t * length
             x_rel = (x - cx) / (length/2)
         
         # Taper at bow
-        if x_rel > 0.6:  # Bow region
+        if x_rel > 0.6:
             taper = 1.0 - 0.9 * ((x_rel - 0.6) / 0.4) ** 1.5
         else:
             taper = 1.0
@@ -176,10 +188,9 @@ def create_ship_hull(
         hull_x.append(x)
         hull_y.append(cy + beam/2 * taper)
     
-    # Port side (negative y)
+    # Port side
     for i in range(n_pts, -1, -1):
         t = i / n_pts
-        
         if bow_direction == 'left':
             x = cx + length/2 - t * length
             x_rel = -(x - cx) / (length/2)
@@ -196,35 +207,64 @@ def create_ship_hull(
         hull_x.append(x)
         hull_y.append(cy - beam/2 * taper)
     
-    hull_outline = np.column_stack([hull_x, hull_y])
-    
-    return hull_outline
+    return np.column_stack([hull_x, hull_y])
 
 
 # ============================================================================
 # Physics Simulation
 # ============================================================================
 
+def find_connected_components(n, bonds, intact):
+    """Find connected components of bonded elements."""
+    # Build adjacency list for intact bonds only
+    adj = {i: [] for i in range(n)}
+    for b, (i, j) in enumerate(bonds):
+        if intact[b]:
+            adj[i].append(j)
+            adj[j].append(i)
+    
+    # BFS to find components
+    visited = set()
+    components = []
+    
+    for start in range(n):
+        if start in visited:
+            continue
+        
+        component = []
+        queue = [start]
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            for neighbor in adj[node]:
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        
+        components.append(component)
+    
+    return components
+
+
 def simulate_ice_ship_interaction(
-    polygons: list,
-    centroids: np.ndarray,
-    bonds: list,
-    ship_pos: np.ndarray,
-    ship_length: float,
-    ship_beam: float,
-    n_frames: int,
-    dt: float,
-    drift_vel: float,
-) -> tuple:
+    polygons, centroids, bonds, ship_pos, ship_length, ship_beam,
+    n_frames, dt, drift_vel
+):
     """
     Simulate ice drifting toward ship with bond fracture.
     
-    Returns:
-        positions_history: List of (n, 2) position arrays
-        rotations_history: List of (n,) rotation angle arrays
-        bonds_history: List of intact bond masks
+    Key physics from paper:
+    - Bonded elements move together as rigid bodies
+    - When stress exceeds strength (Eq. 14), bonds break
+    - Broken elements then move independently
     """
     n = len(polygons)
+    
+    # Compute masses and effective radii
+    masses = np.array([polygon_area(p) * 0.5 * 920 for p in polygons])
+    radii = np.array([np.sqrt(polygon_area(p) / np.pi) for p in polygons])
     
     # State
     positions = centroids.copy()
@@ -232,132 +272,136 @@ def simulate_ice_ship_interaction(
     rotations = np.zeros(n)
     angular_vels = np.zeros(n)
     
-    # Bond state
+    # Bond state - all start intact (frozen ice)
     bond_intact = np.ones(len(bonds), dtype=bool)
     
-    # Track which floes have contacted the ship
-    has_contacted_ship = np.zeros(n, dtype=bool)
+    # Initial rest lengths for bonds
+    rest_lengths = np.array([np.linalg.norm(centroids[i] - centroids[j]) 
+                            for i, j in bonds])
     
-    # Compute floe masses and radii
-    masses = np.array([compute_floe_area(p) * 0.5 * 920 for p in polygons])
-    radii = np.array([np.sqrt(compute_floe_area(p) / np.pi) for p in polygons])
-    
-    # Bond properties - very strong bonds that only break on ship impact
-    bond_stiffness = 5e6   # Stiffer bonds
-    bond_strength = 5e6    # Very high - won't break from drift alone
-    
+    # History
     positions_history = [positions.copy()]
     rotations_history = [rotations.copy()]
     bonds_history = [bond_intact.copy()]
     
+    # Bond strength (from paper Table 1: σ = 0.6 MPa, C = 1.8 MPa)
+    bond_strength = 1e6  # Threshold force for fracture
+    
     for frame in range(n_frames):
-        forces = np.zeros_like(positions)
-        ship_contact_force = np.zeros(n)  # Track ship collision force per floe
+        # 1. Find connected components (groups that move together)
+        components = find_connected_components(n, bonds, bond_intact)
         
-        # 1. Ship collision FIRST - to know which floes are being stressed
+        # 2. Compute forces on each element
+        forces = np.zeros_like(positions)
+        bond_stresses = np.zeros(len(bonds))
+        
+        # Ship collision forces
         ship_left = ship_pos[0] - ship_length/2
         ship_right = ship_pos[0] + ship_length/2
         ship_bottom = ship_pos[1] - ship_beam/2
         ship_top = ship_pos[1] + ship_beam/2
         
+        ship_collision_force = np.zeros(n)
+        
         for i in range(n):
             px, py = positions[i]
             r = radii[i]
             
-            # Simple AABB collision
-            if (px + r > ship_left and px - r < ship_right and
-                py + r > ship_bottom and py - r < ship_top):
-                
-                has_contacted_ship[i] = True
-                
-                # Find penetration direction
-                dx_left = (px + r) - ship_left
-                dx_right = ship_right - (px - r)
-                dy_bottom = (py + r) - ship_bottom
-                dy_top = ship_top - (py - r)
-                
-                pen = min(dx_left, dx_right, dy_bottom, dy_top)
-                
-                if pen > 0:
-                    ship_contact_force[i] = 5e6 * pen
-                    # Push away from closest edge
-                    if pen == dx_left:
-                        forces[i, 0] -= 5e6 * pen
-                    elif pen == dx_right:
-                        forces[i, 0] += 5e6 * pen
-                    elif pen == dy_bottom:
-                        forces[i, 1] -= 5e6 * pen
-                    else:
-                        forces[i, 1] += 5e6 * pen
+            # Check collision with ship bow (left side)
+            if px + r > ship_left and px - r < ship_right:
+                if py + r > ship_bottom and py - r < ship_top:
+                    # Penetration depth
+                    pen_x = (px + r) - ship_left
+                    
+                    if pen_x > 0:
+                        # Strong repulsion force from ship
+                        force_mag = 5e6 * pen_x
+                        forces[i, 0] -= force_mag
+                        ship_collision_force[i] = force_mag
         
-        # Propagate "contacted" status through bonds
-        changed = True
-        while changed:
-            changed = False
-            for b, (i, j) in enumerate(bonds):
-                if bond_intact[b]:
-                    if has_contacted_ship[i] and not has_contacted_ship[j]:
-                        has_contacted_ship[j] = True
-                        changed = True
-                    elif has_contacted_ship[j] and not has_contacted_ship[i]:
-                        has_contacted_ship[i] = True
-                        changed = True
+        # Drift force (ice drifting toward ship)
+        for comp in components:
+            # Apply drift force to component center of mass
+            total_mass = sum(masses[i] for i in comp)
+            drift_force = drift_vel * total_mass * 10
+            
+            # Distribute to elements
+            for i in comp:
+                forces[i, 0] += drift_force * masses[i] / total_mass
         
-        # 2. Bond forces - only check fracture for floes that have contacted ship
+        # Water drag
+        for i in range(n):
+            forces[i] -= 0.3 * velocities[i] * masses[i]
+        
+        # 3. Move connected components together
+        new_velocities = velocities.copy()
+        new_positions = positions.copy()
+        
+        for comp in components:
+            if len(comp) == 1:
+                # Single element - simple integration
+                i = comp[0]
+                accel = forces[i] / masses[i]
+                new_velocities[i] += accel * dt
+                new_velocities[i] = np.clip(new_velocities[i], -20, 20)
+                new_positions[i] += new_velocities[i] * dt
+            else:
+                # Multi-element component - move as rigid body
+                # Compute center of mass
+                total_mass = sum(masses[i] for i in comp)
+                com = sum(masses[i] * positions[i] for i in comp) / total_mass
+                
+                # Total force on component
+                total_force = sum(forces[i] for i in comp)
+                
+                # Component velocity (average weighted by mass)
+                comp_vel = sum(masses[i] * velocities[i] for i in comp) / total_mass
+                
+                # Update component velocity
+                accel = total_force / total_mass
+                comp_vel += accel * dt
+                comp_vel = np.clip(comp_vel, -20, 20)
+                
+                # Move all elements in component together
+                for i in comp:
+                    new_velocities[i] = comp_vel
+                    # Maintain relative position within component
+                    rel_pos = positions[i] - com
+                    new_com = com + comp_vel * dt
+                    new_positions[i] = new_com + rel_pos
+        
+        velocities = new_velocities
+        positions = new_positions
+        
+        # 4. Check for bond fracture
+        # Bonds break when stress exceeds strength (Eq. 14 in paper)
         for b, (i, j) in enumerate(bonds):
             if not bond_intact[b]:
                 continue
             
+            # Compute stress on bond
             d = positions[j] - positions[i]
             dist = np.linalg.norm(d)
-            rest_len = np.linalg.norm(centroids[j] - centroids[i])
             
-            if dist < 1e-6:
-                continue
+            # Change in distance from rest
+            stretch = abs(dist - rest_lengths[b])
             
-            direction = d / dist
-            stretch = dist - rest_len
-            force_mag = bond_stiffness * stretch
+            # Force transmitted through bond
+            bond_force = 1e6 * stretch
             
-            # Only check fracture if at least one floe has contacted ship
-            # and there's actual stress in the bond
-            if has_contacted_ship[i] or has_contacted_ship[j]:
-                # Fracture threshold is lower when under ship stress
-                effective_strength = bond_strength * 0.02  # Much weaker when ship contact
-                if abs(force_mag) > effective_strength:
-                    bond_intact[b] = False
-                    continue
+            # Add contribution from ship collision forces
+            if ship_collision_force[i] > 0 or ship_collision_force[j] > 0:
+                bond_force += max(ship_collision_force[i], ship_collision_force[j])
             
-            forces[i] += force_mag * direction
-            forces[j] -= force_mag * direction
+            bond_stresses[b] = bond_force
+            
+            # Fracture criterion (simplified version of Eq. 14)
+            if bond_force > bond_strength:
+                bond_intact[b] = False
         
-        # 3. Inter-floe contact (simple)
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = positions[j] - positions[i]
-                dist = np.linalg.norm(d)
-                overlap = radii[i] + radii[j] - dist
-                
-                if overlap > 0 and dist > 1e-6:
-                    direction = d / dist
-                    f = 1e5 * overlap ** 1.5 * direction
-                    forces[i] -= f
-                    forces[j] += f
-        
-        # 4. Drift force
-        forces[:, 0] += drift_vel * masses * 5
-        
-        # 5. Damping (water resistance)
-        forces -= 0.5 * velocities * masses[:, None]
-        
-        # 6. Integration
-        accel = forces / masses[:, None]
-        velocities += accel * dt
-        velocities = np.clip(velocities, -20, 20)
-        positions += velocities * dt
-        
-        # Small random rotation for visual interest
-        angular_vels += (np.random.randn(n) * 0.01 - angular_vels * 0.1) * dt
+        # 5. Small rotation for visual effect
+        angular_vels += np.random.randn(n) * 0.005
+        angular_vels *= 0.95  # Damping
         rotations += angular_vels * dt
         
         positions_history.append(positions.copy())
@@ -367,47 +411,29 @@ def simulate_ice_ship_interaction(
     return positions_history, rotations_history, bonds_history
 
 
-def compute_floe_area(polygon):
-    """Compute area of polygon."""
-    n = len(polygon)
-    area = 0
-    for i in range(n):
-        j = (i + 1) % n
-        area += polygon[i, 0] * polygon[j, 1]
-        area -= polygon[j, 0] * polygon[i, 1]
-    return abs(area) / 2
-
-
 # ============================================================================
 # Visualization
 # ============================================================================
 
 def animate_ice_ship(
-    polygons: list,
-    positions_history: list,
-    rotations_history: list,
-    bonds_history: list,
-    bonds: list,
-    ship_outline: np.ndarray,
-    ship_pos: np.ndarray,
-    initial_centroids: np.ndarray,
-    output_file: str = 'dpdem_ice_ship.gif',
-    fps: int = 20,
+    polygons, positions_history, rotations_history, bonds_history, bonds,
+    ship_outline, initial_centroids, output_file='dpdem_ice_ship.gif', fps=20
 ):
     """
-    Create animation of ice-ship interaction.
+    Animate ice-ship interaction.
     
-    The ice starts as one solid coherent sheet (level ice).
-    Cracks appear only where bonds have broken.
+    Visualization approach:
+    - Draw actual Voronoi polygon shapes
+    - Bonded elements appear as one continuous mass (no visible boundaries)
+    - Broken bonds show as visible cracks/edges
     """
-    
     n_frames = len(positions_history)
-    n_floes = len(polygons)
+    n_elements = len(polygons)
     
     # Compute local polygons (centered at origin)
     local_polys = []
     for poly in polygons:
-        centroid = compute_polygon_centroid(poly)
+        centroid = polygon_centroid(poly)
         local_polys.append(poly - centroid)
     
     # Domain bounds
@@ -417,24 +443,13 @@ def animate_ice_ship(
     y_min = min(all_pos[:, 1].min(), ship_outline[:, 1].min()) - 5
     y_max = max(all_pos[:, 1].max(), ship_outline[:, 1].max()) + 5
     
-    # Create figure
     fig, ax = plt.subplots(figsize=(14, 10))
     
     # Colors
     water_color = '#1A4D70'
-    ice_color = '#D8EAF3'          # Solid ice
-    ice_edge_intact = '#D8EAF3'    # No visible edge when bonded
-    ice_edge_broken = '#4080A0'    # Visible edge when broken
-    crack_color = '#1A4D70'        # Cracks show water underneath
+    ice_color = '#D8EAF3'
+    crack_color = '#2A5D80'
     ship_color = '#404040'
-    
-    def get_broken_edges(intact):
-        """Find which floe pairs have broken bonds (show as cracks)."""
-        broken_pairs = set()
-        for b, (i, j) in enumerate(bonds):
-            if not intact[b]:
-                broken_pairs.add((min(i, j), max(i, j)))
-        return broken_pairs
     
     def rotate_polygon(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -451,84 +466,63 @@ def animate_ice_ship(
         positions = positions_history[frame]
         rotations = rotations_history[frame]
         intact = bonds_history[frame]
-        broken_edges = get_broken_edges(intact)
-        n_broken = len(broken_edges)
         
-        # Check which floes have separated significantly
-        def is_separated(i):
-            """Check if floe has moved away from neighbors."""
-            for b, (bi, bj) in enumerate(bonds):
-                if bi == i or bj == i:
-                    other = bj if bi == i else bi
-                    init_dist = np.linalg.norm(initial_centroids[i] - initial_centroids[other])
-                    curr_dist = np.linalg.norm(positions[i] - positions[other])
-                    if curr_dist > init_dist * 1.5:  # Moved apart by 50%
-                        return True
-            return False
+        # Build set of broken bonds for each element
+        broken_neighbors = {i: set() for i in range(n_elements)}
+        for b, (i, j) in enumerate(bonds):
+            if not intact[b]:
+                broken_neighbors[i].add(j)
+                broken_neighbors[j].add(i)
         
-        # Draw ice: solid background rectangle, then individual floes on top
-        
-        # 1. Draw solid ice background (bounding box of all floes)
-        all_x = [positions[i][0] for i in range(n_floes)]
-        all_y = [positions[i][1] for i in range(n_floes)]
-        # Add cell size margin
-        cell_margin = 5
-        ice_bounds = np.array([
-            [min(all_x) - cell_margin, min(all_y) - cell_margin],
-            [max(all_x) + cell_margin, min(all_y) - cell_margin],
-            [max(all_x) + cell_margin, max(all_y) + cell_margin],
-            [min(all_x) - cell_margin, max(all_y) + cell_margin],
-        ])
-        
-        # Only draw solid background if ice sheet is mostly intact
-        if n_broken < len(bonds) * 0.3:
-            bg_patch = MplPolygon(
-                ice_bounds,
-                facecolor=ice_color,
-                edgecolor=ice_color,
-                linewidth=0,
-                zorder=2,
-                alpha=1.0
-            )
-            ax.add_patch(bg_patch)
-        
-        # 2. Draw separated floes with visible edges
-        for i in range(n_floes):
+        # Draw all ice elements
+        # Elements with no broken bonds: no visible edge (part of solid sheet)
+        # Elements with broken bonds: show edges where breaks occurred
+        for i in range(n_elements):
             rotated = rotate_polygon(local_polys[i], rotations[i])
             world_poly = rotated + positions[i]
             
-            separated = is_separated(i)
+            has_breaks = len(broken_neighbors[i]) > 0
             
-            if separated:
-                # Separated floe - show distinct edges
-                patch = MplPolygon(
-                    world_poly,
-                    facecolor=ice_color,
-                    edgecolor='#5090B0',
-                    linewidth=1.5,
-                    zorder=5,
-                    alpha=0.95
-                )
-                ax.add_patch(patch)
+            if has_breaks:
+                # Show this element with visible edge
+                edge_color = crack_color
+                edge_width = 1.0
+            else:
+                # Part of intact ice sheet - edge same as fill (invisible)
+                edge_color = ice_color
+                edge_width = 0.5
+            
+            patch = MplPolygon(
+                world_poly,
+                facecolor=ice_color,
+                edgecolor=edge_color,
+                linewidth=edge_width,
+                zorder=3,
+                alpha=1.0
+            )
+            ax.add_patch(patch)
         
-        # Draw cracks where bonds have broken (only after first contact)
-        if n_broken > 5:  # Only show cracks after significant fracture
+        # Draw crack lines where bonds have broken
+        n_broken = np.sum(~intact)
+        if n_broken > 0:
             crack_lines = []
             for b, (i, j) in enumerate(bonds):
                 if not intact[b]:
+                    # Draw line between centers of broken pair
                     p1, p2 = positions[i], positions[j]
-                    # Only draw crack if floes haven't fully separated
                     dist = np.linalg.norm(p1 - p2)
                     init_dist = np.linalg.norm(initial_centroids[i] - initial_centroids[j])
-                    if dist < init_dist * 2.0:  # Still close enough to show crack
+                    
+                    # Only show crack if elements haven't drifted too far apart
+                    if dist < init_dist * 2.5:
                         crack_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
             
             if crack_lines:
-                lc = LineCollection(crack_lines, colors='#1A4D70',
-                                  linewidths=2.5, alpha=0.9, zorder=4)
+                lc = LineCollection(crack_lines, colors=water_color,
+                                  linewidths=2.0, alpha=0.8, zorder=4)
                 ax.add_collection(lc)
         
-        # Draw ship
+        # Draw ship (on top)
         ship_patch = MplPolygon(
             ship_outline,
             facecolor=ship_color,
@@ -541,15 +535,14 @@ def animate_ice_ship(
         # Stats
         n_intact = int(intact.sum())
         n_total = len(intact)
-        n_broken = n_total - n_intact
-        pct_broken = 100 * n_broken / n_total if n_total > 0 else 0
+        pct_broken = 100 * (n_total - n_intact) / n_total if n_total > 0 else 0
         
         ax.set_xlabel('X [m]', fontsize=11)
         ax.set_ylabel('Y [m]', fontsize=11)
         ax.set_title(
             f'DPDEM: Level Ice Fracture on Ship Impact\n'
             f'Frame {frame}/{n_frames-1} | '
-            f'Cracks: {n_broken}/{n_total} ({pct_broken:.0f}%)',
+            f'Broken bonds: {n_total - n_intact}/{n_total} ({pct_broken:.0f}%)',
             fontsize=13, fontweight='bold'
         )
         ax.grid(True, alpha=0.15, color='white', linestyle='--')
@@ -572,31 +565,30 @@ def animate_ice_ship(
 
 def main():
     print("=" * 60, flush=True)
-    print("DPDEM: Ice-Ship Interaction with Voronoi Ice Floes", flush=True)
+    print("DPDEM: Ice-Ship Interaction with Voronoi Ice Elements", flush=True)
     print("=" * 60, flush=True)
     
     # Ice field parameters
-    n_floes = 80
+    n_elements = 100
     field_width = 50.0
-    field_height = 35.0
+    field_height = 40.0
     
-    # Ship parameters (similar to R/V Xuelong proportions)
+    # Ship parameters
     ship_length = 35.0
     ship_beam = 8.0
-    # Position ship closer to ice field
-    ship_pos = np.array([field_width + 8, field_height / 2])
+    ship_pos = np.array([field_width + 10, field_height / 2])
     
-    # Create ice field
+    # Create Voronoi ice field
     print("Generating Voronoi ice field...", flush=True)
-    polygons, centroids, bonds = create_ice_field(
-        n_floes, field_width, field_height, seed=42
+    polygons, centroids, bonds = create_voronoi_ice_field(
+        n_elements, field_width, field_height, seed=42
     )
-    print(f"  Created {len(polygons)} ice floes with {len(bonds)} bonds", flush=True)
+    print(f"  Created {len(polygons)} ice elements with {len(bonds)} bonds", flush=True)
     
-    # Create ship hull with bow facing left (toward incoming ice)
-    ship_outline = create_ship_hull(ship_length, ship_beam, 3.0, ship_pos, bow_direction='left')
+    # Create ship hull (bow facing left toward ice)
+    ship_outline = create_ship_hull(ship_length, ship_beam, ship_pos, bow_direction='left')
     
-    # Run simulation - longer to ensure ice reaches and impacts ship
+    # Run simulation
     print("Running simulation...", flush=True)
     positions, rotations, bonds_intact = simulate_ice_ship_interaction(
         polygons=polygons,
@@ -605,13 +597,13 @@ def main():
         ship_pos=ship_pos,
         ship_length=ship_length,
         ship_beam=ship_beam,
-        n_frames=300,
+        n_frames=250,
         dt=0.05,
-        drift_vel=1.2,  # Faster drift
+        drift_vel=1.5,
     )
     
     n_final = bonds_intact[-1].sum()
-    print(f"  Final bonds: {n_final}/{len(bonds)}", flush=True)
+    print(f"  Final intact bonds: {n_final}/{len(bonds)}", flush=True)
     
     # Create animation
     animate_ice_ship(
@@ -621,7 +613,6 @@ def main():
         bonds_history=bonds_intact,
         bonds=bonds,
         ship_outline=ship_outline,
-        ship_pos=ship_pos,
         initial_centroids=centroids,
         output_file='dpdem_ice_ship.gif',
         fps=20,
