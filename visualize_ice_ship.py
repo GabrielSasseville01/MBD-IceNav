@@ -474,7 +474,24 @@ def simulate_ice_ship_interaction(
         velocities = new_velocities
         positions = new_positions
         
-        # 4. Check for bond fracture
+        # 4. Propagate stress through ice sheet
+        # Elements under compression from ship transfer stress to neighbors
+        element_stress = ship_collision_force.copy()
+        
+        # Propagate stress backward through bonds (multiple iterations)
+        for _ in range(3):
+            new_stress = element_stress.copy()
+            for b, (i, j) in enumerate(bonds):
+                if bond_intact[b]:
+                    # Stress propagates through intact bonds
+                    stress_transfer = 0.6  # 60% of stress transfers
+                    if element_stress[i] > element_stress[j]:
+                        new_stress[j] += element_stress[i] * stress_transfer
+                    else:
+                        new_stress[i] += element_stress[j] * stress_transfer
+            element_stress = new_stress
+        
+        # 5. Check for bond fracture with propagated stress
         # Bonds break when stress exceeds strength (Eq. 14 in paper)
         for b, (i, j) in enumerate(bonds):
             if not bond_intact[b]:
@@ -484,19 +501,23 @@ def simulate_ice_ship_interaction(
             d = positions[j] - positions[i]
             dist = np.linalg.norm(d)
             
-            # Change in distance from rest
+            # Change in distance from rest (strain)
             stretch = abs(dist - rest_lengths[b])
             
-            # Force transmitted through bond
+            # Force from bond deformation
             bond_force = 1e6 * stretch
             
-            # Ship collision causes much easier fracture
-            # (ice is crushed/bent when hitting ship)
-            ship_force_on_bond = max(ship_collision_force[i], ship_collision_force[j])
-            if ship_force_on_bond > 0:
-                # Lower threshold when ship contact is involved
+            # Add propagated stress from ship collision
+            propagated_stress = max(element_stress[i], element_stress[j])
+            bond_force += propagated_stress * 0.3
+            
+            # Determine effective strength
+            # Direct ship contact = much weaker
+            # Propagated stress = somewhat weaker
+            if ship_collision_force[i] > 0 or ship_collision_force[j] > 0:
                 effective_strength = bond_strength * 0.1
-                bond_force += ship_force_on_bond * 0.5
+            elif propagated_stress > bond_strength * 0.5:
+                effective_strength = bond_strength * 0.5
             else:
                 effective_strength = bond_strength
             
