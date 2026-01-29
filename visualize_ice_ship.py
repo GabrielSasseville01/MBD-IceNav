@@ -47,21 +47,31 @@ def create_voronoi_ice_field(
     """
     np.random.seed(seed)
     
-    # Generate seed points with some regularity (jittered grid)
-    nx = int(np.sqrt(n_elements * field_width / field_height))
-    ny = int(n_elements / nx)
-    
+    # Generate seed points with random distribution for varied floe sizes
+    # Mix of clustered and sparse regions creates natural size variation
     points = []
+    
+    # Some points from jittered grid (creates medium-sized floes)
+    nx = int(np.sqrt(n_elements * 0.5 * field_width / field_height))
+    ny = int(n_elements * 0.5 / nx)
     dx = field_width / nx
     dy = field_height / ny
     
     for i in range(nx):
         for j in range(ny):
-            x = (i + 0.5) * dx + np.random.uniform(-0.3*dx, 0.3*dx)
-            y = (j + 0.5) * dy + np.random.uniform(-0.3*dy, 0.3*dy)
+            # Large jitter for varied spacing
+            x = (i + 0.5) * dx + np.random.uniform(-0.45*dx, 0.45*dx)
+            y = (j + 0.5) * dy + np.random.uniform(-0.45*dy, 0.45*dy)
             x = np.clip(x, 0.1, field_width - 0.1)
             y = np.clip(y, 0.1, field_height - 0.1)
             points.append([x, y])
+    
+    # Add random points (creates varied sizes - some large, some small)
+    n_random = n_elements - len(points)
+    for _ in range(n_random):
+        x = np.random.uniform(0.5, field_width - 0.5)
+        y = np.random.uniform(0.5, field_height - 0.5)
+        points.append([x, y])
     
     points = np.array(points)
     n_actual = len(points)
@@ -359,8 +369,7 @@ def simulate_ice_ship_interaction(
     bonds_history = [bond_intact.copy()]
     
     # Bond strength (from paper Table 1: σ = 0.6 MPa, C = 1.8 MPa)
-    # Lowered for demo to show more visible fracture
-    bond_strength = 5e5  # Threshold force for fracture
+    bond_strength = 1.5e6  # Threshold force for fracture
     
     for frame in range(n_frames):
         # 1. Find connected components (groups that move together)
@@ -474,17 +483,17 @@ def simulate_ice_ship_interaction(
         velocities = new_velocities
         positions = new_positions
         
-        # 4. Propagate stress through ice sheet
+        # 4. Propagate stress through ice sheet (limited propagation)
         # Elements under compression from ship transfer stress to neighbors
         element_stress = ship_collision_force.copy()
         
-        # Propagate stress backward through bonds (multiple iterations)
-        for _ in range(3):
+        # Propagate stress backward through bonds (2 iterations, lower transfer)
+        for _ in range(2):
             new_stress = element_stress.copy()
             for b, (i, j) in enumerate(bonds):
                 if bond_intact[b]:
-                    # Stress propagates through intact bonds
-                    stress_transfer = 0.6  # 60% of stress transfers
+                    # Stress propagates through intact bonds (reduced rate)
+                    stress_transfer = 0.3  # 30% of stress transfers
                     if element_stress[i] > element_stress[j]:
                         new_stress[j] += element_stress[i] * stress_transfer
                     else:
@@ -507,17 +516,17 @@ def simulate_ice_ship_interaction(
             # Force from bond deformation
             bond_force = 1e6 * stretch
             
-            # Add propagated stress from ship collision
+            # Add propagated stress from ship collision (reduced contribution)
             propagated_stress = max(element_stress[i], element_stress[j])
-            bond_force += propagated_stress * 0.3
+            bond_force += propagated_stress * 0.15
             
             # Determine effective strength
-            # Direct ship contact = much weaker
-            # Propagated stress = somewhat weaker
+            # Direct ship contact = weaker (but not as extreme)
+            # Propagated stress = slightly weaker
             if ship_collision_force[i] > 0 or ship_collision_force[j] > 0:
-                effective_strength = bond_strength * 0.1
-            elif propagated_stress > bond_strength * 0.5:
-                effective_strength = bond_strength * 0.5
+                effective_strength = bond_strength * 0.3
+            elif propagated_stress > bond_strength * 0.7:
+                effective_strength = bond_strength * 0.7
             else:
                 effective_strength = bond_strength
             
