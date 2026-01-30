@@ -15,9 +15,12 @@ env/
 *.swo
 
 # Generated files
-*.gif
 *.png
 *.mp4
+
+# Allow demo GIFs for README
+!dpdem_ice_ship.gif
+!dpdem_ice_ship_3d.gif
 
 # OS
 .DS_Store
