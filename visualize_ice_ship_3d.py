@@ -277,8 +277,17 @@ def animate_ice_ship_3d(
         ax.set_ylim(y_min - 10, y_max + 10)
         ax.set_zlim(-15, 10)  # Deeper for 10.5m draft
         
+        # CRITICAL: Set proper aspect ratio so ship looks correct
+        # X range ~500m, Y range ~200m, Z range 25m
+        # Scale Z up visually so it's visible but proportional
+        x_range = x_max + 50
+        y_range = (y_max + 10) - (y_min - 10)
+        z_range = 25
+        # Exaggerate Z by 3x so underwater part visible, but ship still looks long
+        ax.set_box_aspect([x_range, y_range, z_range * 3])
+        
         # Viewing angle - higher elevation to see over water
-        ax.view_init(elev=30, azim=-60 + frame * 0.1)
+        ax.view_init(elev=25, azim=-60 + frame * 0.1)
         
         # Draw water surface - very transparent so ship is visible
         water_x = np.array([[x_min - 50, x_max + 100], [x_min - 50, x_max + 100]])
