@@ -137,15 +137,105 @@ def polygon_to_3d_prism(poly_2d, z_bottom, z_top, center, rotation=0, tilt_x=0, 
     return verts, faces
 
 
+def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_pos, 
+                            ship_length, ship_beam, n_elements):
+    """
+    Add 3D physics: vertical movement, tilting, and ice going under hull.
+    Based on paper Fig. 17 showing ice bending, breaking, and accumulating under platform.
+    """
+    n_frames = len(positions_history)
+    
+    # Initialize 3D state
+    z_positions = [np.zeros(n_elements) for _ in range(n_frames)]
+    tilts_x = [np.zeros(n_elements) for _ in range(n_frames)]  # Pitch (forward tilt)
+    tilts_y = [np.zeros(n_elements) for _ in range(n_frames)]  # Roll (sideways tilt)
+    
+    ship_bow_x = ship_pos[0] - ship_length / 2
+    
+    for frame in range(1, n_frames):
+        positions = positions_history[frame]
+        intact = bonds_history[frame]
+        prev_z = z_positions[frame - 1].copy()
+        prev_tilt_x = tilts_x[frame - 1].copy()
+        prev_tilt_y = tilts_y[frame - 1].copy()
+        
+        # Check which elements have broken bonds
+        broken_count = np.zeros(n_elements)
+        for b, (i, j) in enumerate(bonds):
+            if not intact[b]:
+                broken_count[i] += 1
+                broken_count[j] += 1
+        
+        new_z = prev_z.copy()
+        new_tilt_x = prev_tilt_x.copy()
+        new_tilt_y = prev_tilt_y.copy()
+        
+        for i in range(n_elements):
+            px, py = positions[i]
+            dist_to_bow = px - ship_bow_x
+            rel_y = py - ship_pos[1]
+            
+            # Ice near ship bow gets pushed down and tilts
+            if 0 < dist_to_bow < ship_length * 0.3:
+                # Close to bow - ice bends down (like Fig 17a,b)
+                push_factor = 1 - dist_to_bow / (ship_length * 0.3)
+                
+                if broken_count[i] > 0:
+                    # Broken ice goes under the hull (Fig 17c,d)
+                    target_z = -2.0 - push_factor * 1.5
+                    new_z[i] += (target_z - new_z[i]) * 0.1
+                    
+                    # Tilt forward (nose down) as it slides under
+                    new_tilt_x[i] += (0.4 * push_factor - new_tilt_x[i]) * 0.1
+                else:
+                    # Intact ice bends at contact
+                    new_tilt_x[i] += (0.2 * push_factor - new_tilt_x[i]) * 0.05
+            
+            elif dist_to_bow < 0:
+                # Past the bow - ice is under/beside the hull
+                if broken_count[i] > 0:
+                    # Broken fragments accumulate under hull (ice cushion)
+                    # Some float back up on sides
+                    if abs(rel_y) > ship_beam / 2:
+                        # Outside hull width - float back up
+                        new_z[i] += (0 - new_z[i]) * 0.05
+                        new_tilt_x[i] *= 0.95
+                    else:
+                        # Under hull - stay down, slide along
+                        new_z[i] = max(new_z[i], -3.0)  # Don't go too deep
+                        new_z[i] += (-1.5 - new_z[i]) * 0.02
+            
+            # Damping
+            new_tilt_x[i] *= 0.98
+            new_tilt_y[i] *= 0.98
+            
+            # Buoyancy - ice wants to float
+            if new_z[i] < -0.5 and dist_to_bow > ship_length * 0.5:
+                new_z[i] += 0.02  # Slowly float back up
+        
+        z_positions[frame] = new_z
+        tilts_x[frame] = new_tilt_x
+        tilts_y[frame] = new_tilt_y
+    
+    return z_positions, tilts_x, tilts_y
+
+
 def animate_ice_ship_3d(
     polygons, positions_history, rotations_history, bonds_history, bonds,
-    ship_hull_verts, ship_hull_faces, ship_pos, initial_centroids,
-    ice_thickness=0.5, output_file='dpdem_ice_ship_3d.gif', fps=15
+    ship_hull_verts, ship_hull_faces, ship_pos, ship_length, ship_beam,
+    initial_centroids, ice_thickness=0.5, output_file='dpdem_ice_ship_3d.gif', fps=15
 ):
-    """Create 3D animation of ice-ship interaction."""
+    """Create 3D animation of ice-ship interaction with vertical physics."""
     
     n_frames = len(positions_history)
     n_elements = len(polygons)
+    
+    # Compute 3D physics (vertical movement, tilting)
+    print("Computing 3D ice physics...", flush=True)
+    z_positions, tilts_x, tilts_y = simulate_3d_ice_physics(
+        positions_history, bonds_history, bonds, ship_pos,
+        ship_length, ship_beam, n_elements
+    )
     
     # Compute local polygons
     local_polys = []
@@ -175,21 +265,23 @@ def animate_ice_ship_3d(
         positions = positions_history[frame]
         rotations = rotations_history[frame]
         intact = bonds_history[frame]
+        z_pos = z_positions[frame]
+        tilt_x = tilts_x[frame]
+        tilt_y = tilts_y[frame]
         
         # Set view - tighter bounds on ice/ship area
-        view_margin = 5
-        ax.set_xlim(x_min + 20, x_max - 100)  # Focus on interaction area
+        ax.set_xlim(x_min + 20, x_max - 100)
         ax.set_ylim(y_min + 10, y_max - 10)
-        ax.set_zlim(-4, 4)
+        ax.set_zlim(-5, 4)
         
-        # Viewing angle - higher for better overview
-        ax.view_init(elev=35, azim=-50 + frame * 0.15)
+        # Viewing angle - side view to see ice going under
+        ax.view_init(elev=20, azim=-70 + frame * 0.1)
         
         # Draw water surface
         water_x = np.array([[x_min, x_max], [x_min, x_max]])
         water_y = np.array([[y_min, y_min], [y_max, y_max]])
         water_z = np.array([[-0.1, -0.1], [-0.1, -0.1]])
-        ax.plot_surface(water_x, water_y, water_z, color=water_color, alpha=0.7, zorder=1)
+        ax.plot_surface(water_x, water_y, water_z, color=water_color, alpha=0.5, zorder=1)
         
         # Build set of broken bonds
         broken_neighbors = {i: set() for i in range(n_elements)}
@@ -198,7 +290,7 @@ def animate_ice_ship_3d(
                 broken_neighbors[i].add(j)
                 broken_neighbors[j].add(i)
         
-        # Draw ice floes as 3D prisms
+        # Draw ice floes as 3D prisms with tilt
         for i in range(n_elements):
             # Rotate local polygon
             angle = rotations[i]
@@ -210,22 +302,26 @@ def animate_ice_ship_3d(
             
             has_breaks = len(broken_neighbors[i]) > 0
             
-            # Add some tilt for broken floes
-            if has_breaks:
-                tilt = np.random.uniform(-0.1, 0.1)
-                z_offset = np.random.uniform(-0.1, 0.1)
-            else:
-                tilt = 0
-                z_offset = 0
+            # Get 3D position and orientation
+            z_center = z_pos[i]
+            tx, ty = tilt_x[i], tilt_y[i]
             
-            # Create 3D vertices for ice floe
+            # Create 3D vertices with tilt
             n_verts = len(world_poly)
-            z_bottom = -ice_thickness/2 + z_offset
-            z_top = ice_thickness/2 + z_offset
+            center_xy = positions[i]
             
-            # Top and bottom faces
-            top_verts = np.column_stack([world_poly, np.full(n_verts, z_top)])
-            bottom_verts = np.column_stack([world_poly, np.full(n_verts, z_bottom)])
+            top_verts = []
+            bottom_verts = []
+            for v in world_poly:
+                dx = v[0] - center_xy[0]
+                dy = v[1] - center_xy[1]
+                # Apply tilt
+                z_offset = dx * np.sin(tx) + dy * np.sin(ty)
+                top_verts.append([v[0], v[1], z_center + ice_thickness/2 + z_offset])
+                bottom_verts.append([v[0], v[1], z_center - ice_thickness/2 + z_offset])
+            
+            top_verts = np.array(top_verts)
+            bottom_verts = np.array(bottom_verts)
             
             # Choose color based on state
             if has_breaks:
@@ -363,6 +459,8 @@ def main():
         ship_hull_verts=ship_hull_verts,
         ship_hull_faces=ship_hull_faces,
         ship_pos=ship_pos,
+        ship_length=ship_length,
+        ship_beam=ship_beam,
         initial_centroids=centroids,
         ice_thickness=ice_thickness,
         output_file='dpdem_ice_ship_3d.gif',
