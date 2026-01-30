@@ -54,13 +54,14 @@ def create_ship_hull_3d(length, beam, draft, position):
         local_draft = draft * taper
         
         # Cross-section vertices (simplified hull shape)
-        # Deck level
-        hull_verts.append([x, cy - local_beam/2, cz + draft * 0.3])
-        hull_verts.append([x, cy + local_beam/2, cz + draft * 0.3])
+        # Deck level (about 3m above waterline for icebreaker)
+        deck_height = 3.0 * taper
+        hull_verts.append([x, cy - local_beam/2, cz + deck_height])
+        hull_verts.append([x, cy + local_beam/2, cz + deck_height])
         # Waterline
         hull_verts.append([x, cy - local_beam/2 * 0.9, cz])
         hull_verts.append([x, cy + local_beam/2 * 0.9, cz])
-        # Keel
+        # Keel (draft below waterline)
         hull_verts.append([x, cy, cz - local_draft])
     
     hull_verts = np.array(hull_verts)
@@ -182,14 +183,15 @@ def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_pos,
                 
                 if broken_count[i] > 0:
                     # Broken ice goes under the hull (Fig 17c,d)
-                    target_z = -2.0 - push_factor * 1.5
+                    # Draft is ~10.5m, so ice needs to go deeper
+                    target_z = -8.0 - push_factor * 4.0
                     new_z[i] += (target_z - new_z[i]) * 0.1
                     
                     # Tilt forward (nose down) as it slides under
-                    new_tilt_x[i] += (0.4 * push_factor - new_tilt_x[i]) * 0.1
+                    new_tilt_x[i] += (0.5 * push_factor - new_tilt_x[i]) * 0.1
                 else:
                     # Intact ice bends at contact
-                    new_tilt_x[i] += (0.2 * push_factor - new_tilt_x[i]) * 0.05
+                    new_tilt_x[i] += (0.3 * push_factor - new_tilt_x[i]) * 0.05
             
             elif dist_to_bow < 0:
                 # Past the bow - ice is under/beside the hull
@@ -201,9 +203,9 @@ def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_pos,
                         new_z[i] += (0 - new_z[i]) * 0.05
                         new_tilt_x[i] *= 0.95
                     else:
-                        # Under hull - stay down, slide along
-                        new_z[i] = max(new_z[i], -3.0)  # Don't go too deep
-                        new_z[i] += (-1.5 - new_z[i]) * 0.02
+                        # Under hull - stay down at keel depth
+                        new_z[i] = max(new_z[i], -12.0)  # Below 10.5m draft
+                        new_z[i] += (-10.0 - new_z[i]) * 0.02
             
             # Damping
             new_tilt_x[i] *= 0.98
@@ -211,7 +213,7 @@ def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_pos,
             
             # Buoyancy - ice wants to float
             if new_z[i] < -0.5 and dist_to_bow > ship_length * 0.5:
-                new_z[i] += 0.02  # Slowly float back up
+                new_z[i] += 0.05  # Slowly float back up
         
         z_positions[frame] = new_z
         tilts_x[frame] = new_tilt_x
@@ -270,9 +272,9 @@ def animate_ice_ship_3d(
         tilt_y = tilts_y[frame]
         
         # Set view - tighter bounds on ice/ship area
-        ax.set_xlim(x_min + 20, x_max - 100)
-        ax.set_ylim(y_min + 10, y_max - 10)
-        ax.set_zlim(-5, 4)
+        ax.set_xlim(x_min + 50, x_max - 150)
+        ax.set_ylim(y_min + 30, y_max - 30)
+        ax.set_zlim(-15, 8)  # Deeper for 10.5m draft
         
         # Viewing angle - side view to see ice going under
         ax.view_init(elev=20, azim=-70 + frame * 0.1)
@@ -407,17 +409,18 @@ def main():
     print("DPDEM 3D: Ice-Ship Interaction Visualization", flush=True)
     print("=" * 60, flush=True)
     
-    # Ice field parameters
-    n_elements = 80  # Fewer for faster 3D rendering
-    field_width = 45.0
-    field_height = 35.0
-    ice_thickness = 1.5  # Exaggerated for visibility (paper uses 0.5m)
+    # Ice field parameters - scaled for ship size
+    field_width = 250.0
+    field_height = 180.0
+    n_elements = 150
+    ice_thickness = 2.5  # Typical Arctic multi-year ice thickness
     
-    # Ship parameters
-    ship_length = 30.0
-    ship_beam = 7.0
-    ship_draft = 3.0
-    ship_pos = np.array([field_width + 25, field_height / 2])
+    # Ship parameters: CCGS John G. Diefenbaker (Polar Class Icebreaker)
+    ship_length = 158.0  # m
+    ship_beam = 28.0     # m  
+    ship_draft = 10.5    # m (below waterline)
+    # ship_depth = 13.5  # m (total hull depth, for reference)
+    ship_pos = np.array([field_width + 80, field_height / 2])
     
     # Create Voronoi ice field
     print("Generating Voronoi ice field...", flush=True)
