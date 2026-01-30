@@ -290,10 +290,10 @@ def animate_ice_ship_3d(
         ax.view_init(elev=25, azim=-60 + frame * 0.1)
         
         # Draw water surface - very transparent so ship is visible
-        water_x = np.array([[x_min - 50, x_max + 100], [x_min - 50, x_max + 100]])
-        water_y = np.array([[y_min - 50, y_min - 50], [y_max + 50, y_max + 50]])
-        water_z = np.array([[0, 0], [0, 0]])
-        ax.plot_surface(water_x, water_y, water_z, color=water_color, alpha=0.2, zorder=1)
+        # water_x = np.array([[x_min - 50, x_max + 100], [x_min - 50, x_max + 100]])
+        # water_y = np.array([[y_min - 50, y_min - 50], [y_max + 50, y_max + 50]])
+        # water_z = np.array([[0, 0], [0, 0]])
+        # ax.plot_surface(water_x, water_y, water_z, color=water_color, alpha=0.2, zorder=1)
         
         # Build set of broken bonds
         broken_neighbors = {i: set() for i in range(n_elements)}
@@ -371,16 +371,44 @@ def animate_ice_ship_3d(
                     alpha=0.85
                 ))
         
-        # Draw ship hull
-        hull_faces_verts = [[ship_hull_verts[idx] for idx in face] for face in ship_hull_faces]
-        ax.add_collection3d(Poly3DCollection(
-            hull_faces_verts,
-            facecolor=ship_color,
-            edgecolor='#303030',
-            linewidth=0.5,
-            alpha=1.0,
-            zorder=10
-        ))
+        # Draw ship hull with different colors for different parts
+        # Colors for ship parts
+        deck_color = '#8B4513'      # Brown deck
+        hull_above = '#C0C0C0'      # Light gray above waterline
+        hull_below = '#8B0000'      # Dark red below waterline (anti-fouling paint)
+        
+        for face_idx, face in enumerate(ship_hull_faces):
+            face_verts = np.array([ship_hull_verts[idx] for idx in face])
+            
+            # Determine face type by checking z coordinates
+            z_coords = face_verts[:, 2]
+            avg_z = np.mean(z_coords)
+            
+            # Check if face is mostly horizontal (deck) or vertical (side)
+            z_range = np.max(z_coords) - np.min(z_coords)
+            is_horizontal = z_range < 1.0
+            
+            if is_horizontal and avg_z > 1.0:
+                # Deck (top horizontal faces above waterline)
+                color = deck_color
+                edge = '#5D3A1A'
+            elif avg_z > 0:
+                # Hull above waterline
+                color = hull_above
+                edge = '#808080'
+            else:
+                # Hull below waterline
+                color = hull_below
+                edge = '#5C0000'
+            
+            ax.add_collection3d(Poly3DCollection(
+                [face_verts],
+                facecolor=color,
+                edgecolor=edge,
+                linewidth=0.8,
+                alpha=0.95,
+                zorder=10
+            ))
         
         # Labels
         ax.set_xlabel('X [m]')
