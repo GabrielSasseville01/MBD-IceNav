@@ -271,19 +271,20 @@ def animate_ice_ship_3d(
         tilt_x = tilts_x[frame]
         tilt_y = tilts_y[frame]
         
-        # Set view - tighter bounds on ice/ship area
-        ax.set_xlim(x_min + 50, x_max - 150)
-        ax.set_ylim(y_min + 30, y_max - 30)
-        ax.set_zlim(-15, 8)  # Deeper for 10.5m draft
+        # Set view - show full ship and ice field
+        # Ship is at x = field_width + 80 = 330, length 158m, so spans ~250 to 410
+        ax.set_xlim(0, x_max + 50)  # Full scene
+        ax.set_ylim(y_min - 10, y_max + 10)
+        ax.set_zlim(-15, 10)  # Deeper for 10.5m draft
         
-        # Viewing angle - side view to see ice going under
-        ax.view_init(elev=20, azim=-70 + frame * 0.1)
+        # Viewing angle - higher elevation to see over water
+        ax.view_init(elev=30, azim=-60 + frame * 0.1)
         
-        # Draw water surface
-        water_x = np.array([[x_min, x_max], [x_min, x_max]])
-        water_y = np.array([[y_min, y_min], [y_max, y_max]])
-        water_z = np.array([[-0.1, -0.1], [-0.1, -0.1]])
-        ax.plot_surface(water_x, water_y, water_z, color=water_color, alpha=0.5, zorder=1)
+        # Draw water surface - very transparent so ship is visible
+        water_x = np.array([[x_min - 50, x_max + 100], [x_min - 50, x_max + 100]])
+        water_y = np.array([[y_min - 50, y_min - 50], [y_max + 50, y_max + 50]])
+        water_z = np.array([[0, 0], [0, 0]])
+        ax.plot_surface(water_x, water_y, water_z, color=water_color, alpha=0.2, zorder=1)
         
         # Build set of broken bonds
         broken_neighbors = {i: set() for i in range(n_elements)}
