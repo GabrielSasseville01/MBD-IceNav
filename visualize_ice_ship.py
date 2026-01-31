@@ -915,16 +915,16 @@ def create_multi_patch_ice_field(
     
     # Generate random patch properties
     for patch_idx in range(n_patches):
-        # Random patch size (20-80 elements per patch - larger patches)
-        patch_n_elements = np.random.randint(20, 80)
+        # Random patch size (40-120 elements per patch - larger patches)
+        patch_n_elements = np.random.randint(40, 120)
         
         # Random patch position (leave room at right for ship)
-        patch_cx = np.random.uniform(10, field_width - 10)
-        patch_cy = np.random.uniform(10, field_height - 10)
+        patch_cx = np.random.uniform(15, field_width - 15)
+        patch_cy = np.random.uniform(15, field_height - 15)
         
-        # Random patch dimensions - much larger
-        patch_width = np.random.uniform(15, 35)
-        patch_height = np.random.uniform(12, 28)
+        # Random patch dimensions - larger
+        patch_width = np.random.uniform(25, 50)
+        patch_height = np.random.uniform(20, 40)
         
         # Random thickness for this patch (uniform across entire patch)
         # Thicker patches = multi-year ice, thinner = first-year ice
@@ -1055,9 +1055,9 @@ def main():
     print("=" * 60, flush=True)
     
     # Field parameters - larger field for bigger patches
-    field_width = 80.0
-    field_height = 60.0
-    n_patches = 5  # Fewer but larger patches
+    field_width = 100.0
+    field_height = 70.0
+    n_patches = 4  # Fewer but larger patches
     
     # Ship parameters
     ship_length = 30.0
@@ -1074,8 +1074,8 @@ def main():
     print(f"Ship: {ship_length}m x {ship_beam}m, mass={ship_props.mass/1e6:.1f} kt", 
           flush=True)
     
-    ship_pos = np.array([field_width + 30, field_height / 2])
-    drift_vel = 2.5  # Slightly faster to reach patches
+    ship_pos = np.array([field_width + 35, field_height / 2])
+    drift_vel = 3.5  # Faster drift to ensure collision
     
     # Create multiple separate ice patches
     print("\nGenerating multiple ice patches...", flush=True)
@@ -1096,7 +1096,7 @@ def main():
         ship_pos=ship_pos,
         ship_length=ship_length,
         ship_beam=ship_beam,
-        n_frames=400,
+        n_frames=500,  # Longer animation to see collision
         dt=0.05,
         drift_vel=drift_vel,
         thicknesses=thicknesses,

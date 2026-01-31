@@ -466,9 +466,9 @@ def main():
     print("=" * 60, flush=True)
     
     # Field parameters - scaled for ship size
-    field_width = 350.0
-    field_height = 250.0
-    n_patches = 6  # Fewer but larger patches
+    field_width = 400.0
+    field_height = 280.0
+    n_patches = 4  # Fewer but larger patches
     
     # Ship parameters: CCGS John G. Diefenbaker (Polar Class Icebreaker)
     ship_length = 158.0  # m
@@ -486,7 +486,7 @@ def main():
           flush=True)
     
     ship_pos = np.array([field_width + 80, field_height / 2])
-    drift_vel = 3.0  # m/s (icebreaker transit speed)
+    drift_vel = 5.0  # m/s (faster to ensure collision)
     
     # Create multiple separate ice patches
     print("\nGenerating multiple ice patches...", flush=True)
@@ -513,7 +513,7 @@ def main():
         ship_pos=ship_pos,
         ship_length=ship_length,
         ship_beam=ship_beam,
-        n_frames=250,
+        n_frames=350,  # Longer animation to see collision
         dt=0.05,
         drift_vel=drift_vel,
         thicknesses=thicknesses,
