@@ -21,6 +21,7 @@ from scipy.spatial import Voronoi
 # Import the 2D simulation functions
 from visualize_ice_ship import (
     create_voronoi_ice_field,
+    create_multi_patch_ice_field,
     simulate_ice_ship_interaction,
     polygon_area,
     polygon_centroid,
@@ -461,17 +462,13 @@ def animate_ice_ship_3d(
 
 def main():
     print("=" * 60, flush=True)
-    print("DPDEM 3D: Ice-Ship Interaction with Realistic Physics", flush=True)
+    print("DPDEM 3D: Multiple Ice Patches with Realistic Physics", flush=True)
     print("=" * 60, flush=True)
     
-    # Ice field parameters - scaled for ship size
-    field_width = 250.0
-    field_height = 180.0
-    n_elements = 150
-    
-    # Ice thickness parameters - increased variation for visualization
-    ice_thickness_mean = 2.5   # Multi-year ice average
-    ice_thickness_std = 1.2    # Larger variation = more visible differences
+    # Field parameters - scaled for ship size
+    field_width = 300.0
+    field_height = 200.0
+    n_patches = 15  # Number of separate ice patches
     
     # Ship parameters: CCGS John G. Diefenbaker (Polar Class Icebreaker)
     ship_length = 158.0  # m
@@ -491,17 +488,15 @@ def main():
     ship_pos = np.array([field_width + 80, field_height / 2])
     drift_vel = 3.0  # m/s (icebreaker transit speed)
     
-    # Create Voronoi ice field with variable thickness
-    print("\nGenerating Voronoi ice field...", flush=True)
-    polygons, centroids, bonds, thicknesses = create_voronoi_ice_field(
-        n_elements, field_width, field_height, seed=42,
-        thickness_mean=ice_thickness_mean,
-        thickness_std=ice_thickness_std,
+    # Create multiple separate ice patches
+    print("\nGenerating multiple ice patches...", flush=True)
+    polygons, centroids, bonds, thicknesses, patch_ids = create_multi_patch_ice_field(
+        n_patches, field_width, field_height, seed=42
     )
     print(f"  Created {len(polygons)} ice elements with {len(bonds)} bonds", flush=True)
     
     # Use mean thickness for visualization
-    ice_thickness = thicknesses.mean()
+    ice_thickness = thicknesses.mean() if len(thicknesses) > 0 else 2.5
     
     # Create 3D ship hull
     print("Creating 3D ship hull...", flush=True)

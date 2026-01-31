@@ -882,29 +882,190 @@ def animate_ice_ship(
 # Main
 # ============================================================================
 
+def create_multi_patch_ice_field(
+    n_patches: int,
+    field_width: float,
+    field_height: float,
+    seed: int = 42,
+):
+    """
+    Create multiple separate ice patches/floes of different sizes and thicknesses.
+    
+    Each patch is an independent ice mass that can have its own:
+    - Size (number of elements)
+    - Thickness
+    - Shape (from Voronoi tessellation)
+    
+    Returns:
+        polygons: List of all polygon vertex arrays
+        centroids: All element centers
+        bonds: All bonds (only within patches, not between)
+        thicknesses: Thickness per element
+        patch_ids: Which patch each element belongs to
+    """
+    np.random.seed(seed)
+    
+    all_polygons = []
+    all_centroids = []
+    all_bonds = []
+    all_thicknesses = []
+    all_patch_ids = []
+    
+    element_offset = 0
+    
+    # Generate random patch properties
+    for patch_idx in range(n_patches):
+        # Random patch size (5-30 elements per patch)
+        patch_n_elements = np.random.randint(5, 35)
+        
+        # Random patch position (leave room at right for ship)
+        patch_cx = np.random.uniform(5, field_width - 5)
+        patch_cy = np.random.uniform(5, field_height - 5)
+        
+        # Random patch dimensions
+        patch_width = np.random.uniform(8, 20)
+        patch_height = np.random.uniform(6, 15)
+        
+        # Random thickness for this patch (thicker patches = multi-year ice)
+        patch_thickness = np.random.uniform(0.5, 3.5)
+        thickness_var = patch_thickness * 0.15  # Small variation within patch
+        
+        # Generate Voronoi cells for this patch
+        points = []
+        nx = int(np.sqrt(patch_n_elements * patch_width / patch_height))
+        ny = max(1, int(patch_n_elements / max(nx, 1)))
+        dx = patch_width / max(nx, 1)
+        dy = patch_height / max(ny, 1)
+        
+        for i in range(nx):
+            for j in range(ny):
+                x = patch_cx - patch_width/2 + (i + 0.5) * dx + np.random.uniform(-0.4*dx, 0.4*dx)
+                y = patch_cy - patch_height/2 + (j + 0.5) * dy + np.random.uniform(-0.4*dy, 0.4*dy)
+                points.append([x, y])
+        
+        if len(points) < 3:
+            continue
+            
+        points = np.array(points)
+        
+        # Add mirror points for bounded Voronoi
+        mirrors = []
+        for dx_m in [-1, 0, 1]:
+            for dy_m in [-1, 0, 1]:
+                if dx_m == 0 and dy_m == 0:
+                    continue
+                shifted = points.copy()
+                shifted[:, 0] += dx_m * patch_width
+                shifted[:, 1] += dy_m * patch_height
+                mirrors.append(shifted)
+        
+        all_points = np.vstack([points] + mirrors)
+        
+        try:
+            vor = Voronoi(all_points)
+        except:
+            continue
+        
+        # Extract polygons for this patch
+        patch_polygons = []
+        patch_centroids = []
+        valid_idx = []
+        n_orig = len(points)
+        
+        for i in range(n_orig):
+            region_idx = vor.point_region[i]
+            region = vor.regions[region_idx]
+            
+            if -1 in region or len(region) < 3:
+                continue
+            
+            verts = vor.vertices[region]
+            
+            # Clip to patch bounds
+            clipped_verts = []
+            for v in verts:
+                cx = np.clip(v[0], patch_cx - patch_width/2, patch_cx + patch_width/2)
+                cy = np.clip(v[1], patch_cy - patch_height/2, patch_cy + patch_height/2)
+                clipped_verts.append([cx, cy])
+            clipped_verts = np.array(clipped_verts)
+            
+            if len(clipped_verts) < 3:
+                continue
+            
+            # Order vertices
+            centroid = np.mean(clipped_verts, axis=0)
+            angles = np.arctan2(clipped_verts[:, 1] - centroid[1],
+                              clipped_verts[:, 0] - centroid[0])
+            order = np.argsort(angles)
+            clipped_verts = clipped_verts[order]
+            
+            area = polygon_area(clipped_verts)
+            if area < 0.3:
+                continue
+            
+            valid_idx.append(i)
+            patch_polygons.append(clipped_verts)
+            patch_centroids.append(centroid)
+        
+        if len(patch_polygons) < 2:
+            continue
+        
+        patch_centroids = np.array(patch_centroids)
+        n_valid = len(patch_polygons)
+        
+        # Create bonds within this patch only
+        idx_to_poly = {valid_idx[i]: i for i in range(n_valid)}
+        patch_bonds = set()
+        
+        for ridge_points in vor.ridge_points:
+            i, j = ridge_points
+            if i < n_orig and j < n_orig:
+                if i in idx_to_poly and j in idx_to_poly:
+                    pi, pj = idx_to_poly[i], idx_to_poly[j]
+                    # Add element_offset to make global indices
+                    patch_bonds.add((min(pi, pj) + element_offset, 
+                                   max(pi, pj) + element_offset))
+        
+        # Generate thicknesses for this patch
+        patch_thicknesses = np.random.normal(patch_thickness, thickness_var, n_valid)
+        patch_thicknesses = np.clip(patch_thicknesses, 0.3, 4.0)
+        
+        # Add to global lists
+        all_polygons.extend(patch_polygons)
+        all_centroids.extend(patch_centroids)
+        all_bonds.extend(list(patch_bonds))
+        all_thicknesses.extend(patch_thicknesses)
+        all_patch_ids.extend([patch_idx] * n_valid)
+        
+        element_offset += n_valid
+    
+    all_centroids = np.array(all_centroids)
+    all_thicknesses = np.array(all_thicknesses)
+    all_patch_ids = np.array(all_patch_ids)
+    
+    print(f"  Created {n_patches} patches with {len(all_polygons)} total elements", flush=True)
+    print(f"  {len(all_bonds)} bonds (within patches only)", flush=True)
+    print(f"  Thickness range: {all_thicknesses.min():.2f} - {all_thicknesses.max():.2f} m", flush=True)
+    
+    return all_polygons, all_centroids, all_bonds, all_thicknesses, all_patch_ids
+
+
 def main():
     print("=" * 60, flush=True)
-    print("DPDEM: Ice-Ship Interaction with Realistic Fracture Physics", flush=True)
+    print("DPDEM: Multiple Ice Patches with Variable Properties", flush=True)
     print("=" * 60, flush=True)
     
-    # Ice field parameters - more elements for variety
-    n_elements = 150
-    field_width = 55.0
-    field_height = 40.0
+    # Field parameters
+    field_width = 60.0
+    field_height = 45.0
+    n_patches = 12  # Number of separate ice patches
     
-    # Ice thickness parameters - increased variation for visualization
-    # Mix of thin first-year ice and thick multi-year ice
-    ice_thickness_mean = 1.8  # m
-    ice_thickness_std = 0.8   # m (larger variation = more visible differences)
-    
-    # Ship parameters (scaled down for visualization)
-    # Based on typical icebreaker proportions
+    # Ship parameters
     ship_length = 30.0
     ship_beam = 7.0
     ship_draft = 3.0
-    ship_displacement = 8000e3  # 8000 tonnes in kg
+    ship_displacement = 8000e3
     
-    # Create ship with physical properties
     ship_props = ShipProperties(
         length=ship_length,
         beam=ship_beam, 
@@ -914,19 +1075,13 @@ def main():
     print(f"Ship: {ship_length}m x {ship_beam}m, mass={ship_props.mass/1e6:.1f} kt", 
           flush=True)
     
-    # Start ship further away so we see approach
     ship_pos = np.array([field_width + 25, field_height / 2])
+    drift_vel = 2.0
     
-    # Ice drift velocity (typical range: 0.1-0.5 m/s)
-    # Higher velocity = more kinetic energy = easier fracture
-    drift_vel = 2.0  # m/s (exaggerated for visualization)
-    
-    # Create Voronoi ice field with variable thickness
-    print("\nGenerating Voronoi ice field...", flush=True)
-    polygons, centroids, bonds, thicknesses = create_voronoi_ice_field(
-        n_elements, field_width, field_height, seed=42,
-        thickness_mean=ice_thickness_mean,
-        thickness_std=ice_thickness_std,
+    # Create multiple separate ice patches
+    print("\nGenerating multiple ice patches...", flush=True)
+    polygons, centroids, bonds, thicknesses, patch_ids = create_multi_patch_ice_field(
+        n_patches, field_width, field_height, seed=42
     )
     print(f"  Created {len(polygons)} ice elements with {len(bonds)} bonds", flush=True)
     
@@ -942,14 +1097,14 @@ def main():
         ship_pos=ship_pos,
         ship_length=ship_length,
         ship_beam=ship_beam,
-        n_frames=350,
+        n_frames=400,
         dt=0.05,
         drift_vel=drift_vel,
         thicknesses=thicknesses,
         ship_props=ship_props,
     )
     
-    n_final = bonds_intact[-1].sum()
+    n_final = bonds_intact[-1].sum() if len(bonds) > 0 else 0
     print(f"  Final intact bonds: {n_final}/{len(bonds)}", flush=True)
     
     # Create animation
