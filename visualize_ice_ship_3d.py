@@ -466,9 +466,9 @@ def main():
     print("=" * 60, flush=True)
     
     # Field parameters - scaled for ship size
-    field_width = 300.0
-    field_height = 200.0
-    n_patches = 15  # Number of separate ice patches
+    field_width = 350.0
+    field_height = 250.0
+    n_patches = 6  # Fewer but larger patches
     
     # Ship parameters: CCGS John G. Diefenbaker (Polar Class Icebreaker)
     ship_length = 158.0  # m

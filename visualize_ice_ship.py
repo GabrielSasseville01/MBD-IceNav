@@ -915,16 +915,16 @@ def create_multi_patch_ice_field(
     
     # Generate random patch properties
     for patch_idx in range(n_patches):
-        # Random patch size (5-30 elements per patch)
-        patch_n_elements = np.random.randint(5, 35)
+        # Random patch size (20-80 elements per patch - larger patches)
+        patch_n_elements = np.random.randint(20, 80)
         
         # Random patch position (leave room at right for ship)
-        patch_cx = np.random.uniform(5, field_width - 5)
-        patch_cy = np.random.uniform(5, field_height - 5)
+        patch_cx = np.random.uniform(10, field_width - 10)
+        patch_cy = np.random.uniform(10, field_height - 10)
         
-        # Random patch dimensions
-        patch_width = np.random.uniform(8, 20)
-        patch_height = np.random.uniform(6, 15)
+        # Random patch dimensions - much larger
+        patch_width = np.random.uniform(15, 35)
+        patch_height = np.random.uniform(12, 28)
         
         # Random thickness for this patch (thicker patches = multi-year ice)
         patch_thickness = np.random.uniform(0.5, 3.5)
@@ -1055,10 +1055,10 @@ def main():
     print("DPDEM: Multiple Ice Patches with Variable Properties", flush=True)
     print("=" * 60, flush=True)
     
-    # Field parameters
-    field_width = 60.0
-    field_height = 45.0
-    n_patches = 12  # Number of separate ice patches
+    # Field parameters - larger field for bigger patches
+    field_width = 80.0
+    field_height = 60.0
+    n_patches = 5  # Fewer but larger patches
     
     # Ship parameters
     ship_length = 30.0
@@ -1075,8 +1075,8 @@ def main():
     print(f"Ship: {ship_length}m x {ship_beam}m, mass={ship_props.mass/1e6:.1f} kt", 
           flush=True)
     
-    ship_pos = np.array([field_width + 25, field_height / 2])
-    drift_vel = 2.0
+    ship_pos = np.array([field_width + 30, field_height / 2])
+    drift_vel = 2.5  # Slightly faster to reach patches
     
     # Create multiple separate ice patches
     print("\nGenerating multiple ice patches...", flush=True)
