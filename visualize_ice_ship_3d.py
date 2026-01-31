@@ -24,6 +24,8 @@ from visualize_ice_ship import (
     simulate_ice_ship_interaction,
     polygon_area,
     polygon_centroid,
+    IceProperties,
+    ShipProperties,
 )
 
 
@@ -444,28 +446,47 @@ def animate_ice_ship_3d(
 
 def main():
     print("=" * 60, flush=True)
-    print("DPDEM 3D: Ice-Ship Interaction Visualization", flush=True)
+    print("DPDEM 3D: Ice-Ship Interaction with Realistic Physics", flush=True)
     print("=" * 60, flush=True)
     
     # Ice field parameters - scaled for ship size
     field_width = 250.0
     field_height = 180.0
     n_elements = 150
-    ice_thickness = 2.5  # Typical Arctic multi-year ice thickness
+    
+    # Ice thickness parameters (realistic Arctic sea ice)
+    ice_thickness_mean = 2.5   # Multi-year ice average
+    ice_thickness_std = 0.8    # Natural variation
     
     # Ship parameters: CCGS John G. Diefenbaker (Polar Class Icebreaker)
     ship_length = 158.0  # m
     ship_beam = 28.0     # m  
     ship_draft = 10.5    # m (below waterline)
-    # ship_depth = 13.5  # m (total hull depth, for reference)
-    ship_pos = np.array([field_width + 80, field_height / 2])
+    ship_displacement = 23000e3  # ~23,000 tonnes
     
-    # Create Voronoi ice field
-    print("Generating Voronoi ice field...", flush=True)
-    polygons, centroids, bonds = create_voronoi_ice_field(
-        n_elements, field_width, field_height, seed=42
+    ship_props = ShipProperties(
+        length=ship_length,
+        beam=ship_beam,
+        draft=ship_draft,
+        displacement=ship_displacement
+    )
+    print(f"Ship: {ship_length}m x {ship_beam}m, displacement={ship_props.mass/1e6:.0f} tonnes", 
+          flush=True)
+    
+    ship_pos = np.array([field_width + 80, field_height / 2])
+    drift_vel = 3.0  # m/s (icebreaker transit speed)
+    
+    # Create Voronoi ice field with variable thickness
+    print("\nGenerating Voronoi ice field...", flush=True)
+    polygons, centroids, bonds, thicknesses = create_voronoi_ice_field(
+        n_elements, field_width, field_height, seed=42,
+        thickness_mean=ice_thickness_mean,
+        thickness_std=ice_thickness_std,
     )
     print(f"  Created {len(polygons)} ice elements with {len(bonds)} bonds", flush=True)
+    
+    # Use mean thickness for visualization
+    ice_thickness = thicknesses.mean()
     
     # Create 3D ship hull
     print("Creating 3D ship hull...", flush=True)
@@ -473,8 +494,8 @@ def main():
         ship_length, ship_beam, ship_draft, ship_pos
     )
     
-    # Run simulation
-    print("Running simulation...", flush=True)
+    # Run simulation with physics-based fracture
+    print("\nRunning simulation...", flush=True)
     positions, rotations, bonds_intact = simulate_ice_ship_interaction(
         polygons=polygons,
         centroids=centroids,
@@ -484,7 +505,9 @@ def main():
         ship_beam=ship_beam,
         n_frames=250,
         dt=0.05,
-        drift_vel=2.0,
+        drift_vel=drift_vel,
+        thicknesses=thicknesses,
+        ship_props=ship_props,
     )
     
     n_final = bonds_intact[-1].sum()

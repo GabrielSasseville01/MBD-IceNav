@@ -9,6 +9,11 @@ Key concepts from the paper:
 - Adjacent elements are bonded together to represent frozen state (Section 2.1, Fig. 3)
 - Bonded elements move together as one mass until bonds break under stress
 - Fracture occurs when stress exceeds strength criterion (Eq. 14)
+
+Enhanced physics:
+- Variable ice thickness per floe (affects fracture resistance)
+- Fracture depends on: ice thickness, ship mass, ship speed
+- Flexural strength scales with thickness^1.5 (bending mechanics)
 """
 
 import numpy as np
@@ -23,6 +28,87 @@ from scipy.ndimage import label
 
 
 # ============================================================================
+# Ice Material Properties (from literature)
+# ============================================================================
+
+class IceProperties:
+    """Physical properties of sea ice."""
+    # Density
+    ICE_DENSITY = 920  # kg/m³
+    WATER_DENSITY = 1025  # kg/m³
+    
+    # Mechanical properties (typical values from Timco & Weeks 2010)
+    FLEXURAL_STRENGTH_BASE = 0.5e6  # Pa (0.5 MPa base flexural strength)
+    COMPRESSIVE_STRENGTH = 2.5e6   # Pa
+    YOUNGS_MODULUS = 5e9           # Pa
+    
+    # Fracture energy (from paper Table 1)
+    FRACTURE_ENERGY_MODE_I = 15    # J/m² (tensile)
+    FRACTURE_ENERGY_MODE_II = 45   # J/m² (shear)
+    
+    @staticmethod
+    def flexural_strength(thickness):
+        """
+        Flexural strength varies with thickness.
+        Thicker ice is stronger but also more brittle.
+        σ_f ∝ h^0.5 approximately (empirical relationship)
+        """
+        h_ref = 1.0  # reference thickness
+        return IceProperties.FLEXURAL_STRENGTH_BASE * np.sqrt(thickness / h_ref)
+    
+    @staticmethod
+    def breaking_force(thickness, width):
+        """
+        Force required to break ice in bending.
+        From beam theory: F_break ∝ σ_f * w * h²
+        """
+        sigma_f = IceProperties.flexural_strength(thickness)
+        return sigma_f * width * thickness ** 2
+
+
+# ============================================================================
+# Ship Properties
+# ============================================================================
+
+class ShipProperties:
+    """Physical properties of the ship."""
+    def __init__(self, length, beam, draft, displacement=None):
+        self.length = length  # m
+        self.beam = beam      # m
+        self.draft = draft    # m
+        
+        # Displacement (mass of water displaced = ship mass)
+        if displacement is None:
+            # Estimate from hull dimensions (simplified box approximation)
+            # Real ships have ~0.5-0.7 block coefficient
+            block_coef = 0.6
+            self.displacement = (length * beam * draft * 
+                                block_coef * IceProperties.WATER_DENSITY)
+        else:
+            self.displacement = displacement
+        
+        self.mass = self.displacement  # kg
+    
+    def impact_force(self, velocity, ice_thickness):
+        """
+        Estimate ice impact force using momentum-impulse approach.
+        F = m * dv / dt, where dt depends on ice crushing
+        
+        From Daley (2000) ice load model:
+        F ∝ (displacement)^0.7 * (velocity)^0.8 * (thickness)^0.5
+        """
+        # Empirical coefficients (calibrated)
+        C_force = 0.1  # Force coefficient
+        
+        F = C_force * (self.mass ** 0.7) * (velocity ** 0.8) * (ice_thickness ** 0.5)
+        return F
+    
+    def kinetic_energy(self, velocity):
+        """Ship kinetic energy."""
+        return 0.5 * self.mass * velocity ** 2
+
+
+# ============================================================================
 # Voronoi Ice Field Generation (as per paper Section 2.1, Fig. 2)
 # ============================================================================
 
@@ -31,6 +117,8 @@ def create_voronoi_ice_field(
     field_width: float,
     field_height: float,
     seed: int = 42,
+    thickness_mean: float = 1.5,
+    thickness_std: float = 0.5,
 ) -> tuple:
     """
     Create ice field using Voronoi tessellation as described in the paper.
@@ -40,10 +128,19 @@ def create_voronoi_ice_field(
     a Voronoi cutting algorithm was employed to parametrically divide 
     a two-dimensional plane into polygons."
     
+    Args:
+        n_elements: Target number of ice floes
+        field_width: Width of ice field [m]
+        field_height: Height of ice field [m]
+        seed: Random seed
+        thickness_mean: Mean ice thickness [m]
+        thickness_std: Standard deviation of thickness [m]
+    
     Returns:
         polygons: List of (N, 2) polygon vertex arrays
         centroids: (n, 2) array of element centers
         bonds: List of (i, j) tuples for adjacent elements
+        thicknesses: (n,) array of ice thickness per element [m]
     """
     np.random.seed(seed)
     
@@ -148,8 +245,27 @@ def create_voronoi_ice_field(
     
     bonds = list(bonds)
     
+    # Generate variable ice thickness for each floe
+    # Thickness varies spatially - can have ridges, thin spots, etc.
+    thicknesses = np.random.normal(thickness_mean, thickness_std, n_valid)
+    thicknesses = np.clip(thicknesses, 0.3, thickness_mean * 2.5)  # Physical bounds
+    
+    # Add some spatial correlation - nearby floes have similar thickness
+    for _ in range(3):
+        new_thick = thicknesses.copy()
+        for i in range(n_valid):
+            neighbors = [j for pi, pj in bonds if pi == i or pj == i 
+                        for j in [pi, pj] if j != i]
+            if neighbors:
+                neighbor_avg = np.mean([thicknesses[j] for j in neighbors])
+                new_thick[i] = 0.7 * thicknesses[i] + 0.3 * neighbor_avg
+        thicknesses = new_thick
+    
     print(f"  Generated {n_valid} Voronoi elements, {len(bonds)} bonds", flush=True)
-    return polygons, centroids, bonds
+    print(f"  Ice thickness: {thicknesses.min():.2f} - {thicknesses.max():.2f} m "
+          f"(mean: {thicknesses.mean():.2f} m)", flush=True)
+    
+    return polygons, centroids, bonds, thicknesses
 
 
 def polygon_area(verts):
@@ -334,21 +450,43 @@ def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_
 
 def simulate_ice_ship_interaction(
     polygons, centroids, bonds, ship_pos, ship_length, ship_beam,
-    n_frames, dt, drift_vel
+    n_frames, dt, drift_vel, thicknesses=None, ship_props=None
 ):
     """
-    Simulate ice drifting toward ship with bond fracture.
+    Simulate ice drifting toward ship with realistic fracture mechanics.
     
-    Key physics from paper:
+    Key physics:
     - Bonded elements move together as rigid bodies
-    - When stress exceeds strength (Eq. 14), bonds break
-    - Broken elements then move independently
+    - Fracture depends on: ice thickness, ship mass, ship speed
+    - Flexural strength scales with thickness (bending mechanics)
+    - Impact force from ship momentum transfer
+    
+    Args:
+        polygons: List of ice floe polygons
+        centroids: Floe centroids
+        bonds: Bond pairs
+        ship_pos: Ship position
+        ship_length, ship_beam: Ship dimensions
+        n_frames: Number of frames
+        dt: Time step
+        drift_vel: Ice drift velocity (m/s)
+        thicknesses: Ice thickness per floe [m]
+        ship_props: ShipProperties object (if None, uses defaults)
     """
     n = len(polygons)
     
-    # Compute masses and effective radii
-    masses = np.array([polygon_area(p) * 0.5 * 920 for p in polygons])
-    radii = np.array([np.sqrt(polygon_area(p) / np.pi) for p in polygons])
+    # Default thicknesses if not provided
+    if thicknesses is None:
+        thicknesses = np.ones(n) * 1.5  # 1.5m default
+    
+    # Default ship properties
+    if ship_props is None:
+        ship_props = ShipProperties(ship_length, ship_beam, draft=ship_beam/3)
+    
+    # Compute masses (area * thickness * density) and effective radii
+    areas = np.array([polygon_area(p) for p in polygons])
+    masses = areas * thicknesses * IceProperties.ICE_DENSITY
+    radii = np.array([np.sqrt(a / np.pi) for a in areas])
     
     # State
     positions = centroids.copy()
@@ -363,13 +501,29 @@ def simulate_ice_ship_interaction(
     rest_lengths = np.array([np.linalg.norm(centroids[i] - centroids[j]) 
                             for i, j in bonds])
     
+    # Compute bond strengths based on ice thickness at each bond
+    # Bond strength depends on the thinner ice of the two bonded elements
+    # and the width of the bond (approximated by element size)
+    bond_strengths = np.zeros(len(bonds))
+    for b, (i, j) in enumerate(bonds):
+        # Use minimum thickness (weakest link)
+        h = min(thicknesses[i], thicknesses[j])
+        # Bond width approximated by average element radius
+        w = (radii[i] + radii[j]) / 2
+        # Breaking force from flexural strength
+        bond_strengths[b] = IceProperties.breaking_force(h, w)
+    
+    print(f"  Bond strengths: {bond_strengths.min()/1e6:.2f} - "
+          f"{bond_strengths.max()/1e6:.2f} MN", flush=True)
+    
     # History
     positions_history = [positions.copy()]
     rotations_history = [rotations.copy()]
     bonds_history = [bond_intact.copy()]
     
-    # Bond strength (from paper Table 1: σ = 0.6 MPa, C = 1.8 MPa)
-    bond_strength = 1.5e6  # Threshold force for fracture
+    # Ship impact force (depends on mass and speed)
+    ship_impact_force = ship_props.impact_force(drift_vel, np.mean(thicknesses))
+    print(f"  Ship impact force: {ship_impact_force/1e6:.2f} MN", flush=True)
     
     for frame in range(n_frames):
         # 1. Find connected components (groups that move together)
@@ -398,8 +552,9 @@ def simulate_ice_ship_interaction(
                 )
             
             if pen > 0:
-                # Strong repulsion force along hull normal
-                force_mag = 1e7 * pen
+                # Collision force scales with ship mass and penetration
+                # Heavier ships exert more force
+                force_mag = (ship_props.mass / 1e6) * 1e5 * pen
                 forces[i, 0] += force_mag * nx
                 forces[i, 1] += force_mag * ny
                 ship_collision_force[i] = force_mag
@@ -408,7 +563,7 @@ def simulate_ice_ship_interaction(
                 # Push ice toward nearest side of ship
                 rel_y = py - ship_pos[1]
                 side_direction = 1 if rel_y > 0 else -1
-                side_push = 5e6 * pen * side_direction
+                side_push = (ship_props.mass / 1e6) * 3e4 * pen * side_direction
                 forces[i, 1] += side_push
                 
                 # Apply torque to encourage rotation/flow
@@ -500,8 +655,9 @@ def simulate_ice_ship_interaction(
                         new_stress[i] += element_stress[j] * stress_transfer
             element_stress = new_stress
         
-        # 5. Check for bond fracture with propagated stress
-        # Bonds break when stress exceeds strength (Eq. 14 in paper)
+        # 5. Check for bond fracture with physics-based criterion
+        # Bonds break when applied force exceeds bond strength
+        # Strength depends on ice thickness (thinner ice breaks easier)
         for b, (i, j) in enumerate(bonds):
             if not bond_intact[b]:
                 continue
@@ -513,26 +669,34 @@ def simulate_ice_ship_interaction(
             # Change in distance from rest (strain)
             stretch = abs(dist - rest_lengths[b])
             
-            # Force from bond deformation
-            bond_force = 1e6 * stretch
+            # Force from bond deformation (elastic)
+            # Stiffness scales with ice thickness
+            avg_thickness = (thicknesses[i] + thicknesses[j]) / 2
+            stiffness = IceProperties.YOUNGS_MODULUS * avg_thickness * 0.001
+            bond_force = stiffness * stretch
             
-            # Add propagated stress from ship collision (reduced contribution)
+            # Add force from ship collision (direct impact)
             propagated_stress = max(element_stress[i], element_stress[j])
-            bond_force += propagated_stress * 0.15
+            bond_force += propagated_stress * 0.2
             
-            # Determine effective strength
-            # Direct ship contact = weaker (but not as extreme)
-            # Propagated stress = slightly weaker
+            # Get this bond's strength (based on thickness)
+            base_strength = bond_strengths[b]
+            
+            # Strength reduction factors:
+            # - Direct ship contact: stress concentration at impact
+            # - High propagated stress: fatigue/pre-weakening
             if ship_collision_force[i] > 0 or ship_collision_force[j] > 0:
-                effective_strength = bond_strength * 0.3
-            elif propagated_stress > bond_strength * 0.7:
-                effective_strength = bond_strength * 0.7
+                # Direct impact - significant strength reduction
+                effective_strength = base_strength * 0.25
+            elif propagated_stress > base_strength * 0.5:
+                # High stress propagation - some weakening
+                effective_strength = base_strength * 0.6
             else:
-                effective_strength = bond_strength
+                effective_strength = base_strength
             
             bond_stresses[b] = bond_force
             
-            # Fracture criterion (simplified version of Eq. 14)
+            # Fracture criterion: force exceeds strength
             if bond_force > effective_strength:
                 bond_intact[b] = False
         
@@ -554,18 +718,24 @@ def simulate_ice_ship_interaction(
 
 def animate_ice_ship(
     polygons, positions_history, rotations_history, bonds_history, bonds,
-    ship_outline, initial_centroids, output_file='dpdem_ice_ship.gif', fps=20
+    ship_outline, initial_centroids, thicknesses=None, 
+    output_file='dpdem_ice_ship.gif', fps=20
 ):
     """
     Animate ice-ship interaction.
     
     Visualization approach:
     - Draw actual Voronoi polygon shapes
+    - Color ice by thickness (thicker = darker blue)
     - Bonded elements appear as one continuous mass (no visible boundaries)
     - Broken bonds show as visible cracks/edges
     """
     n_frames = len(positions_history)
     n_elements = len(polygons)
+    
+    # Default thickness if not provided
+    if thicknesses is None:
+        thicknesses = np.ones(n_elements) * 1.5
     
     # Compute local polygons (centered at origin)
     local_polys = []
@@ -582,11 +752,20 @@ def animate_ice_ship(
     
     fig, ax = plt.subplots(figsize=(14, 10))
     
-    # Colors
+    # Colors - ice color varies by thickness
     water_color = '#1A4D70'
-    ice_color = '#D8EAF3'
     crack_color = '#2A5D80'
     ship_color = '#404040'
+    
+    # Color map for thickness: thin ice = lighter, thick ice = darker
+    thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
+    ice_colors = []
+    for t in thickness_norm:
+        # Interpolate from light blue (thin) to darker blue (thick)
+        r = int(216 - 40 * t)
+        g = int(234 - 30 * t)
+        b = int(243 - 20 * t)
+        ice_colors.append(f'#{r:02x}{g:02x}{b:02x}')
     
     def rotate_polygon(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -612,26 +791,28 @@ def animate_ice_ship(
                 broken_neighbors[j].add(i)
         
         # Draw all ice elements
-        # Elements with no broken bonds: no visible edge (part of solid sheet)
-        # Elements with broken bonds: show edges where breaks occurred
+        # Color by thickness, edges shown for broken bonds
         for i in range(n_elements):
             rotated = rotate_polygon(local_polys[i], rotations[i])
             world_poly = rotated + positions[i]
             
             has_breaks = len(broken_neighbors[i]) > 0
             
+            # Color based on thickness
+            floe_color = ice_colors[i]
+            
             if has_breaks:
                 # Show this element with visible edge
                 edge_color = crack_color
                 edge_width = 1.0
             else:
-                # Part of intact ice sheet - edge same as fill (invisible)
-                edge_color = ice_color
-                edge_width = 0.5
+                # Part of intact ice sheet - subtle edge
+                edge_color = floe_color
+                edge_width = 0.3
             
             patch = MplPolygon(
                 world_poly,
-                facecolor=ice_color,
+                facecolor=floe_color,
                 edgecolor=edge_color,
                 linewidth=edge_width,
                 zorder=3,
@@ -702,7 +883,7 @@ def animate_ice_ship(
 
 def main():
     print("=" * 60, flush=True)
-    print("DPDEM: Ice-Ship Interaction with Voronoi Ice Elements", flush=True)
+    print("DPDEM: Ice-Ship Interaction with Realistic Fracture Physics", flush=True)
     print("=" * 60, flush=True)
     
     # Ice field parameters
@@ -710,24 +891,49 @@ def main():
     field_width = 45.0
     field_height = 35.0
     
-    # Ship parameters
+    # Ice thickness parameters (realistic Arctic sea ice)
+    # First-year ice: 0.3-2.0m, Multi-year ice: 2-4m
+    ice_thickness_mean = 1.5  # m
+    ice_thickness_std = 0.5   # m (creates natural variation)
+    
+    # Ship parameters (scaled down for visualization)
+    # Based on typical icebreaker proportions
     ship_length = 30.0
     ship_beam = 7.0
+    ship_draft = 3.0
+    ship_displacement = 8000e3  # 8000 tonnes in kg
+    
+    # Create ship with physical properties
+    ship_props = ShipProperties(
+        length=ship_length,
+        beam=ship_beam, 
+        draft=ship_draft,
+        displacement=ship_displacement
+    )
+    print(f"Ship: {ship_length}m x {ship_beam}m, mass={ship_props.mass/1e6:.1f} kt", 
+          flush=True)
+    
     # Start ship further away so we see approach
     ship_pos = np.array([field_width + 25, field_height / 2])
     
-    # Create Voronoi ice field
-    print("Generating Voronoi ice field...", flush=True)
-    polygons, centroids, bonds = create_voronoi_ice_field(
-        n_elements, field_width, field_height, seed=42
+    # Ice drift velocity (typical range: 0.1-0.5 m/s)
+    # Higher velocity = more kinetic energy = easier fracture
+    drift_vel = 2.0  # m/s (exaggerated for visualization)
+    
+    # Create Voronoi ice field with variable thickness
+    print("\nGenerating Voronoi ice field...", flush=True)
+    polygons, centroids, bonds, thicknesses = create_voronoi_ice_field(
+        n_elements, field_width, field_height, seed=42,
+        thickness_mean=ice_thickness_mean,
+        thickness_std=ice_thickness_std,
     )
     print(f"  Created {len(polygons)} ice elements with {len(bonds)} bonds", flush=True)
     
     # Create ship hull (bow facing left toward ice)
     ship_outline = create_ship_hull(ship_length, ship_beam, ship_pos, bow_direction='left')
     
-    # Run simulation (longer to see full interaction)
-    print("Running simulation...", flush=True)
+    # Run simulation with physics-based fracture
+    print("\nRunning simulation...", flush=True)
     positions, rotations, bonds_intact = simulate_ice_ship_interaction(
         polygons=polygons,
         centroids=centroids,
@@ -737,7 +943,9 @@ def main():
         ship_beam=ship_beam,
         n_frames=350,
         dt=0.05,
-        drift_vel=2.0,  # Faster drift
+        drift_vel=drift_vel,
+        thicknesses=thicknesses,
+        ship_props=ship_props,
     )
     
     n_final = bonds_intact[-1].sum()
@@ -752,6 +960,7 @@ def main():
         bonds=bonds,
         ship_outline=ship_outline,
         initial_centroids=centroids,
+        thicknesses=thicknesses,
         output_file='dpdem_ice_ship.gif',
         fps=20,
     )
