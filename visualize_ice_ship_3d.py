@@ -227,12 +227,26 @@ def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_pos,
 def animate_ice_ship_3d(
     polygons, positions_history, rotations_history, bonds_history, bonds,
     ship_hull_verts, ship_hull_faces, ship_pos, ship_length, ship_beam,
-    initial_centroids, ice_thickness=0.5, output_file='dpdem_ice_ship_3d.gif', fps=15
+    initial_centroids, ice_thickness=0.5, thicknesses=None,
+    output_file='dpdem_ice_ship_3d.gif', fps=15
 ):
     """Create 3D animation of ice-ship interaction with vertical physics."""
     
     n_frames = len(positions_history)
     n_elements = len(polygons)
+    
+    # Per-floe thickness for coloring
+    if thicknesses is None:
+        thicknesses = np.ones(n_elements) * ice_thickness
+    
+    # Color map for thickness: thin = white/cyan, thick = darker blue
+    thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
+    ice_colors = []
+    for t in thickness_norm:
+        r = int(240 - 90 * t)   # 240 -> 150
+        g = int(250 - 70 * t)   # 250 -> 180
+        b = int(255 - 30 * t)   # 255 -> 225
+        ice_colors.append(f'#{r:02x}{g:02x}{b:02x}')
     
     # Compute 3D physics (vertical movement, tilting)
     print("Computing 3D ice physics...", flush=True)
@@ -337,15 +351,16 @@ def animate_ice_ship_3d(
             top_verts = np.array(top_verts)
             bottom_verts = np.array(bottom_verts)
             
-            # Choose color based on state
+            # Choose color based on thickness and state
+            base_color = ice_colors[i]
             if has_breaks:
-                face_color = '#D0E8F0'  # Slightly different for broken
+                # Slightly darken broken ice
                 edge_color = '#3080A0'
                 edge_width = 1.0
             else:
-                face_color = ice_color
                 edge_color = '#A0C8D8'
                 edge_width = 0.3
+            face_color = base_color
             
             # Draw top face
             ax.add_collection3d(Poly3DCollection(
@@ -454,9 +469,9 @@ def main():
     field_height = 180.0
     n_elements = 150
     
-    # Ice thickness parameters (realistic Arctic sea ice)
+    # Ice thickness parameters - increased variation for visualization
     ice_thickness_mean = 2.5   # Multi-year ice average
-    ice_thickness_std = 0.8    # Natural variation
+    ice_thickness_std = 1.2    # Larger variation = more visible differences
     
     # Ship parameters: CCGS John G. Diefenbaker (Polar Class Icebreaker)
     ship_length = 158.0  # m
@@ -527,6 +542,7 @@ def main():
         ship_beam=ship_beam,
         initial_centroids=centroids,
         ice_thickness=ice_thickness,
+        thicknesses=thicknesses,
         output_file='dpdem_ice_ship_3d.gif',
         fps=12,
     )

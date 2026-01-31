@@ -757,14 +757,15 @@ def animate_ice_ship(
     crack_color = '#2A5D80'
     ship_color = '#404040'
     
-    # Color map for thickness: thin ice = lighter, thick ice = darker
+    # Color map for thickness: thin ice = lighter/whiter, thick ice = darker blue
     thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
     ice_colors = []
     for t in thickness_norm:
-        # Interpolate from light blue (thin) to darker blue (thick)
-        r = int(216 - 40 * t)
-        g = int(234 - 30 * t)
-        b = int(243 - 20 * t)
+        # Interpolate from white/light cyan (thin) to deep blue (thick)
+        # More dramatic color range for better visualization
+        r = int(240 - 100 * t)  # 240 -> 140
+        g = int(250 - 80 * t)   # 250 -> 170
+        b = int(255 - 40 * t)   # 255 -> 215 (stays blueish)
         ice_colors.append(f'#{r:02x}{g:02x}{b:02x}')
     
     def rotate_polygon(poly, angle):
@@ -886,15 +887,15 @@ def main():
     print("DPDEM: Ice-Ship Interaction with Realistic Fracture Physics", flush=True)
     print("=" * 60, flush=True)
     
-    # Ice field parameters
-    n_elements = 100
-    field_width = 45.0
-    field_height = 35.0
+    # Ice field parameters - more elements for variety
+    n_elements = 150
+    field_width = 55.0
+    field_height = 40.0
     
-    # Ice thickness parameters (realistic Arctic sea ice)
-    # First-year ice: 0.3-2.0m, Multi-year ice: 2-4m
-    ice_thickness_mean = 1.5  # m
-    ice_thickness_std = 0.5   # m (creates natural variation)
+    # Ice thickness parameters - increased variation for visualization
+    # Mix of thin first-year ice and thick multi-year ice
+    ice_thickness_mean = 1.8  # m
+    ice_thickness_std = 0.8   # m (larger variation = more visible differences)
     
     # Ship parameters (scaled down for visualization)
     # Based on typical icebreaker proportions
