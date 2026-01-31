@@ -926,9 +926,9 @@ def create_multi_patch_ice_field(
         patch_width = np.random.uniform(15, 35)
         patch_height = np.random.uniform(12, 28)
         
-        # Random thickness for this patch (thicker patches = multi-year ice)
+        # Random thickness for this patch (uniform across entire patch)
+        # Thicker patches = multi-year ice, thinner = first-year ice
         patch_thickness = np.random.uniform(0.5, 3.5)
-        thickness_var = patch_thickness * 0.15  # Small variation within patch
         
         # Generate Voronoi cells for this patch
         points = []
@@ -1026,9 +1026,8 @@ def create_multi_patch_ice_field(
                     patch_bonds.add((min(pi, pj) + element_offset, 
                                    max(pi, pj) + element_offset))
         
-        # Generate thicknesses for this patch
-        patch_thicknesses = np.random.normal(patch_thickness, thickness_var, n_valid)
-        patch_thicknesses = np.clip(patch_thicknesses, 0.3, 4.0)
+        # All elements in this patch have the same thickness
+        patch_thicknesses = np.full(n_valid, patch_thickness)
         
         # Add to global lists
         all_polygons.extend(patch_polygons)
