@@ -17,3 +17,9 @@ numpy>=1.24.0
 
 # Optional: for visualization
 matplotlib>=3.7.0
+
+# Optional: for satellite image ice floe extraction
+opencv-python>=4.5.0
+
+# Polygon operations (clipping Voronoi cells to floe boundaries)
+shapely>=2.0.0

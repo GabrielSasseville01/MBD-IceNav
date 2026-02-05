@@ -2,7 +2,7 @@
 Geometry module for DPDEM.
 
 Handles Voronoi tessellation, polyhedral extrusion, dilated polyhedra
-(Minkowski sums), and mesh utilities.
+(Minkowski sums), mesh utilities, and image-based floe extraction.
 """
 
 from .voronoi import generate_voronoi_polygons, clip_voronoi_to_domain
@@ -23,3 +23,16 @@ from .mesh import (
     compute_triangle_area,
     compute_triangle_normal,
 )
+
+# Image-based floe extraction (optional OpenCV dependency)
+try:
+    from .image_floes import (
+        segment_ice_floes,
+        extract_floe_polygons,
+        load_floes_from_pickle,
+        apply_scale_calibration,
+        process_image_to_polygons,
+        HAS_OPENCV,
+    )
+except ImportError:
+    HAS_OPENCV = False
