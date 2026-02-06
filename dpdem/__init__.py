@@ -21,3 +21,14 @@ from . import bonds
 from . import hydrodynamics
 from . import dynamics
 from . import integration
+
+# Autonomous navigation modules
+from . import control
+from . import planning
+from .navigation import (
+    AutonomousNavigator,
+    NavigationConfig,
+    NavigationState,
+    apply_control_to_platform,
+    get_control_moment,
+)

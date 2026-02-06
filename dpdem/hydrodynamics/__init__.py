@@ -6,9 +6,9 @@ Handles buoyancy and drag forces on submerged bodies.
 
 from .buoyancy import (
     compute_submerged_volume,
-    compute_center_of_buoyancy,
     compute_buoyancy_force,
     compute_buoyancy_moment,
+    compute_total_buoyancy,
     clip_triangle_to_waterline,
     tetrahedron_volume,
     tetrahedron_centroid,

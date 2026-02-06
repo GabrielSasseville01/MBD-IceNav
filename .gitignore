@@ -18,9 +18,14 @@ env/
 *.png
 *.mp4
 
-# Allow demo GIFs for README
+# Ignore generated GIFs (large files)
+autonomous_*.gif
+planned_navigation*.gif
+
+# Allow original demo GIFs for README
 !dpdem_ice_ship.gif
 !dpdem_ice_ship_3d.gif
+!medea_*.gif
 
 # OS
 .DS_Store
