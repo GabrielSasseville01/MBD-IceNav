@@ -1173,54 +1173,100 @@ def create_3d_animation(results, output_file='planned_navigation_3d.gif', fps=15
                     linewidth=0.1, alpha=0.8
                 ))
         
-        # Draw ship as 3D box
+        # Draw proper 3D ship hull (matching visualize_ice_ship_3d.py style)
         c, s = np.cos(ship_psi), np.sin(ship_psi)
         half_l, half_b = ship.length / 2, ship.beam / 2
+        deck_height = 1.5
         
-        # Ship corners in local frame
-        corners_local = np.array([
-            [half_l, half_b], [half_l, -half_b],
-            [-half_l, -half_b], [-half_l, half_b]
-        ])
+        # Create hull cross-sections
+        n_sections = 10
+        hull_verts = []
         
-        # Taper bow
-        taper_corners = []
-        for cl in corners_local:
-            if cl[0] > 0:  # Bow end
-                taper = max(0.3, 1 - 0.7 * (cl[0] / half_l))
-                taper_corners.append([cl[0], cl[1] * taper])
+        for i in range(n_sections + 1):
+            t = i / n_sections  # 0 at stern, 1 at bow
+            x_local = half_l - t * ship.length  # Bow at +half_l, stern at -half_l
+            
+            # Taper at bow
+            x_rel = x_local / half_l
+            if x_rel > 0.6:
+                taper = 1.0 - 0.9 * ((x_rel - 0.6) / 0.4) ** 1.5
             else:
-                taper_corners.append(cl)
-        taper_corners = np.array(taper_corners)
+                taper = 1.0
+            taper = max(taper, 0.05)
+            
+            local_beam = ship.beam * taper
+            local_draft = ship_draft * taper
+            local_deck = deck_height * taper
+            
+            # Cross-section vertices in local coords: deck_port, deck_starboard, 
+            # waterline_port, waterline_starboard, keel
+            section_verts_local = [
+                [x_local, -local_beam/2, local_deck],      # Deck port
+                [x_local, local_beam/2, local_deck],       # Deck starboard
+                [x_local, -local_beam/2 * 0.9, 0],         # Waterline port
+                [x_local, local_beam/2 * 0.9, 0],          # Waterline starboard
+                [x_local, 0, -local_draft],                # Keel
+            ]
+            hull_verts.extend(section_verts_local)
         
-        # Rotate and translate
-        R = np.array([[c, -s], [s, c]])
-        ship_corners = taper_corners @ R.T + np.array([ship_x, ship_y])
+        hull_verts = np.array(hull_verts)
         
-        # Ship 3D (deck at z=1, keel at z=-2)
-        deck_z = 1.5
-        keel_z = -ship_draft
+        # Rotate hull vertices
+        R_3d = np.array([
+            [c, -s, 0],
+            [s, c, 0],
+            [0, 0, 1]
+        ])
+        hull_verts_world = hull_verts @ R_3d.T + np.array([ship_x, ship_y, 0])
         
-        ship_top = np.column_stack([ship_corners, np.full(4, deck_z)])
-        ship_bot = np.column_stack([ship_corners, np.full(4, keel_z)])
+        # Create and draw faces
+        verts_per_section = 5
+        deck_color = '#8B4513'      # Brown deck
+        hull_above = '#C0C0C0'      # Gray above waterline
+        hull_below = '#8B0000'      # Dark red below waterline
         
-        ax.add_collection3d(Poly3DCollection(
-            [ship_top], facecolor='#606060', edgecolor='#303030',
-            linewidth=1, alpha=0.95, zorder=10
-        ))
-        ax.add_collection3d(Poly3DCollection(
-            [ship_bot], facecolor='#800000', edgecolor='#400000',
-            linewidth=1, alpha=0.9, zorder=10
-        ))
-        
-        # Ship sides
-        for j in range(4):
-            k = (j + 1) % 4
-            side = np.array([ship_bot[j], ship_bot[k], ship_top[k], ship_top[j]])
-            color = '#808080' if side[0, 2] > 0 else '#700000'
+        for i in range(n_sections):
+            base = i * verts_per_section
+            next_base = (i + 1) * verts_per_section
+            
+            # Deck (top horizontal)
+            deck_face = [hull_verts_world[base], hull_verts_world[next_base],
+                        hull_verts_world[next_base + 1], hull_verts_world[base + 1]]
             ax.add_collection3d(Poly3DCollection(
-                [side], facecolor=color, edgecolor='#303030',
-                linewidth=0.5, alpha=0.9, zorder=10
+                [deck_face], facecolor=deck_color, edgecolor='#5D3A1A',
+                linewidth=0.5, alpha=0.95, zorder=10
+            ))
+            
+            # Port side top (deck to waterline)
+            port_top = [hull_verts_world[base], hull_verts_world[base + 2],
+                       hull_verts_world[next_base + 2], hull_verts_world[next_base]]
+            ax.add_collection3d(Poly3DCollection(
+                [port_top], facecolor=hull_above, edgecolor='#808080',
+                linewidth=0.3, alpha=0.95, zorder=10
+            ))
+            
+            # Starboard side top (deck to waterline)
+            starboard_top = [hull_verts_world[base + 1], hull_verts_world[next_base + 1],
+                            hull_verts_world[next_base + 3], hull_verts_world[base + 3]]
+            ax.add_collection3d(Poly3DCollection(
+                [starboard_top], facecolor=hull_above, edgecolor='#808080',
+                linewidth=0.3, alpha=0.95, zorder=10
+            ))
+            
+            # Port side bottom (waterline to keel)
+            port_bot = [hull_verts_world[base + 2], hull_verts_world[base + 4],
+                       hull_verts_world[next_base + 4], hull_verts_world[next_base + 2]]
+            ax.add_collection3d(Poly3DCollection(
+                [port_bot], facecolor=hull_below, edgecolor='#5C0000',
+                linewidth=0.3, alpha=0.95, zorder=10
+            ))
+            
+            # Starboard side bottom (waterline to keel)
+            starboard_bot = [hull_verts_world[base + 3], hull_verts_world[next_base + 3],
+                            hull_verts_world[next_base + 4], hull_verts_world[base + 4]]
+            ax.add_collection3d(Poly3DCollection(
+                [starboard_bot], facecolor=hull_below, edgecolor='#5C0000',
+                linewidth=0.3, alpha=0.95, zorder=10
             ))
         
         # Goal marker
@@ -1265,8 +1311,11 @@ def main():
     )
     
     create_animation(results, output_file='planned_navigation_sparse.gif', fps=20)
-    
     print("\nOutput: planned_navigation_sparse.gif")
+    
+    # Also create 3D animation
+    create_3d_animation(results, output_file='planned_navigation_sparse_3d.gif', fps=15)
+    print("Output: planned_navigation_sparse_3d.gif")
 
 
 if __name__ == '__main__':
