@@ -211,6 +211,47 @@ def create_ship_hull(length, beam, position, bow_direction='left'):
     return np.column_stack([hull_x, hull_y])
 
 
+def create_ship_hull_at_position_heading(length, beam, position, heading):
+    """Create ship hull outline at position with given heading (radians). Bow faces heading direction."""
+    cx, cy = position
+    half_len = length / 2
+    half_beam = beam / 2
+    n_pts = 30
+    
+    # Build hull in local frame (bow at +x, centered at origin)
+    local_x = []
+    local_y = []
+    for i in range(n_pts + 1):
+        t = i / n_pts
+        x_local = half_len - t * length  # bow at +half_len, stern at -half_len
+        x_rel = x_local / half_len
+        if x_rel > 0.6:
+            taper = 1.0 - 0.9 * ((x_rel - 0.6) / 0.4) ** 1.5
+        else:
+            taper = 1.0
+        taper = max(taper, 0.02)
+        local_x.append(x_local)
+        local_y.append(half_beam * taper)
+    for i in range(n_pts, -1, -1):
+        t = i / n_pts
+        x_local = half_len - t * length
+        x_rel = x_local / half_len
+        if x_rel > 0.6:
+            taper = 1.0 - 0.9 * ((x_rel - 0.6) / 0.4) ** 1.5
+        else:
+            taper = 1.0
+        taper = max(taper, 0.02)
+        local_x.append(x_local)
+        local_y.append(-half_beam * taper)
+    
+    local_verts = np.column_stack([local_x, local_y])
+    # Rotate by heading and translate to position
+    c, s = np.cos(heading), np.sin(heading)
+    R = np.array([[c, -s], [s, c]])
+    world_verts = local_verts @ R.T + np.array([cx, cy])
+    return world_verts
+
+
 # ============================================================================
 # Internal Tessellation (convert large floes to small cells)
 # ============================================================================
@@ -475,14 +516,18 @@ def find_connected_components(n, bonds, intact):
     return components
 
 
-def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_start=0.6):
-    """Check collision with ship hull."""
+def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_start=0.6, ship_heading=0.0):
+    """Check collision with ship hull. ship_heading: angle in radians (0 = bow toward -x)."""
     cx, cy = ship_pos
     half_len = ship_length / 2
     half_beam = ship_beam / 2
     
-    rel_x = px - cx
-    rel_y = py - cy
+    # Transform to ship-local frame (ship bow along -x when heading=0)
+    dx = px - cx
+    dy = py - cy
+    c, s = np.cos(-ship_heading), np.sin(-ship_heading)
+    rel_x = c * dx - s * dy
+    rel_y = s * dx + c * dy
     x_rel = rel_x / half_len
     
     if x_rel < -bow_taper_start:
@@ -508,31 +553,38 @@ def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_
         bow_angle = 0.3 + 0.5 * t
         
         if rel_y >= 0:
-            nx = -np.cos(bow_angle)
-            ny = np.sin(bow_angle)
+            nx_local = -np.cos(bow_angle)
+            ny_local = np.sin(bow_angle)
         else:
-            nx = -np.cos(bow_angle)
-            ny = -np.sin(bow_angle)
+            nx_local = -np.cos(bow_angle)
+            ny_local = -np.sin(bow_angle)
         
         pen = min(dist_to_bow, dist_to_side) + 0.5
     else:
         if dist_to_bow < dist_to_side:
-            nx, ny = -1, 0
+            nx_local, ny_local = -1, 0
             pen = dist_to_bow
         else:
-            nx, ny = 0, 1 if rel_y > 0 else -1
+            nx_local = 0
+            ny_local = 1 if rel_y > 0 else -1
             pen = dist_to_side
+    
+    # Rotate normal back to world frame
+    nx = np.cos(ship_heading) * nx_local - np.sin(ship_heading) * ny_local
+    ny = np.sin(ship_heading) * nx_local + np.cos(ship_heading) * ny_local
     
     return max(pen, 0), nx, ny
 
 
 def simulate_ice_ship_interaction(
     polygons, centroids, bonds, ship_pos, ship_length, ship_beam,
-    n_frames, dt, drift_vel, thicknesses, ship_props
+    n_frames, dt, drift_vel, thicknesses, ship_props,
+    ship_trajectory=None  # Optional: list of (pos, heading) per frame for moving ship
 ):
     """
-    Simulate ice drifting toward ship with fracture mechanics.
-    Same physics as visualize_ice_ship.py, adapted for satellite floes.
+    Simulate ice-ship interaction with fracture mechanics.
+    If ship_trajectory is provided: ship moves through ice (no drift).
+    Otherwise: ice drifts toward stationary ship.
     """
     n = len(polygons)
     
@@ -577,13 +629,22 @@ def simulate_ice_ship_interaction(
     positions_history = [positions.copy()]
     rotations_history = [rotations.copy()]
     bonds_history = [bond_intact.copy()]
+    ship_history = []
     
-    ship_impact_force = ship_props.impact_force(drift_vel, np.mean(thicknesses))
+    ship_impact_force = ship_props.impact_force(drift_vel, np.mean(thicknesses)) if drift_vel > 0 else 0.0
     print(f"  Ship impact force: {ship_impact_force/1e6:.2f} MN", flush=True)
     
     collision_count = 0
     ever_collided = set()  # Track which elements ever collided throughout simulation
+    
     for frame in range(n_frames):
+        # Ship position and heading this frame
+        if ship_trajectory is not None:
+            ship_pos_frame, ship_heading = ship_trajectory[min(frame, len(ship_trajectory) - 1)]
+        else:
+            ship_pos_frame = ship_pos
+            ship_heading = 0.0
+        
         # Find connected components
         components = find_connected_components(n, bonds, bond_intact)
         
@@ -609,7 +670,7 @@ def simulate_ice_ship_interaction(
             # Check collision at polygon vertices (actual floe shape)
             for vx, vy in world_poly:
                 test_pen, test_nx, test_ny = point_to_ship_collision(
-                    vx, vy, ship_pos, ship_length, ship_beam
+                    vx, vy, ship_pos_frame, ship_length, ship_beam, ship_heading=ship_heading
                 )
                 if test_pen > pen:
                     pen, nx, ny = test_pen, test_nx, test_ny
@@ -621,7 +682,7 @@ def simulate_ice_ship_interaction(
                 v2 = world_poly[(j + 1) % n_verts]
                 mid = (v1 + v2) / 2
                 test_pen, test_nx, test_ny = point_to_ship_collision(
-                    mid[0], mid[1], ship_pos, ship_length, ship_beam
+                    mid[0], mid[1], ship_pos_frame, ship_length, ship_beam, ship_heading=ship_heading
                 )
                 if test_pen > pen:
                     pen, nx, ny = test_pen, test_nx, test_ny
@@ -637,7 +698,7 @@ def simulate_ice_ship_interaction(
                 ship_collision_force[i] = force_mag
                 
                 # Side push for flow around hull
-                rel_y = py - ship_pos[1]
+                rel_y = py - ship_pos_frame[1]
                 side_direction = 1 if rel_y > 0 else -1
                 side_push = (ship_props.mass / 1e6) * 3e4 * pen * side_direction
                 forces[i, 1] += side_push
@@ -659,12 +720,13 @@ def simulate_ice_ship_interaction(
                     forces[i] -= f
                     forces[j] += f
         
-        # Drift force
-        for comp in components:
-            total_mass = sum(masses[i] for i in comp)
-            drift_force = drift_vel * total_mass * 8
-            for i in comp:
-                forces[i, 0] += drift_force * masses[i] / total_mass
+        # Drift force (only when ship is stationary - ice drifts toward ship)
+        if ship_trajectory is None:
+            for comp in components:
+                total_mass = sum(masses[i] for i in comp)
+                drift_force = drift_vel * total_mass * 8
+                for i in comp:
+                    forces[i, 0] += drift_force * masses[i] / total_mass
         
         # Water drag
         for i in range(n):
@@ -756,6 +818,7 @@ def simulate_ice_ship_interaction(
         positions_history.append(positions.copy())
         rotations_history.append(rotations.copy())
         bonds_history.append(bond_intact.copy())
+        ship_history.append((ship_pos_frame, ship_heading))
     
     if collision_count > 0:
         print(f"  Total collisions: {collision_count}", flush=True)
@@ -771,7 +834,7 @@ def simulate_ice_ship_interaction(
     else:
         print("  WARNING: No collisions detected!", flush=True)
     
-    return positions_history, rotations_history, bonds_history
+    return positions_history, rotations_history, bonds_history, ship_history
 
 
 # ============================================================================
@@ -780,10 +843,10 @@ def simulate_ice_ship_interaction(
 
 def animate_ice_ship_2d(
     polygons, positions_history, rotations_history, bonds_history, bonds,
-    ship_outline, initial_centroids, thicknesses,
+    ship_history, ship_length, ship_beam, initial_centroids, thicknesses,
     output_file='medea_ship_fracture.gif', fps=20
 ):
-    """Animate ice-ship interaction in 2D."""
+    """Animate ice-ship interaction in 2D. ship_history: list of (pos, heading) per frame."""
     n_frames = len(positions_history)
     n_elements = len(polygons)
     
@@ -793,10 +856,14 @@ def animate_ice_ship_2d(
         local_polys.append(poly - centroid)
     
     all_pos = np.concatenate(positions_history)
-    x_min = min(all_pos[:, 0].min(), ship_outline[:, 0].min()) - 20
-    x_max = max(all_pos[:, 0].max(), ship_outline[:, 0].max()) + 20
-    y_min = min(all_pos[:, 1].min(), ship_outline[:, 1].min()) - 20
-    y_max = max(all_pos[:, 1].max(), ship_outline[:, 1].max()) + 20
+    x_min, x_max = all_pos[:, 0].min() - 20, all_pos[:, 0].max() + 20
+    y_min, y_max = all_pos[:, 1].min() - 20, all_pos[:, 1].max() + 20
+    if len(ship_history) > 0:
+        ship_positions = np.array([h[0] for h in ship_history])
+        x_min = min(x_min, ship_positions[:, 0].min() - ship_length)
+        x_max = max(x_max, ship_positions[:, 0].max() + ship_length)
+        y_min = min(y_min, ship_positions[:, 1].min() - ship_beam)
+        y_max = max(y_max, ship_positions[:, 1].max() + ship_beam)
     
     fig, ax = plt.subplots(figsize=(16, 12))
     
@@ -855,14 +922,19 @@ def animate_ice_ship_2d(
             ax.add_patch(patch)
         
         # Draw ship
-        ship_patch = MplPolygon(
-            ship_outline, closed=True,
-            facecolor=ship_color,
-            edgecolor='#202020',
-            linewidth=2,
-            alpha=0.95
-        )
-        ax.add_patch(ship_patch)
+        if frame < len(ship_history):
+            ship_pos_frame, ship_heading = ship_history[frame]
+            ship_outline = create_ship_hull_at_position_heading(
+                ship_length, ship_beam, ship_pos_frame, ship_heading
+            )
+            ship_patch = MplPolygon(
+                ship_outline, closed=True,
+                facecolor=ship_color,
+                edgecolor='#202020',
+                linewidth=2,
+                alpha=0.95
+            )
+            ax.add_patch(ship_patch)
         
         # Stats
         n_broken = np.sum(~intact)
@@ -889,115 +961,254 @@ def animate_ice_ship_2d(
 # 3D Visualization
 # ============================================================================
 
+def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_history,
+                           ship_length, ship_beam, ship_draft, n_elements):
+    """
+    Add 3D ice dynamics: ice bends and submerges under ship hull when pushed.
+    Broken ice goes under the hull; intact ice bends at the bow.
+    """
+    n_frames = len(positions_history)
+    z_positions = [np.zeros(n_elements) for _ in range(n_frames)]
+    tilts_x = [np.zeros(n_elements) for _ in range(n_frames)]
+    tilts_y = [np.zeros(n_elements) for _ in range(n_frames)]
+    
+    for frame in range(1, n_frames):
+        positions = positions_history[frame]
+        intact = bonds_history[frame]
+        ship_pos, ship_psi = ship_history[min(frame, len(ship_history) - 1)]
+        ship_x, ship_y = ship_pos[0], ship_pos[1]
+        
+        prev_z = z_positions[frame - 1].copy()
+        prev_tilt_x = tilts_x[frame - 1].copy()
+        
+        broken_count = np.zeros(n_elements)
+        for b, (i, j) in enumerate(bonds):
+            if not intact[b]:
+                broken_count[i] += 1
+                broken_count[j] += 1
+        
+        new_z = prev_z.copy()
+        new_tilt_x = prev_tilt_x.copy()
+        new_tilt_y = tilts_y[frame - 1].copy()
+        
+        bow_x = ship_x + (ship_length / 2) * np.cos(ship_psi)
+        bow_y = ship_y + (ship_length / 2) * np.sin(ship_psi)
+        
+        for i in range(n_elements):
+            px, py = positions[i]
+            dx = px - ship_x
+            dy = py - ship_y
+            c, s = np.cos(-ship_psi), np.sin(-ship_psi)
+            local_x = c * dx - s * dy
+            local_y = s * dx + c * dy
+            dist_from_bow = ship_length / 2 - local_x
+            
+            if 0 < dist_from_bow < ship_length * 0.4 and abs(local_y) < ship_beam:
+                push_factor = 1 - dist_from_bow / (ship_length * 0.4)
+                if broken_count[i] > 0:
+                    target_z = -ship_draft - push_factor * 2.0
+                    new_z[i] += (target_z - new_z[i]) * 0.15
+                    new_tilt_x[i] += (0.4 * push_factor - new_tilt_x[i]) * 0.1
+                else:
+                    new_tilt_x[i] += (0.2 * push_factor - new_tilt_x[i]) * 0.05
+            elif dist_from_bow < 0:
+                if broken_count[i] > 0 and abs(local_y) < ship_beam * 0.8:
+                    new_z[i] += (-ship_draft * 0.9 - new_z[i]) * 0.05
+                elif new_z[i] < -0.5:
+                    new_z[i] += (0 - new_z[i]) * 0.03
+            
+            new_tilt_x[i] *= 0.95
+            new_tilt_y[i] *= 0.95
+            
+            dist_to_ship = np.sqrt((px - ship_x)**2 + (py - ship_y)**2)
+            if new_z[i] < -0.3 and dist_to_ship > ship_length:
+                new_z[i] += 0.02
+        
+        z_positions[frame] = new_z
+        tilts_x[frame] = new_tilt_x
+        tilts_y[frame] = new_tilt_y
+    
+    return z_positions, tilts_x, tilts_y
+
+
 def animate_ice_ship_3d(
     polygons, positions_history, rotations_history, bonds_history, bonds,
-    ship_pos, ship_length, ship_beam, ship_draft,
+    ship_history, ship_length, ship_beam, ship_draft,
     initial_centroids, thicknesses,
-    output_file='medea_ship_fracture_3d.gif', fps=15, max_floes=50
+    output_file='medea_ship_fracture_3d.gif', fps=15, frame_skip=2
 ):
-    """Create 3D animation."""
+    """
+    Create 3D animation matching 2D: same ice map, ship motion, plus 3D ice dynamics
+    (bending, submerging under hull).
+    """
     n_frames = len(positions_history)
-    n_elements = min(len(polygons), max_floes)
-    
-    # Select largest floes for 3D visualization
-    areas = np.array([polygon_area(p) for p in polygons])
-    indices = np.argsort(areas)[-n_elements:]
+    n_elements = len(polygons)
     
     local_polys = []
-    for i in indices:
-        centroid = polygon_centroid(polygons[i])
-        local_polys.append(polygons[i] - centroid)
+    for poly in polygons:
+        centroid = polygon_centroid(poly)
+        local_polys.append(poly - centroid)
+    
+    all_pos = np.concatenate(positions_history)
+    x_min, x_max = all_pos[:, 0].min() - 50, all_pos[:, 0].max() + 50
+    y_min, y_max = all_pos[:, 1].min() - 50, all_pos[:, 1].max() + 50
+    domain_width = x_max - x_min
+    domain_height = y_max - y_min
+    
+    print(f"  Computing 3D ice dynamics (bending, submerging)...", flush=True)
+    z_positions, tilts_x, tilts_y = simulate_3d_ice_physics(
+        positions_history, bonds_history, bonds, ship_history,
+        ship_length, ship_beam, ship_draft, n_elements
+    )
+    
+    thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
+    ice_colors = []
+    for t in thickness_norm:
+        r = int(230 - 80 * t)
+        g = int(245 - 60 * t)
+        b = int(255 - 30 * t)
+        ice_colors.append(f'#{r:02x}{g:02x}{b:02x}')
     
     fig = plt.figure(figsize=(16, 12))
     ax = fig.add_subplot(111, projection='3d')
     
-    all_pos = np.concatenate([positions_history[f][indices] for f in range(n_frames)])
-    x_range = all_pos[:, 0].max() - all_pos[:, 0].min()
-    y_range = all_pos[:, 1].max() - all_pos[:, 1].min()
+    frames_to_render = list(range(0, n_frames, frame_skip))
+    if frames_to_render[-1] != n_frames - 1:
+        frames_to_render.append(n_frames - 1)
     
-    print(f"Creating 3D animation with {n_frames} frames...", flush=True)
+    print(f"  Creating 3D animation with {len(frames_to_render)} frames...", flush=True)
     
-    def update(frame):
+    def rotate_poly(poly, angle):
+        c, s = np.cos(angle), np.sin(angle)
+        R = np.array([[c, -s], [s, c]])
+        return poly @ R.T
+    
+    def update(frame_idx):
+        frame = frames_to_render[frame_idx]
         ax.clear()
         
+        ship_pos, ship_psi = ship_history[min(frame, len(ship_history) - 1)]
+        ship_x, ship_y = ship_pos[0], ship_pos[1]
         positions = positions_history[frame]
         rotations = rotations_history[frame]
+        intact = bonds_history[frame]
+        z_pos = z_positions[frame]
+        tilt_x = tilts_x[frame]
+        tilt_y = tilts_y[frame]
         
-        # Draw ice floes
-        for idx, i in enumerate(indices):
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_zlim(-ship_draft - 3, 5)
+        ax.set_box_aspect([domain_width, domain_height, (ship_draft + 8) * 2])
+        ax.view_init(elev=30, azim=-60 + frame * 0.15)
+        
+        # Draw ice with 3D dynamics (z offset, tilt)
+        for i in range(n_elements):
+            rotated = rotate_poly(local_polys[i], rotations[i])
+            world_poly = rotated + positions[i]
+            z_center = z_pos[i]
+            tx, ty = tilt_x[i], tilt_y[i]
             h = thicknesses[i]
-            angle = rotations[i]
-            c, s = np.cos(angle), np.sin(angle)
-            R = np.array([[c, -s], [s, c]])
             
-            poly_2d = local_polys[idx] @ R.T + positions[i]
+            n_verts = len(world_poly)
+            center_xy = positions[i]
+            top_verts = []
+            bottom_verts = []
+            for v in world_poly:
+                dx = v[0] - center_xy[0]
+                dy = v[1] - center_xy[1]
+                z_offset = dx * np.sin(tx) + dy * np.sin(ty)
+                top_verts.append([v[0], v[1], z_center + h * 0.1 + z_offset])
+                bottom_verts.append([v[0], v[1], z_center - h * 0.9 + z_offset])
             
-            # Top face
-            top_verts = np.column_stack([poly_2d, np.full(len(poly_2d), h * 0.1)])
-            # Bottom face
-            bot_verts = np.column_stack([poly_2d, np.full(len(poly_2d), -h * 0.9)])
+            top_verts = np.array(top_verts)
+            bottom_verts = np.array(bottom_verts)
             
-            # Draw faces
+            has_breaks = any(not intact[b] for b, (pi, pj) in enumerate(bonds) if pi == i or pj == i)
+            edge_color = '#2080A0' if has_breaks else '#A0C8D8'
+            
             ax.add_collection3d(Poly3DCollection(
-                [top_verts], alpha=0.8, facecolor='#E8F4F8', edgecolor='#A0C0D0', linewidth=0.5
+                [top_verts], facecolor=ice_colors[i], edgecolor=edge_color,
+                linewidth=0.5 if has_breaks else 0.2, alpha=0.9
             ))
-            ax.add_collection3d(Poly3DCollection(
-                [bot_verts], alpha=0.6, facecolor='#B0D0E0', edgecolor='#80A0B0', linewidth=0.5
-            ))
-            
-            # Side faces
-            n_verts = len(poly_2d)
             for j in range(n_verts):
                 k = (j + 1) % n_verts
-                side = np.array([
-                    [poly_2d[j, 0], poly_2d[j, 1], h * 0.1],
-                    [poly_2d[k, 0], poly_2d[k, 1], h * 0.1],
-                    [poly_2d[k, 0], poly_2d[k, 1], -h * 0.9],
-                    [poly_2d[j, 0], poly_2d[j, 1], -h * 0.9],
-                ])
+                side = np.array([bottom_verts[j], bottom_verts[k], top_verts[k], top_verts[j]])
                 ax.add_collection3d(Poly3DCollection(
-                    [side], alpha=0.7, facecolor='#D0E8F0', edgecolor='#90B0C0', linewidth=0.3
+                    [side], facecolor='#C8E0F0', edgecolor=edge_color, linewidth=0.1, alpha=0.8
                 ))
         
-        # Draw ship
-        sx, sy = ship_pos
-        ship_verts_top = [
-            [sx - ship_length/2, sy - ship_beam/2, ship_draft * 0.3],
-            [sx + ship_length/2, sy - ship_beam/2, ship_draft * 0.3],
-            [sx + ship_length/2, sy + ship_beam/2, ship_draft * 0.3],
-            [sx - ship_length/2, sy + ship_beam/2, ship_draft * 0.3],
-        ]
-        ship_verts_bot = [
-            [sx - ship_length/2, sy - ship_beam/2, -ship_draft * 0.7],
-            [sx + ship_length/2, sy - ship_beam/2, -ship_draft * 0.7],
-            [sx + ship_length/2, sy + ship_beam/2, -ship_draft * 0.7],
-            [sx - ship_length/2, sy + ship_beam/2, -ship_draft * 0.7],
-        ]
+        # Draw 3D ship hull at correct position and heading
+        c, s = np.cos(ship_psi), np.sin(ship_psi)
+        half_l, half_b = ship_length / 2, ship_beam / 2
+        deck_height = 1.5
+        n_sections = 10
         
-        ax.add_collection3d(Poly3DCollection(
-            [ship_verts_top], alpha=0.9, facecolor='#505050', edgecolor='#303030'
-        ))
-        ax.add_collection3d(Poly3DCollection(
-            [ship_verts_bot], alpha=0.9, facecolor='#404040', edgecolor='#303030'
-        ))
+        hull_verts = []
+        for i in range(n_sections + 1):
+            t = i / n_sections
+            x_local = half_l - t * ship_length
+            x_rel = x_local / half_l
+            taper = 1.0 - 0.9 * ((x_rel - 0.6) / 0.4) ** 1.5 if x_rel > 0.6 else 1.0
+            taper = max(taper, 0.05)
+            local_beam = ship_beam * taper
+            local_draft = ship_draft * taper
+            local_deck = deck_height * taper
+            hull_verts.extend([
+                [x_local, -local_beam/2, local_deck],
+                [x_local, local_beam/2, local_deck],
+                [x_local, -local_beam/2 * 0.9, 0],
+                [x_local, local_beam/2 * 0.9, 0],
+                [x_local, 0, -local_draft],
+            ])
         
-        # Set view
-        ax.set_xlim(all_pos[:, 0].min() - 50, all_pos[:, 0].max() + 50)
-        ax.set_ylim(all_pos[:, 1].min() - 50, all_pos[:, 1].max() + 50)
-        ax.set_zlim(-5, 5)
-        ax.view_init(elev=25, azim=-60 + frame * 0.1)
+        hull_verts = np.array(hull_verts)
+        R_3d = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        hull_verts_world = hull_verts @ R_3d.T + np.array([ship_x, ship_y, 0])
         
+        verts_per_section = 5
+        deck_color, hull_above, hull_below = '#8B4513', '#C0C0C0', '#8B0000'
+        
+        for i in range(n_sections):
+            base = i * verts_per_section
+            next_base = (i + 1) * verts_per_section
+            deck_face = [hull_verts_world[base], hull_verts_world[next_base],
+                        hull_verts_world[next_base + 1], hull_verts_world[base + 1]]
+            ax.add_collection3d(Poly3DCollection(
+                [deck_face], facecolor=deck_color, edgecolor='#5D3A1A', linewidth=0.5, alpha=0.95
+            ))
+            port_top = [hull_verts_world[base], hull_verts_world[base + 2],
+                       hull_verts_world[next_base + 2], hull_verts_world[next_base]]
+            ax.add_collection3d(Poly3DCollection(
+                [port_top], facecolor=hull_above, edgecolor='#808080', linewidth=0.3, alpha=0.95
+            ))
+            starboard_top = [hull_verts_world[base + 1], hull_verts_world[next_base + 1],
+                            hull_verts_world[next_base + 3], hull_verts_world[base + 3]]
+            ax.add_collection3d(Poly3DCollection(
+                [starboard_top], facecolor=hull_above, edgecolor='#808080', linewidth=0.3, alpha=0.95
+            ))
+            port_bot = [hull_verts_world[base + 2], hull_verts_world[base + 4],
+                       hull_verts_world[next_base + 4], hull_verts_world[next_base + 2]]
+            ax.add_collection3d(Poly3DCollection(
+                [port_bot], facecolor=hull_below, edgecolor='#5C0000', linewidth=0.3, alpha=0.95
+            ))
+            starboard_bot = [hull_verts_world[base + 3], hull_verts_world[next_base + 3],
+                            hull_verts_world[next_base + 4], hull_verts_world[base + 4]]
+            ax.add_collection3d(Poly3DCollection(
+                [starboard_bot], facecolor=hull_below, edgecolor='#5C0000', linewidth=0.3, alpha=0.95
+            ))
+        
+        n_broken = np.sum(~intact)
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')
         ax.set_zlabel('Z [m]')
-        ax.set_title(f'DPDEM 3D Ice-Ship Simulation\nFrame {frame}/{n_frames-1}')
-        
+        ax.set_title(f'DPDEM 3D Ice-Ship Simulation (MEDEA)\nFrame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken')
         return []
     
-    anim = FuncAnimation(fig, update, frames=n_frames, blit=False)
-    print(f"Saving to {output_file}...", flush=True)
+    anim = FuncAnimation(fig, update, frames=len(frames_to_render), blit=False)
+    print(f"  Saving to {output_file}...", flush=True)
     anim.save(output_file, writer=PillowWriter(fps=fps))
-    print("Done!", flush=True)
+    print("  Done!", flush=True)
     plt.close(fig)
 
 
@@ -1009,12 +1220,16 @@ def main():
     parser = argparse.ArgumentParser(description='MEDEA Ice Ship Fracture Simulation')
     parser.add_argument('--quick', action='store_true', help='Simulation only, no animations')
     parser.add_argument('--no-3d', action='store_true', help='Skip 3D animation')
+    parser.add_argument('--full-map', action='store_true',
+                        help='Use full ice map; ship starts bottom-left, moves diagonally to top-right')
     args = parser.parse_args()
     
     total_start = time.time()
     
     print("=" * 70)
     print("DPDEM: MEDEA Satellite Ice + Ship Fracture Simulation")
+    if args.full_map:
+        print("  [FULL MAP MODE - ship diagonal bottom-left to top-right]")
     if args.quick:
         print("  [QUICK MODE - simulation only]")
     elif args.no_3d:
@@ -1049,38 +1264,46 @@ def main():
     print(f"Scaling to world coordinates ({METERS_PER_PIXEL} m/px)...", flush=True)
     all_polygons, all_centroids = scale_floes_to_world(
         polygons_px, centroids_px, METERS_PER_PIXEL, center_domain=True,
-        subsample_region=None  # Use all floes first
+        subsample_region=None
     )
     
-    # Filter to keep only floes in ship's path (narrow y-band for meaningful collision)
-    y_center = (all_centroids[:, 1].min() + all_centroids[:, 1].max()) / 2
-    y_band = 80.0  # Keep floes within +/- 80m of ship centerline
-    keep_mask = np.abs(all_centroids[:, 1] - y_center) < y_band
-    
-    sat_polygons = [all_polygons[i] for i in range(len(all_polygons)) if keep_mask[i]]
-    sat_centroids = all_centroids[keep_mask]
-    
-    print(f"  Selected {len(sat_polygons)} satellite floes in ship's path", flush=True)
+    if args.full_map:
+        # Full map: use ALL floes (like run_medea_floes.py)
+        sat_polygons = all_polygons
+        sat_centroids = all_centroids
+        print(f"  Using full ice map: {len(sat_polygons)} floes", flush=True)
+    else:
+        # Narrow band: filter to floes in ship's path (original behavior)
+        y_center = (all_centroids[:, 1].min() + all_centroids[:, 1].max()) / 2
+        y_band = 80.0
+        keep_mask = np.abs(all_centroids[:, 1] - y_center) < y_band
+        sat_polygons = [all_polygons[i] for i in range(len(all_polygons)) if keep_mask[i]]
+        sat_centroids = all_centroids[keep_mask]
+        print(f"  Selected {len(sat_polygons)} floes in ship's path (y +/- {y_band}m)", flush=True)
     
     # Tessellate each satellite floe internally for FRACTURING
-    # This allows pieces to break OFF from larger floes
     print("Tessellating floes internally for fracturing...", flush=True)
-    # DENSITY-BASED: 0.8 cells per 100m² = ~1 cell per 125m² = ~11m radius cells
-    CELLS_PER_100M2 = 0.8  # Higher = more cells = more fracturing
+    CELLS_PER_100M2 = 0.8
     all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
         sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=42
     )
     print(f"  Created {len(all_cells)} total cells", flush=True)
     
-    # Filter cells to keep only those in ship's collision path
-    ship_y_center = y_center  # Same as satellite floe center
-    cell_y_band = 60.0  # Keep cells within +/- 60m of ship (ship beam 28m + cell radius)
-    keep_cells = np.abs(all_cell_centroids[:, 1] - ship_y_center) < cell_y_band
-    
-    polygons = [all_cells[i] for i in range(len(all_cells)) if keep_cells[i]]
-    centroids = all_cell_centroids[keep_cells]
-    parent_floe_ids = all_parent_ids[keep_cells]
-    print(f"  Filtered to {len(polygons)} cells in ship's path (y +/- {cell_y_band}m)", flush=True)
+    if args.full_map:
+        # Full map: use all cells
+        polygons = all_cells
+        centroids = all_cell_centroids
+        parent_floe_ids = all_parent_ids
+        print(f"  Using all {len(polygons)} cells (full map)", flush=True)
+    else:
+        # Narrow band: filter cells in ship's path
+        ship_y_center = (sat_centroids[:, 1].min() + sat_centroids[:, 1].max()) / 2
+        cell_y_band = 60.0
+        keep_cells = np.abs(all_cell_centroids[:, 1] - ship_y_center) < cell_y_band
+        polygons = [all_cells[i] for i in range(len(all_cells)) if keep_cells[i]]
+        centroids = all_cell_centroids[keep_cells]
+        parent_floe_ids = all_parent_ids[keep_cells]
+        print(f"  Filtered to {len(polygons)} cells in ship's path (y +/- {cell_y_band}m)", flush=True)
     
     # Compute areas and radii for cells
     areas = np.array([polygon_area(p) for p in polygons])
@@ -1108,28 +1331,44 @@ def main():
     ship_props = ShipProperties(ship_length, ship_beam, ship_draft, ship_displacement)
     print(f"\nShip: {ship_length}m x {ship_beam}m, mass={ship_props.mass/1e6:.1f} kt", flush=True)
     
-    # Debug: print centroid range
-    print(f"  Centroids X range: {centroids[:, 0].min():.1f} to {centroids[:, 0].max():.1f}m", flush=True)
-    print(f"  Centroids Y range: {centroids[:, 1].min():.1f} to {centroids[:, 1].max():.1f}m", flush=True)
+    all_verts = np.vstack(polygons)
+    x_min, x_max = all_verts[:, 0].min(), all_verts[:, 0].max()
+    y_min, y_max = all_verts[:, 1].min(), all_verts[:, 1].max()
+    print(f"  Ice domain X: {x_min:.1f} to {x_max:.1f}m, Y: {y_min:.1f} to {y_max:.1f}m", flush=True)
     
-    # Position ship very close to ice field for immediate collision
-    rightmost_edge = max(centroids[i, 0] + radii[i] for i in range(len(centroids)))
-    # Ship bow almost touching the rightmost floe
-    ship_bow_x = rightmost_edge + 5  # 5m gap - immediate collision
-    # Center ship on ice field's y-center
-    y_center = (centroids[:, 1].min() + centroids[:, 1].max()) / 2
-    ship_pos = np.array([ship_bow_x + ship_length/2, y_center])
-    drift_vel = 6.0  # m/s
-    print(f"  Ship bow at x={ship_bow_x:.1f}m (rightmost floe edge at {rightmost_edge:.1f}m)", flush=True)
+    if args.full_map:
+        # Ship trajectory: bottom-left to top-right, diagonal straight line
+        margin = 50.0
+        ship_start = np.array([x_min - ship_length/2 + margin, y_min - ship_beam/2 + margin])
+        ship_end = np.array([x_max + ship_length/2 - margin, y_max + ship_beam/2 - margin])
+        diagonal_heading = np.arctan2(ship_end[1] - ship_start[1], ship_end[0] - ship_start[0])
+        n_frames = 600
+        ship_trajectory = []
+        for frame in range(n_frames + 1):
+            t = frame / n_frames
+            pos = ship_start + t * (ship_end - ship_start)
+            ship_trajectory.append((pos, diagonal_heading))
+        ship_pos = ship_trajectory[0][0]  # For API compatibility
+        drift_vel = 0.0
+        print(f"  Ship path: bottom-left ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> "
+              f"top-right ({ship_end[0]:.0f}, {ship_end[1]:.0f})", flush=True)
+        print(f"  Ship heading: {np.degrees(diagonal_heading):.0f}° (diagonal)", flush=True)
+    else:
+        # Original: stationary ship, ice drifts toward it
+        rightmost_edge = max(centroids[i, 0] + radii[i] for i in range(len(centroids)))
+        ship_bow_x = rightmost_edge + 5
+        y_center = (centroids[:, 1].min() + centroids[:, 1].max()) / 2
+        ship_pos = np.array([ship_bow_x + ship_length/2, y_center])
+        ship_trajectory = None
+        drift_vel = 6.0
+        n_frames = 600
+        print(f"  Ship stationary at ({ship_pos[0]:.0f}, {ship_pos[1]:.0f}), ice drifts toward ship", flush=True)
     
-    ship_outline = create_ship_hull(ship_length, ship_beam, ship_pos, bow_direction='left')
-    
-    # Run simulation - longer to capture all collisions
+    # Run simulation
     t0 = time.time()
-    n_frames = 600  # More frames to see full interaction
     print(f"\nRunning fracture simulation ({n_frames} frames)...", flush=True)
     
-    positions_history, rotations_history, bonds_history = simulate_ice_ship_interaction(
+    positions_history, rotations_history, bonds_history, ship_history = simulate_ice_ship_interaction(
         polygons=polygons,
         centroids=centroids.copy(),
         bonds=bonds,
@@ -1141,6 +1380,7 @@ def main():
         drift_vel=drift_vel,
         thicknesses=thicknesses,
         ship_props=ship_props,
+        ship_trajectory=ship_trajectory,
     )
     sim_time = time.time() - t0
     
@@ -1161,7 +1401,7 @@ def main():
     print("\nGenerating 2D animation...", flush=True)
     animate_ice_ship_2d(
         polygons, positions_history, rotations_history, bonds_history, bonds,
-        ship_outline, centroids, thicknesses,
+        ship_history, ship_length, ship_beam, centroids, thicknesses,
         output_file='medea_ship_fracture.gif', fps=20
     )
     print(f"  2D animation time: {time.time()-t0:.1f}s", flush=True)
@@ -1172,9 +1412,9 @@ def main():
         print("\nGenerating 3D animation...", flush=True)
         animate_ice_ship_3d(
             polygons, positions_history, rotations_history, bonds_history, bonds,
-            ship_pos, ship_length, ship_beam, ship_draft,
+            ship_history, ship_length, ship_beam, ship_draft,
             centroids, thicknesses,
-            output_file='medea_ship_fracture_3d.gif', fps=15, max_floes=50
+            output_file='medea_ship_fracture_3d.gif', fps=15, frame_skip=2
         )
         print(f"  3D animation time: {time.time()-t0:.1f}s", flush=True)
     
