@@ -25,7 +25,6 @@ import pickle
 import time
 import argparse
 
-
 # ============================================================================
 # Ice Material Properties (same as visualize_ice_ship.py)
 # ============================================================================
@@ -145,6 +144,36 @@ def assign_thickness_by_area(areas, min_thickness=0.5, max_thickness=3.0, power=
     thicknesses = min_thickness + thickness_norm * (max_thickness - min_thickness)
     thicknesses += np.random.randn(len(areas)) * 0.1
     return np.clip(thicknesses, min_thickness, max_thickness)
+
+
+def create_simple_ice_field(
+    seed=42,
+):
+    """
+    Create a minimal synthetic ice field for fast testing: 3 floes of different
+    sizes so ship–ice and ice–ice interaction can be observed.
+    Returns (sat_polygons, sat_centroids) in world coordinates [m].
+    """
+    np.random.seed(seed)
+    # (cx, cy, half_width, half_height) for each floe — layout along ship path (x) with some y spread
+    floes_spec = [
+        (0.0, 0.0, 30.0, 20.0),    # main floe: 60x40 m
+        (-55.0, 10.0, 15.0, 11.0), # smaller: 30x22 m, left and above
+        (50.0, -25.0, 24.0, 16.0), # medium: 48x32 m, right and below
+    ]
+    sat_polygons = []
+    sat_centroids = []
+    for cx, cy, w, h in floes_spec:
+        poly = np.array([
+            [cx - w, cy - h],
+            [cx + w, cy - h],
+            [cx + w, cy + h],
+            [cx - w, cy + h],
+        ])
+        sat_polygons.append(poly)
+        sat_centroids.append(np.array([cx, cy]))
+    sat_centroids = np.array(sat_centroids)
+    return sat_polygons, sat_centroids
 
 
 # ============================================================================
@@ -611,13 +640,10 @@ def simulate_ice_ship_interaction(
                             for i, j in bonds])
     
     # Compute bond strengths
-    # Smaller bond width for more dramatic fracturing
     MAX_BOND_WIDTH = 4.0  # meters - allows easier fracturing
-    
     bond_strengths = np.zeros(len(bonds))
     for b, (i, j) in enumerate(bonds):
         h = min(thicknesses[i], thicknesses[j])
-        # Cap bond width for realistic strength
         w = min((radii[i] + radii[j]) / 2, MAX_BOND_WIDTH)
         bond_strengths[b] = IceProperties.breaking_force(h, w)
     
@@ -706,7 +732,8 @@ def simulate_ice_ship_interaction(
                 # Angular impulse - very small to prevent spinning
                 angular_vels[i] += 0.01 * side_direction * min(pen, 1.0)
         
-        # Inter-element repulsion
+        # Inter-element contact: normal repulsion (Hertz-like) + Coulomb tangential friction (1.3)
+        ICE_ICE_FRICTION = 0.1  # μ, from typical ice–ice friction (e.g. DPDEM config)
         for i in range(n):
             for j in range(i + 1, n):
                 d = positions[j] - positions[i]
@@ -716,9 +743,21 @@ def simulate_ice_ship_interaction(
                 if dist < min_dist and dist > 1e-6:
                     overlap = min_dist - dist
                     direction = d / dist
-                    f = 2e5 * overlap ** 1.5 * direction
-                    forces[i] -= f
-                    forces[j] += f
+                    # Normal force (repulsion)
+                    f_n_mag = 2e5 * overlap ** 1.5
+                    f_n = f_n_mag * direction
+                    forces[i] -= f_n
+                    forces[j] += f_n
+                    # Tangential friction (Coulomb): oppose relative sliding, |F_t| ≤ μ |F_n|
+                    v_rel = velocities[j] - velocities[i]
+                    v_t = v_rel - np.dot(v_rel, direction) * direction
+                    v_t_mag = np.linalg.norm(v_t)
+                    if v_t_mag > 1e-6:
+                        t_hat = v_t / v_t_mag
+                        f_t_mag = min(ICE_ICE_FRICTION * f_n_mag, 1e5)  # cap for stability
+                        f_t = -f_t_mag * t_hat  # opposes sliding
+                        forces[i] += f_t
+                        forces[j] -= f_t
         
         # Drift force (only when ship is stationary - ice drifts toward ship)
         if ship_trajectory is None:
@@ -728,9 +767,21 @@ def simulate_ice_ship_interaction(
                 for i in comp:
                     forces[i, 0] += drift_force * masses[i] / total_mass
         
-        # Water drag
+        # Water drag (1.4): quadratic in speed, depends on submerged/drag area and thickness
+        RHO_WATER = IceProperties.WATER_DENSITY
+        C_D_DRAG = 0.4  # drag coefficient (order 0.1–0.5 for bluff bodies)
         for i in range(n):
-            forces[i] -= 0.5 * velocities[i] * masses[i]
+            v = velocities[i]
+            v_mag = np.linalg.norm(v)
+            # Drag area: top area scaled by thickness so thicker floes have more wetted drag
+            A_drag = areas[i] * (thicknesses[i] / 1.0)  # ref thickness 1 m
+            if v_mag > 1e-6:
+                # Quadratic: F_drag = -0.5 * rho * C_d * A * |v|^2 * v_hat
+                drag_mag = 0.5 * RHO_WATER * C_D_DRAG * A_drag * (v_mag ** 2)
+                forces[i] -= drag_mag * (v / v_mag)
+            else:
+                # Linear damping at very low speed for numerical stability
+                forces[i] -= 0.5 * RHO_WATER * C_D_DRAG * A_drag * 0.1 * v
         
         # Move connected components together
         new_velocities = velocities.copy()
@@ -762,8 +813,19 @@ def simulate_ice_ship_interaction(
         velocities = new_velocities
         positions = new_positions
         
-        # Stress propagation (same as original)
+        # Stress propagation (1.2): drive from actual bond forces, then diffuse
         element_stress = ship_collision_force.copy()
+        for b, (i, j) in enumerate(bonds):
+            if not bond_intact[b]:
+                continue
+            d = positions[j] - positions[i]
+            dist = np.linalg.norm(d)
+            stretch = abs(dist - rest_lengths[b])
+            avg_thickness = (thicknesses[i] + thicknesses[j]) / 2
+            stiffness = IceProperties.YOUNGS_MODULUS * avg_thickness * 0.001
+            bond_force_mag = stiffness * stretch
+            element_stress[i] += bond_force_mag
+            element_stress[j] += bond_force_mag
         for _ in range(2):
             new_stress = element_stress.copy()
             for b, (i, j) in enumerate(bonds):
@@ -775,7 +837,7 @@ def simulate_ice_ship_interaction(
                         new_stress[i] += element_stress[j] * stress_transfer
             element_stress = new_stress
         
-        # Check for bond fracture (same as original)
+        # Check for bond fracture
         for b, (i, j) in enumerate(bonds):
             if not bond_intact[b]:
                 continue
@@ -793,16 +855,14 @@ def simulate_ice_ship_interaction(
             
             base_strength = bond_strengths[b]
             
-            # Direct collision dramatically weakens bonds
             collision_on_bond = ship_collision_force[i] > 0 or ship_collision_force[j] > 0
             if collision_on_bond:
-                effective_strength = base_strength * 0.1  # Even weaker for direct collision
+                effective_strength = base_strength * 0.1
             elif propagated_stress > base_strength * 0.5:
                 effective_strength = base_strength * 0.6
             else:
                 effective_strength = base_strength
             
-            # Also break if collision force is strong enough (direct fracture)
             collision_force_on_bond = max(ship_collision_force[i], ship_collision_force[j])
             if collision_on_bond and collision_force_on_bond > effective_strength:
                 bond_intact[b] = False
@@ -1222,12 +1282,16 @@ def main():
     parser.add_argument('--no-3d', action='store_true', help='Skip 3D animation')
     parser.add_argument('--full-map', action='store_true',
                         help='Use full ice map; ship starts bottom-left, moves diagonally to top-right')
+    parser.add_argument('--simple', action='store_true',
+                        help='Use minimal synthetic ice field (3 floes) for fast testing (no MEDEA data)')
     args = parser.parse_args()
     
     total_start = time.time()
     
     print("=" * 70)
     print("DPDEM: MEDEA Satellite Ice + Ship Fracture Simulation")
+    if args.simple:
+        print("  [SIMPLE MODE - synthetic ice field for quick testing]")
     if args.full_map:
         print("  [FULL MAP MODE - ship diagonal bottom-left to top-right]")
     if args.quick:
@@ -1246,64 +1310,66 @@ def main():
     ship_draft = 10.5    # m
     ship_displacement = 23000e3  # 23,000 tonnes
     
-    # Paths
-    data_dir = Path(__file__).parent / 'data'
-    pickle_path = data_dir / 'ice_floes_MEDEA_fram_20100629.pkl'
-    
-    if not pickle_path.exists():
-        print(f"ERROR: Data file not found: {pickle_path}")
-        return
-    
-    # Load data
-    t0 = time.time()
-    print("Loading MEDEA ice floe data...", flush=True)
-    polygons_px, centroids_px, metadata = load_medea_floes(pickle_path)
-    print(f"  Loaded {metadata['n_floes']} floes ({time.time()-t0:.1f}s)", flush=True)
-    
-    # Scale to world coordinates
-    print(f"Scaling to world coordinates ({METERS_PER_PIXEL} m/px)...", flush=True)
-    all_polygons, all_centroids = scale_floes_to_world(
-        polygons_px, centroids_px, METERS_PER_PIXEL, center_domain=True,
-        subsample_region=None
-    )
-    
-    if args.full_map:
-        # Full map: use ALL floes (like run_medea_floes.py)
-        sat_polygons = all_polygons
-        sat_centroids = all_centroids
-        print(f"  Using full ice map: {len(sat_polygons)} floes", flush=True)
-    else:
-        # Narrow band: filter to floes in ship's path (original behavior)
-        y_center = (all_centroids[:, 1].min() + all_centroids[:, 1].max()) / 2
-        y_band = 80.0
-        keep_mask = np.abs(all_centroids[:, 1] - y_center) < y_band
-        sat_polygons = [all_polygons[i] for i in range(len(all_polygons)) if keep_mask[i]]
-        sat_centroids = all_centroids[keep_mask]
-        print(f"  Selected {len(sat_polygons)} floes in ship's path (y +/- {y_band}m)", flush=True)
-    
-    # Tessellate each satellite floe internally for FRACTURING
-    print("Tessellating floes internally for fracturing...", flush=True)
-    CELLS_PER_100M2 = 0.8
-    all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
-        sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=42
-    )
-    print(f"  Created {len(all_cells)} total cells", flush=True)
-    
-    if args.full_map:
-        # Full map: use all cells
+    if args.simple:
+        # Minimal synthetic ice field: 3 floes of different sizes, no MEDEA
+        t0 = time.time()
+        print("Creating simple synthetic ice field (3 floes)...", flush=True)
+        sat_polygons, sat_centroids = create_simple_ice_field(seed=42)
+        print(f"  Created {len(sat_polygons)} floes ({time.time()-t0:.1f}s)", flush=True)
+        CELLS_PER_100M2 = 0.25
+        all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
+            sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=42
+        )
         polygons = all_cells
         centroids = all_cell_centroids
         parent_floe_ids = all_parent_ids
-        print(f"  Using all {len(polygons)} cells (full map)", flush=True)
+        print(f"  Tessellated to {len(polygons)} cells", flush=True)
     else:
-        # Narrow band: filter cells in ship's path
-        ship_y_center = (sat_centroids[:, 1].min() + sat_centroids[:, 1].max()) / 2
-        cell_y_band = 60.0
-        keep_cells = np.abs(all_cell_centroids[:, 1] - ship_y_center) < cell_y_band
-        polygons = [all_cells[i] for i in range(len(all_cells)) if keep_cells[i]]
-        centroids = all_cell_centroids[keep_cells]
-        parent_floe_ids = all_parent_ids[keep_cells]
-        print(f"  Filtered to {len(polygons)} cells in ship's path (y +/- {cell_y_band}m)", flush=True)
+        # MEDEA data path
+        data_dir = Path(__file__).parent / 'data'
+        pickle_path = data_dir / 'ice_floes_MEDEA_fram_20100629.pkl'
+        if not pickle_path.exists():
+            print(f"ERROR: Data file not found: {pickle_path}")
+            return
+        t0 = time.time()
+        print("Loading MEDEA ice floe data...", flush=True)
+        polygons_px, centroids_px, metadata = load_medea_floes(pickle_path)
+        print(f"  Loaded {metadata['n_floes']} floes ({time.time()-t0:.1f}s)", flush=True)
+        print(f"Scaling to world coordinates ({METERS_PER_PIXEL} m/px)...", flush=True)
+        all_polygons, all_centroids = scale_floes_to_world(
+            polygons_px, centroids_px, METERS_PER_PIXEL, center_domain=True,
+            subsample_region=None
+        )
+        if args.full_map:
+            sat_polygons = all_polygons
+            sat_centroids = all_centroids
+            print(f"  Using full ice map: {len(sat_polygons)} floes", flush=True)
+        else:
+            y_center = (all_centroids[:, 1].min() + all_centroids[:, 1].max()) / 2
+            y_band = 80.0
+            keep_mask = np.abs(all_centroids[:, 1] - y_center) < y_band
+            sat_polygons = [all_polygons[i] for i in range(len(all_polygons)) if keep_mask[i]]
+            sat_centroids = all_centroids[keep_mask]
+            print(f"  Selected {len(sat_polygons)} floes in ship's path (y +/- {y_band}m)", flush=True)
+        print("Tessellating floes internally for fracturing...", flush=True)
+        CELLS_PER_100M2 = 0.8
+        all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
+            sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=42
+        )
+        print(f"  Created {len(all_cells)} total cells", flush=True)
+        if args.full_map:
+            polygons = all_cells
+            centroids = all_cell_centroids
+            parent_floe_ids = all_parent_ids
+            print(f"  Using all {len(polygons)} cells (full map)", flush=True)
+        else:
+            ship_y_center = (sat_centroids[:, 1].min() + sat_centroids[:, 1].max()) / 2
+            cell_y_band = 60.0
+            keep_cells = np.abs(all_cell_centroids[:, 1] - ship_y_center) < cell_y_band
+            polygons = [all_cells[i] for i in range(len(all_cells)) if keep_cells[i]]
+            centroids = all_cell_centroids[keep_cells]
+            parent_floe_ids = all_parent_ids[keep_cells]
+            print(f"  Filtered to {len(polygons)} cells in ship's path (y +/- {cell_y_band}m)", flush=True)
     
     # Compute areas and radii for cells
     areas = np.array([polygon_area(p) for p in polygons])
@@ -1336,7 +1402,21 @@ def main():
     y_min, y_max = all_verts[:, 1].min(), all_verts[:, 1].max()
     print(f"  Ice domain X: {x_min:.1f} to {x_max:.1f}m, Y: {y_min:.1f} to {y_max:.1f}m", flush=True)
     
-    if args.full_map:
+    if args.simple:
+        # Simple mode: ship crosses small field along x, few frames
+        n_frames = 100
+        ship_start = np.array([x_min - ship_length / 2 - 20.0, (y_min + y_max) / 2])
+        ship_end = np.array([x_max + ship_length / 2 + 20.0, (y_min + y_max) / 2])
+        ship_heading = 0.0  # bow in +x
+        ship_trajectory = []
+        for frame in range(n_frames + 1):
+            t = frame / n_frames
+            pos = ship_start + t * (ship_end - ship_start)
+            ship_trajectory.append((pos, ship_heading))
+        ship_pos = ship_trajectory[0][0]
+        drift_vel = 0.0
+        print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames", flush=True)
+    elif args.full_map:
         # Ship trajectory: bottom-left to top-right, diagonal straight line
         margin = 50.0
         ship_start = np.array([x_min - ship_length/2 + margin, y_min - ship_beam/2 + margin])
@@ -1396,13 +1476,16 @@ def main():
         print(f"\nQuick mode complete! Total: {time.time()-total_start:.1f}s")
         return
     
+    out_2d = 'simple_ship_fracture.gif' if args.simple else 'medea_ship_fracture.gif'
+    out_3d = 'simple_ship_fracture_3d.gif' if args.simple else 'medea_ship_fracture_3d.gif'
+    
     # 2D animation
     t0 = time.time()
     print("\nGenerating 2D animation...", flush=True)
     animate_ice_ship_2d(
         polygons, positions_history, rotations_history, bonds_history, bonds,
         ship_history, ship_length, ship_beam, centroids, thicknesses,
-        output_file='medea_ship_fracture.gif', fps=20
+        output_file=out_2d, fps=20
     )
     print(f"  2D animation time: {time.time()-t0:.1f}s", flush=True)
     
@@ -1414,12 +1497,12 @@ def main():
             polygons, positions_history, rotations_history, bonds_history, bonds,
             ship_history, ship_length, ship_beam, ship_draft,
             centroids, thicknesses,
-            output_file='medea_ship_fracture_3d.gif', fps=15, frame_skip=2
+            output_file=out_3d, fps=15, frame_skip=2
         )
         print(f"  3D animation time: {time.time()-t0:.1f}s", flush=True)
     
     print(f"\nTotal time: {time.time()-total_start:.1f}s")
-    print("\nOutput: medea_ship_fracture.gif" + (" and medea_ship_fracture_3d.gif" if not args.no_3d else ""))
+    print(f"\nOutput: {out_2d}" + (f" and {out_3d}" if not args.no_3d else ""))
 
 
 if __name__ == '__main__':
