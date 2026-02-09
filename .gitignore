@@ -22,10 +22,9 @@ env/
 autonomous_*.gif
 planned_navigation*.gif
 
-# Allow original demo GIFs for README
-!dpdem_ice_ship.gif
-!dpdem_ice_ship_3d.gif
-!medea_*.gif
+# Allow MEDEA ship-fracture GIFs (README)
+!medea_ship_fracture.gif
+!medea_ship_fracture_3d.gif
 
 # OS
 .DS_Store

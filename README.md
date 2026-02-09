@@ -14,6 +14,8 @@ The main demo uses **satellite-derived ice floes** (MEDEA Fram Strait, Hwang et 
 |----|-----|
 | [medea_ship_fracture.gif](medea_ship_fracture.gif) | [medea_ship_fracture_3d.gif](medea_ship_fracture_3d.gif) |
 
+Run `python run_medea_ship_fracture.py` to regenerate these animations.
+
 - **Ice**: MEDEA polygons, tessellated into cells with bonds; fracture when bonds break under ship load.
 - **Ship**: Prescribed path (e.g. diagonal across the domain), tapered hull, heading-aware collision.
 - **3D**: Same simulation with added z/tilt for bending and submergence under the hull.
