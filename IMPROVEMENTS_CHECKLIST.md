@@ -67,8 +67,10 @@ python run_medea_ship_fracture.py --simple --quick
   **Implemented:** Single seed at startup (`--seed`, default 42); used for create_simple_ice_field, tessellate_all_floes, and drives assign_thickness_by_area + angular_vels noise. Documented in README.
 - [x] **5.2** Add save/load of full state (positions, velocities, bonds, ship) for scenario replay.  
   **Implemented:** `--save-state FILE` writes pickle (polygons, centroids, bonds, thicknesses, positions/rotations/bonds/ship/submergence history, ship params). `--load-state FILE` skips simulation and regenerates 2D/3D animations only.
-- [ ] **5.3** Refactor into modules (geometry, bonds, contact, integration, visualization) where useful.
-- [ ] **5.4** Centralize parameters (config or dataclass) for easier tuning and reporting.
+- [x] **5.3** Refactor into modules (geometry, bonds, contact, integration, visualization) where useful.  
+  **Implemented:** New package `medea_ice_ship/` with: `properties` (ice/ship, R_xy, ssa), `data` (load MEDEA, scale, simple ice field), `geometry` (polygon, ship hull, point-in-polygon, penetration), `bonds` (proximity bonds, thickness by area, connected components), `tessellation` (Voronoi cells per floe), `simulation` (point_to_ship_collision, simulate_ice_ship_interaction), `visualization` (2D and 3D animation, 3D ice physics), `state_io` (save/load). `run_medea_ship_fracture.py` is a thin entry point that imports from the package.
+- [x] **5.4** Centralize parameters (config or dataclass) for easier tuning and reporting.  
+  **Implemented:** `medea_ice_ship/config.py` with `IceMaterialConfig`, `SimulationConfig`, `RunConfig`, `VisualizationConfig` and `get_default_*()` helpers. Simulation uses `SimulationConfig`; run script uses `RunConfig` for domain, ship, tessellation, thickness, frames, dt, fps, seed; visualization uses optional `VisualizationConfig` for 3D (z threshold, surfaced/submerged colors, view angles).
 
 ---
 
