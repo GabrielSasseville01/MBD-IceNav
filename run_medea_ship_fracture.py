@@ -69,6 +69,17 @@ class ShipProperties:
         return C_force * (self.mass ** 0.7) * (velocity ** 0.8) * (ice_thickness ** 0.5)
 
 
+def R_xy(psi):
+    """Rotation matrix body -> world for 2D (Fossen / AUTO-IceNav). (x_world, y_world)^T = R_xy(psi) @ (u, v)^T."""
+    c, s = np.cos(psi), np.sin(psi)
+    return np.array([[c, -s], [s, c]])
+
+
+def ssa(angle):
+    """Smallest-signed angle in [-pi, pi) (AUTO-IceNav gnc.ssa)."""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
 # ============================================================================
 # Data Loading
 # ============================================================================
@@ -298,6 +309,61 @@ def point_in_polygon(point, polygon):
             inside = not inside
         j = i
     return inside
+
+
+def _distance_point_to_segment(px, py, ax, ay, bx, by):
+    """Signed distance from point (px,py) to segment (A,B). Positive = point to the left of A->B."""
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    c1 = wx * vx + wy * vy
+    c2 = vx * vx + vy * vy
+    if c2 < 1e-20:
+        return np.sqrt(wx * wx + wy * wy), ax, ay
+    if c1 <= 0:
+        d = np.sqrt(wx * wx + wy * wy)
+        return d, ax, ay
+    if c1 >= c2:
+        dx, dy = px - bx, py - by
+        return np.sqrt(dx * dx + dy * dy), bx, by
+    b = c1 / c2
+    cx, cy = ax + b * vx, ay + b * vy
+    dx, dy = px - cx, py - cy
+    return np.sqrt(dx * dx + dy * dy), cx, cy
+
+
+def point_inside_polygon_penetration(px, py, polygon):
+    """
+    When point (px, py) is inside polygon, return penetration (distance to nearest edge)
+    and outward normal from that edge. Assumes polygon is ordered (e.g. CCW).
+    If point is not inside, return (0, 0, 0).
+    """
+    poly = np.asarray(polygon)
+    n = len(poly)
+    if n < 3:
+        return 0.0, 0.0, 0.0
+    if not point_in_polygon((px, py), poly):
+        return 0.0, 0.0, 0.0
+    best_pen = np.inf
+    best_nx, best_ny = 0.0, 0.0
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        dist, _, _ = _distance_point_to_segment(px, py, ax, ay, bx, by)
+        # Outward normal for edge A->B (CCW polygon: left of A->B is inside, so outward is right)
+        ex, ey = bx - ax, by - ay
+        nx = ey
+        ny = -ex
+        nlen = np.sqrt(nx * nx + ny * ny) + 1e-20
+        nx, ny = nx / nlen, ny / nlen
+        # Ensure normal points outward: from centroid to point should be opposite to normal
+        cx, cy = np.mean(poly[:, 0]), np.mean(poly[:, 1])
+        dot = (px - cx) * nx + (py - cy) * ny
+        if dot > 0:
+            nx, ny = -nx, -ny
+        if dist < best_pen:
+            best_pen = dist
+            best_nx, best_ny = nx, ny
+    return best_pen, best_nx, best_ny
 
 
 def clip_cell_to_floe(cell_verts, floe_polygon):
@@ -608,12 +674,16 @@ def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_
 def simulate_ice_ship_interaction(
     polygons, centroids, bonds, ship_pos, ship_length, ship_beam,
     n_frames, dt, drift_vel, thicknesses, ship_props,
-    ship_trajectory=None  # Optional: list of (pos, heading) per frame for moving ship
+    ship_trajectory=None,  # Optional: list of (pos, heading) per frame for moving ship
+    return_ship_diagnostics=False,  # If True and trajectory given, return per-frame F_ice, vel, pos
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
     If ship_trajectory is provided: ship moves through ice (no drift).
     Otherwise: ice drifts toward stationary ship.
+    Returns (positions_history, rotations_history, bonds_history, ship_history[, ship_diagnostics]).
+    When return_ship_diagnostics=True and ship_trajectory is used, ship_diagnostics is a list of
+    dicts per frame: F_ice_ship, ship_vel, ship_pos, desired_pos, desired_vel, t.
     """
     n = len(polygons)
     
@@ -657,15 +727,45 @@ def simulate_ice_ship_interaction(
     bonds_history = [bond_intact.copy()]
     ship_history = []
     
-    ship_impact_force = ship_props.impact_force(drift_vel, np.mean(thicknesses)) if drift_vel > 0 else 0.0
+    ship_impact_force = (ship_props.impact_force(drift_vel, np.mean(thicknesses))
+                         if (drift_vel > 0 and len(thicknesses) > 0) else 0.0)
     print(f"  Ship impact force: {ship_impact_force/1e6:.2f} MN", flush=True)
     
     collision_count = 0
     ever_collided = set()  # Track which elements ever collided throughout simulation
     
+    # Ship dynamics (2.1): 3-DOF body-frame model matching AUTO-IceNav (Fossen notation).
+    # State: eta = (x, y, psi), nu = (u, v, r) body-frame (surge, sway, yaw rate).
+    # Kinematics: eta_dot from R_xy(psi)*[u,v] and psi_dot = r (State.integrate in sim_dynamics).
+    # Dynamics: M*nu_dot + C(nu)*nu + D*nu = tau_control + tau_ice (Fossen 2021 / Supply vessel).
+    # tau_ice = [F_ice_body; M_ice] from ice collision reaction; control = body-frame PD (NRC/DPcontrol).
+    use_ship_dynamics = ship_trajectory is not None
+    ship_diagnostics = [] if (use_ship_dynamics and return_ship_diagnostics) else None
+    if use_ship_dynamics:
+        ship_pos_dyn = np.array(ship_trajectory[0][0], dtype=float)
+        ship_heading_dyn = float(ship_trajectory[0][1])
+        # Body-frame velocity nu = [u, v, r] (surge m/s, sway m/s, yaw rate rad/s)
+        ship_u = 0.0
+        ship_v = 0.0
+        ship_r = 0.0
+        m = ship_props.mass
+        Izz = (1.0 / 12.0) * m * (ship_length**2 + ship_beam**2)
+        # Mass matrix (3-DOF, diagonal for simplicity; can add added-mass later)
+        M3 = np.diag([m, m, Izz])
+        M3inv = np.linalg.inv(M3)
+        # Linear damping (Fossen-style; scale with mass/size so ice can still perturb)
+        D3 = np.diag([m * 0.02, m * 0.02, Izz * 0.15])
+        # Control gains: body-frame PD like NRC/DPcontrol (setpoint = desired pos/heading)
+        Kp_xy = ship_props.mass * 0.03
+        Kp_psi = 5e9
+        Kd_ship = 1e6
+    
     for frame in range(n_frames):
-        # Ship position and heading this frame
-        if ship_trajectory is not None:
+        # Ship position and heading this frame (from dynamics state or fixed)
+        if use_ship_dynamics:
+            ship_pos_frame = ship_pos_dyn.copy()
+            ship_heading = ship_heading_dyn
+        elif ship_trajectory is not None:
             ship_pos_frame, ship_heading = ship_trajectory[min(frame, len(ship_trajectory) - 1)]
         else:
             ship_pos_frame = ship_pos
@@ -677,6 +777,14 @@ def simulate_ice_ship_interaction(
         # Compute forces
         forces = np.zeros_like(positions)
         ship_collision_force = np.zeros(n)
+        F_ice_ship = np.zeros(2)
+        M_ice_ship = 0.0
+        
+        # Ship hull in world frame (once per frame) for ship-to-ice collision (2.3)
+        ship_hull_pts = create_ship_hull_at_position_heading(
+            ship_length, ship_beam, ship_pos_frame, ship_heading
+        )
+        N_EDGE_SAMPLES = 4  # sample points along each ice edge (2.3: harder collision detection)
         
         for i in range(n):
             px, py = positions[i]
@@ -693,7 +801,7 @@ def simulate_ice_ship_interaction(
             rotated[:, 1] = local_polys[i][:, 0] * s + local_polys[i][:, 1] * c
             world_poly = rotated + positions[i]
             
-            # Check collision at polygon vertices (actual floe shape)
+            # Ice -> ship: polygon vertices
             for vx, vy in world_poly:
                 test_pen, test_nx, test_ny = point_to_ship_collision(
                     vx, vy, ship_pos_frame, ship_length, ship_beam, ship_heading=ship_heading
@@ -701,36 +809,74 @@ def simulate_ice_ship_interaction(
                 if test_pen > pen:
                     pen, nx, ny = test_pen, test_nx, test_ny
             
-            # Also check some edge midpoints for better coverage
+            # Ice -> ship: multiple samples along each edge (2.3)
             n_verts = len(world_poly)
             for j in range(n_verts):
                 v1 = world_poly[j]
                 v2 = world_poly[(j + 1) % n_verts]
-                mid = (v1 + v2) / 2
-                test_pen, test_nx, test_ny = point_to_ship_collision(
-                    mid[0], mid[1], ship_pos_frame, ship_length, ship_beam, ship_heading=ship_heading
-                )
-                if test_pen > pen:
-                    pen, nx, ny = test_pen, test_nx, test_ny
+                for k in range(1, N_EDGE_SAMPLES + 1):
+                    t = k / (N_EDGE_SAMPLES + 1)
+                    pt = (1 - t) * v1 + t * v2
+                    test_pen, test_nx, test_ny = point_to_ship_collision(
+                        pt[0], pt[1], ship_pos_frame, ship_length, ship_beam, ship_heading=ship_heading
+                    )
+                    if test_pen > pen:
+                        pen, nx, ny = test_pen, test_nx, test_ny
+            
+            # Ship -> ice: hull points inside this ice polygon (2.3)
+            for sx, sy in ship_hull_pts:
+                if point_in_polygon((sx, sy), world_poly):
+                    test_pen, test_nx, test_ny = point_inside_polygon_penetration(sx, sy, world_poly)
+                    if test_pen > pen:
+                        pen, nx, ny = test_pen, test_nx, test_ny
             
             if pen > 0:
                 collision_count += 1
                 ever_collided.add(i)
                 
-                # Collision force (original values for small cells)
-                force_mag = (ship_props.mass / 1e6) * 1e5 * pen
+                # Collision force (2.2): tied to ice mechanics — breaking force and penetration
+                # Effective contact width for this element (same scale as bond width)
+                w_contact = min(2.0 * radii[i], 4.0)
+                F_break = IceProperties.breaking_force(thicknesses[i], w_contact)
+                PEN_CRIT_REF = 0.5  # m — penetration at which force reaches F_break
+                force_mag = F_break * min(pen / PEN_CRIT_REF, 1.0)
                 forces[i, 0] += force_mag * nx
                 forces[i, 1] += force_mag * ny
                 ship_collision_force[i] = force_mag
                 
-                # Side push for flow around hull
+                # Side push (flow around hull): fraction of normal force, same ice-mechanics scale
                 rel_y = py - ship_pos_frame[1]
                 side_direction = 1 if rel_y > 0 else -1
-                side_push = (ship_props.mass / 1e6) * 3e4 * pen * side_direction
+                side_push = 0.2 * force_mag * side_direction
                 forces[i, 1] += side_push
+                
+                # Reaction force and moment on ship (2.1): F_ship = -F_on_ice, M = r × F_ship
+                F_ice_ship[0] -= force_mag * nx
+                F_ice_ship[1] -= (force_mag * ny + side_push)
+                r_vec = positions[i] - ship_pos_frame
+                F_ship_i = np.array([force_mag * nx, force_mag * ny + side_push])  # force on ice
+                M_ice_ship += r_vec[0] * (-F_ship_i[1]) - r_vec[1] * (-F_ship_i[0])  # r × (-F_on_ice)
                 
                 # Angular impulse - very small to prevent spinning
                 angular_vels[i] += 0.01 * side_direction * min(pen, 1.0)
+        
+        # 2.4: Bow rubble resistance — extra force opposing surge when ice contacts bow
+        RUBBLE_COEF = 0.25  # fraction of bow contact force that acts as rubble resistance
+        RUBBLE_CAP_N = 5e6  # cap (N) so rubble doesn't dominate
+        bow_contact_force = 0.0
+        c_r, s_r = np.cos(ship_heading), np.sin(ship_heading)
+        for i in range(n):
+            if ship_collision_force[i] <= 0:
+                continue
+            dx = positions[i, 0] - ship_pos_frame[0]
+            dy = positions[i, 1] - ship_pos_frame[1]
+            body_x = c_r * dx + s_r * dy  # body-frame forward (bow = +x)
+            if body_x > 0:
+                bow_contact_force += ship_collision_force[i]
+        if bow_contact_force > 0:
+            F_rubble_mag = min(RUBBLE_COEF * bow_contact_force, RUBBLE_CAP_N)
+            forward = np.array([c_r, s_r])
+            F_ice_ship -= F_rubble_mag * forward  # resistance opposes forward motion
         
         # Inter-element contact: normal repulsion (Hertz-like) + Coulomb tangential friction (1.3)
         ICE_ICE_FRICTION = 0.1  # μ, from typical ice–ice friction (e.g. DPDEM config)
@@ -875,10 +1021,64 @@ def simulate_ice_ship_interaction(
         angular_vels = np.clip(angular_vels, -0.2, 0.2)  # Hard cap
         rotations += angular_vels * dt
         
+        # Ship dynamics (2.1): body-frame 3-DOF (AUTO-IceNav / Fossen). M*nu_dot + C*nu + D*nu = tau_control + tau_ice
+        if use_ship_dynamics:
+            psi = ship_heading_dyn
+            nu = np.array([ship_u, ship_v, ship_r])
+            # Ice force/moment in body frame (world F_ice_ship, M_ice_ship)
+            F_ice_body = R_xy(psi).T @ F_ice_ship
+            tau_ice = np.array([F_ice_body[0], F_ice_body[1], M_ice_ship])
+            # Control: body-frame error (NRC/DPcontrol style)
+            tr = ship_trajectory
+            idx = min(frame, len(tr) - 1)
+            idx_next = min(frame + 1, len(tr) - 1)
+            desired_pos = np.array(tr[idx][0])
+            desired_heading = tr[idx][1]
+            e_xy_world = desired_pos - ship_pos_dyn
+            e_xy_body = R_xy(psi).T @ e_xy_world
+            e_psi = ssa(desired_heading - psi)
+            desired_vel_world = (np.array(tr[idx_next][0]) - desired_pos) / dt if idx_next > idx else np.zeros(2)
+            nu_des_xy = R_xy(psi).T @ desired_vel_world
+            nu_des = np.array([nu_des_xy[0], nu_des_xy[1], 0.0])
+            tau_control = np.array([
+                Kp_xy * e_xy_body[0] + Kd_ship * (nu_des[0] - nu[0]),
+                Kp_xy * e_xy_body[1] + Kd_ship * (nu_des[1] - nu[1]),
+                Kp_psi * e_psi - Kd_ship * nu[2],
+            ])
+            # Coriolis (3-DOF, Fossen gnc m2c): C*nu with diagonal M
+            C = np.zeros((3, 3))
+            C[0, 2] = -m * nu[1]
+            C[1, 2] = m * nu[0]
+            C[2, 0], C[2, 1] = -C[0, 2], -C[1, 2]
+            nu_dot = M3inv @ (tau_control + tau_ice - D3 @ nu - C @ nu)
+            nu = nu + nu_dot * dt
+            nu[0] = np.clip(nu[0], -15, 15)
+            nu[1] = np.clip(nu[1], -8, 8)
+            nu[2] = np.clip(nu[2], -0.15, 0.15)
+            ship_u, ship_v, ship_r = nu[0], nu[1], nu[2]
+            # Kinematics (AUTO-IceNav State.integrate): world velocity from body [u,v], then integrate position/heading
+            u_g, v_g = R_xy(psi) @ np.array([ship_u, ship_v])
+            ship_pos_dyn[0] += dt * u_g
+            ship_pos_dyn[1] += dt * v_g
+            ship_heading_dyn = (ship_heading_dyn + dt * ship_r) % (2 * np.pi)
+            ship_history.append((ship_pos_dyn.copy(), float(ship_heading_dyn)))
+            if ship_diagnostics is not None:
+                desired_vel = desired_vel_world
+                ship_vel_world = R_xy(ship_heading_dyn) @ np.array([ship_u, ship_v])
+                ship_diagnostics.append({
+                    't': frame * dt,
+                    'F_ice_ship': F_ice_ship.copy(),
+                    'ship_vel': ship_vel_world,
+                    'ship_pos': ship_pos_dyn.copy(),
+                    'desired_pos': desired_pos,
+                    'desired_vel': desired_vel,
+                })
+        else:
+            ship_history.append((ship_pos_frame, ship_heading))
+        
         positions_history.append(positions.copy())
         rotations_history.append(rotations.copy())
         bonds_history.append(bond_intact.copy())
-        ship_history.append((ship_pos_frame, ship_heading))
     
     if collision_count > 0:
         print(f"  Total collisions: {collision_count}", flush=True)
@@ -894,6 +1094,8 @@ def simulate_ice_ship_interaction(
     else:
         print("  WARNING: No collisions detected!", flush=True)
     
+    if return_ship_diagnostics:
+        return positions_history, rotations_history, bonds_history, ship_history, ship_diagnostics
     return positions_history, rotations_history, bonds_history, ship_history
 
 
@@ -906,7 +1108,8 @@ def animate_ice_ship_2d(
     ship_history, ship_length, ship_beam, initial_centroids, thicknesses,
     output_file='medea_ship_fracture.gif', fps=20
 ):
-    """Animate ice-ship interaction in 2D. ship_history: list of (pos, heading) per frame."""
+    """Animate ice-ship interaction in 2D. ship_history: list of (pos, heading) per frame.
+    Handles n_elements=0 (clear water: ship only)."""
     n_frames = len(positions_history)
     n_elements = len(polygons)
     
@@ -915,28 +1118,36 @@ def animate_ice_ship_2d(
         centroid = polygon_centroid(poly)
         local_polys.append(poly - centroid)
     
-    all_pos = np.concatenate(positions_history)
-    x_min, x_max = all_pos[:, 0].min() - 20, all_pos[:, 0].max() + 20
-    y_min, y_max = all_pos[:, 1].min() - 20, all_pos[:, 1].max() + 20
     if len(ship_history) > 0:
         ship_positions = np.array([h[0] for h in ship_history])
-        x_min = min(x_min, ship_positions[:, 0].min() - ship_length)
-        x_max = max(x_max, ship_positions[:, 0].max() + ship_length)
-        y_min = min(y_min, ship_positions[:, 1].min() - ship_beam)
-        y_max = max(y_max, ship_positions[:, 1].max() + ship_beam)
+        x_min = ship_positions[:, 0].min() - ship_length - 20
+        x_max = ship_positions[:, 0].max() + ship_length + 20
+        y_min = ship_positions[:, 1].min() - ship_beam - 20
+        y_max = ship_positions[:, 1].max() + ship_beam + 20
+    else:
+        x_min, x_max, y_min, y_max = -50, 50, -50, 50
+    if n_elements > 0:
+        all_pos = np.concatenate(positions_history)
+        x_min = min(x_min, all_pos[:, 0].min() - 20)
+        x_max = max(x_max, all_pos[:, 0].max() + 20)
+        y_min = min(y_min, all_pos[:, 1].min() - 20)
+        y_max = max(y_max, all_pos[:, 1].max() + 20)
     
     fig, ax = plt.subplots(figsize=(16, 12))
     
     water_color = '#1A4D70'
     ship_color = '#404040'
     
-    thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
-    ice_colors = []
-    for t in thickness_norm:
-        r = int(240 - 100 * t)
-        g = int(250 - 80 * t)
-        b = int(255 - 40 * t)
-        ice_colors.append(f'#{r:02x}{g:02x}{b:02x}')
+    if n_elements > 0 and len(thicknesses) > 0:
+        thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
+        ice_colors = []
+        for t in thickness_norm:
+            r = int(240 - 100 * t)
+            g = int(250 - 80 * t)
+            b = int(255 - 40 * t)
+            ice_colors.append(f'#{r:02x}{g:02x}{b:02x}')
+    else:
+        ice_colors = []
     
     def rotate_polygon(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -1403,8 +1614,8 @@ def main():
     print(f"  Ice domain X: {x_min:.1f} to {x_max:.1f}m, Y: {y_min:.1f} to {y_max:.1f}m", flush=True)
     
     if args.simple:
-        # Simple mode: ship crosses small field along x, few frames
-        n_frames = 100
+        # Simple mode: ship crosses small field along x; enough frames for dynamics to navigate through ice
+        n_frames = 250
         ship_start = np.array([x_min - ship_length / 2 - 20.0, (y_min + y_max) / 2])
         ship_end = np.array([x_max + ship_length / 2 + 20.0, (y_min + y_max) / 2])
         ship_heading = 0.0  # bow in +x
