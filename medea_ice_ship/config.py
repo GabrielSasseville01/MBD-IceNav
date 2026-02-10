@@ -7,7 +7,7 @@ to the main script as needed.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +51,10 @@ class SimulationConfig:
     dt: float = 0.05
 
     # --- Collision (ice–ship) ---
-    # m — reference penetration depth at which normal force reaches F_break (force = min(pen/pen_crit, 1) × F_break).
+    # m — reference penetration depth at which normal force reaches F_break (at pen_crit_thickness_ref).
     pen_crit_ref: float = 0.5
+    # m — thickness at which pen_crit = pen_crit_ref; pen_crit scales with thickness so thick ice needs more penetration to reach F_break (avoids fracturing 10 m ice with a few cm).
+    pen_crit_thickness_ref: float = 1.0
     # Number of sample points along each ice edge for collision detection (reduces missed contacts).
     n_edge_samples: int = 4
     # Contact width for breaking force: w_contact = min(this × sqrt(area), w_contact_cap).
@@ -147,6 +149,8 @@ class SimulationConfig:
     Kd_ship: float = 1e6
     # (|surge|_max, |sway|_max, |yaw_rate|_max) in m/s and rad/s — clamp on ship body velocity.
     ship_velocity_clip: Tuple[float, float, float] = (15.0, 8.0, 0.15)
+    # N — cap on magnitude of ice-on-ship force from collision (thrust limit). Default 25 MN is order-of-magnitude for typical icebreaker bollard pull / installed thrust (e.g. 1–50 MN range); set to None to disable (unlimited thrust).
+    max_ship_ice_force: Optional[float] = 25e6
 
 
 # ---------------------------------------------------------------------------

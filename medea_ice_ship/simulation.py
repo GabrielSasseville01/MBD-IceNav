@@ -147,6 +147,9 @@ def simulate_ice_ship_interaction(
         ship_collision_force = np.zeros(n)
         F_ice_ship = np.zeros(2)
         M_ice_ship = 0.0
+        F_ice_ship_collision = np.zeros(2)
+        M_ice_ship_collision = 0.0
+        F_ship_on_ice = np.zeros((n, 2))
 
         ship_hull_pts = create_ship_hull_at_position_heading(
             ship_length, ship_beam, ship_pos_frame, ship_heading
@@ -193,7 +196,9 @@ def simulate_ice_ship_interaction(
                 ever_collided.add(i)
                 w_contact = min(cfg.w_contact_radius_factor * radii[i], cfg.w_contact_cap)
                 F_break = IceProperties.breaking_force(thicknesses[i], w_contact)
-                force_mag = F_break * min(pen / cfg.pen_crit_ref, 1.0)
+                # Thickness-dependent pen_crit: thick ice requires more penetration before force reaches F_break (realistic bending).
+                pen_crit_i = cfg.pen_crit_ref * (thicknesses[i] / cfg.pen_crit_thickness_ref)
+                force_mag = F_break * min(pen / pen_crit_i, 1.0)
                 forces[i, 0] += force_mag * nx
                 forces[i, 1] += force_mag * ny
                 ship_collision_force[i] = force_mag
@@ -201,11 +206,11 @@ def simulate_ice_ship_interaction(
                 side_direction = 1 if rel_y > 0 else -1
                 side_push = cfg.side_push_factor * force_mag * side_direction
                 forces[i, 1] += side_push
-                F_ice_ship[0] -= force_mag * nx
-                F_ice_ship[1] -= (force_mag * ny + side_push)
-                r_vec = positions[i] - ship_pos_frame
                 F_ship_i = np.array([force_mag * nx, force_mag * ny + side_push])
-                M_ice_ship += r_vec[0] * (-F_ship_i[1]) - r_vec[1] * (-F_ship_i[0])
+                F_ship_on_ice[i] = F_ship_i
+                F_ice_ship_collision -= F_ship_i
+                r_vec = positions[i] - ship_pos_frame
+                M_ice_ship_collision += r_vec[0] * (-F_ship_i[1]) - r_vec[1] * (-F_ship_i[0])
                 submergence[i] = min(
                     submergence[i] + cfg.submergence_rate * min(pen, cfg.submergence_pen_cap) * dt,
                     thicknesses[i]
@@ -221,6 +226,20 @@ def simulate_ice_ship_interaction(
                 r_vec_b = positions[i] - ship_pos_frame
                 M_ice_ship += F_buoy * (r_vec_b[1] * nx - r_vec_b[0] * ny)
                 angular_vels[i] += cfg.angular_impulse_scale * side_direction * min(pen, cfg.angular_impulse_pen_cap)
+
+        # Optional thrust cap: limit ice-on-ship collision force so ship cannot break very thick ice by unlimited push.
+        if cfg.max_ship_ice_force is not None:
+            F_coll_mag = np.linalg.norm(F_ice_ship_collision)
+            if F_coll_mag > cfg.max_ship_ice_force and F_coll_mag > 1e-6:
+                scale = cfg.max_ship_ice_force / F_coll_mag
+                for i in range(n):
+                    if ship_collision_force[i] > 0:
+                        forces[i] -= (1.0 - scale) * F_ship_on_ice[i]
+                        ship_collision_force[i] *= scale
+                F_ice_ship_collision *= scale
+                M_ice_ship_collision *= scale
+        F_ice_ship += F_ice_ship_collision
+        M_ice_ship += M_ice_ship_collision
 
         for i in range(n):
             if ship_collision_force[i] <= 0:

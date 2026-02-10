@@ -53,6 +53,12 @@ def main():
                         help='Save full simulation state to FILE for replay (pickle)')
     parser.add_argument('--load-state', type=str, metavar='FILE', default=None,
                         help='Load state from FILE and run visualization only (no re-simulation)')
+    parser.add_argument('--thick-ice', type=float, metavar='M', default=None,
+                        help='Override ice thickness to M metres for all cells (e.g. 10 for thick-ice test)')
+    parser.add_argument('--thrust-cap', type=float, metavar='N', default=None,
+                        help='Cap ice-on-ship force to N Newtons (e.g. 25e6 for 25 MN)')
+    parser.add_argument('--no-thrust-cap', action='store_true',
+                        help='Disable thrust cap (unlimited ship thrust)')
     args = parser.parse_args()
     run_cfg = _get_run_config()
 
@@ -161,7 +167,11 @@ def main():
         sat_areas, min_thickness=run_cfg.thickness_min, max_thickness=run_cfg.thickness_max, power=run_cfg.thickness_power
     )
     thicknesses = sat_thicknesses[parent_floe_ids]
-    print(f"  Thickness range: {thicknesses.min():.2f} - {thicknesses.max():.2f} m", flush=True)
+    if args.thick_ice is not None:
+        thicknesses = np.full_like(thicknesses, float(args.thick_ice))
+        print(f"  Thickness overridden to {args.thick_ice} m (thick-ice test)", flush=True)
+    else:
+        print(f"  Thickness range: {thicknesses.min():.2f} - {thicknesses.max():.2f} m", flush=True)
     print("Creating bonds between cells...", flush=True)
     bonds = create_proximity_bonds(centroids, radii, threshold_factor=run_cfg.bond_threshold_factor)
     print(f"  Created {len(bonds)} bonds", flush=True)
@@ -206,6 +216,14 @@ def main():
         print(f"  Ship stationary at ({ship_pos[0]:.0f}, {ship_pos[1]:.0f}), ice drifts toward ship", flush=True)
 
     sim_cfg = get_default_simulation_config()
+    if args.no_thrust_cap:
+        from dataclasses import replace
+        sim_cfg = replace(sim_cfg, max_ship_ice_force=None)
+        print("  Thrust cap: disabled (unlimited)", flush=True)
+    elif args.thrust_cap is not None:
+        from dataclasses import replace
+        sim_cfg = replace(sim_cfg, max_ship_ice_force=args.thrust_cap)
+        print(f"  Thrust cap: {args.thrust_cap/1e6:.1f} MN", flush=True)
     t0 = time.time()
     print(f"\nRunning fracture simulation ({n_frames} frames)...", flush=True)
     sim_result = simulate_ice_ship_interaction(
