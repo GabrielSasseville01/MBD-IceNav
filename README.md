@@ -37,7 +37,27 @@ python run_medea_ship_fracture.py --no-3d
 
 # Full ice map, ship diagonal bottom-left → top-right
 python run_medea_ship_fracture.py --full-map
+
+# Simple synthetic ice field (fast, for testing improvements)
+python run_medea_ship_fracture.py --simple
+
+# Reproducibility: fix random seed (tessellation, thickness noise, angular noise)
+python run_medea_ship_fracture.py --simple --seed 42
+
+# Save state after simulation for replay without re-running
+python run_medea_ship_fracture.py --simple --save-state scenario.pkl
+
+# Replay: load state and generate 2D/3D animations only (no simulation)
+python run_medea_ship_fracture.py --load-state scenario.pkl
 ```
+
+### Reproducibility (Section 5.1)
+
+The script sets a single random seed at startup (default `42`, overridable with `--seed`). This makes tessellation, thickness noise (`assign_thickness_by_area`), and small angular velocity noise deterministic. Same seed ⇒ same ice field layout and same simulation outcome.
+
+### Scenario replay (Section 5.2)
+
+Use `--save-state FILE` to write the full simulation state (positions, rotations, bonds, ship history, submergence, etc.) to a pickle file. Use `--load-state FILE` to skip the simulation and regenerate only the 2D and 3D animations from that state.
 
 Requires MEDEA data: `data/ice_floes_MEDEA_fram_20100629.pkl` (see `data/` or AUTO-IceNav MEDEA dataset).
 

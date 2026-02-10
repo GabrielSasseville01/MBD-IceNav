@@ -703,6 +703,8 @@ def simulate_ice_ship_interaction(
     velocities = np.zeros_like(positions)
     rotations = np.zeros(n)
     angular_vels = np.zeros(n)
+    # 3.1: Pseudo-vertical submergence (m) when ice is pressed under ship; buoyancy resists
+    submergence = np.zeros(n)
     
     # Bond state
     bond_intact = np.ones(len(bonds), dtype=bool)
@@ -726,6 +728,7 @@ def simulate_ice_ship_interaction(
     rotations_history = [rotations.copy()]
     bonds_history = [bond_intact.copy()]
     ship_history = []
+    submergence_history = [submergence.copy()]  # 3.1: for 3D viz (submerged vs surfaced)
     
     ship_impact_force = (ship_props.impact_force(drift_vel, np.mean(thicknesses))
                          if (drift_vel > 0 and len(thicknesses) > 0) else 0.0)
@@ -857,8 +860,31 @@ def simulate_ice_ship_interaction(
                 F_ship_i = np.array([force_mag * nx, force_mag * ny + side_push])  # force on ice
                 M_ice_ship += r_vec[0] * (-F_ship_i[1]) - r_vec[1] * (-F_ship_i[0])  # r × (-F_on_ice)
                 
+                # 3.1: Simple 3D effect — submergence under ship, buoyancy resists (vertical motion in 2D proxy)
+                SUBMERGE_RATE = 0.4  # m/s effective sink rate per m penetration
+                submergence[i] = min(
+                    submergence[i] + SUBMERGE_RATE * min(pen, 0.5) * dt,
+                    thicknesses[i]
+                )
+                z_sub = min(submergence[i], thicknesses[i])
+                RHO_W = IceProperties.WATER_DENSITY
+                G = 9.81
+                F_buoy = RHO_W * G * areas[i] * z_sub  # buoyancy (N) pushing ice up → in 2D: away from ship
+                forces[i, 0] += F_buoy * nx
+                forces[i, 1] += F_buoy * ny
+                F_ice_ship[0] -= F_buoy * nx
+                F_ice_ship[1] -= F_buoy * ny
+                r_vec_b = positions[i] - ship_pos_frame
+                M_ice_ship += F_buoy * (r_vec_b[1] * nx - r_vec_b[0] * ny)  # r × (-F_buoy*n) on ship
+                
                 # Angular impulse - very small to prevent spinning
                 angular_vels[i] += 0.01 * side_direction * min(pen, 1.0)
+        
+        # 3.1: Decay submergence when not in contact (ice surfaces)
+        RISE_TIME_CONST = 0.5  # s
+        for i in range(n):
+            if ship_collision_force[i] <= 0:
+                submergence[i] = max(0, submergence[i] - (1.0 / RISE_TIME_CONST) * submergence[i] * dt)
         
         # 2.4: Bow rubble resistance — extra force opposing surge when ice contacts bow
         RUBBLE_COEF = 0.25  # fraction of bow contact force that acts as rubble resistance
@@ -1079,6 +1105,7 @@ def simulate_ice_ship_interaction(
         positions_history.append(positions.copy())
         rotations_history.append(rotations.copy())
         bonds_history.append(bond_intact.copy())
+        submergence_history.append(submergence.copy())
     
     if collision_count > 0:
         print(f"  Total collisions: {collision_count}", flush=True)
@@ -1095,8 +1122,8 @@ def simulate_ice_ship_interaction(
         print("  WARNING: No collisions detected!", flush=True)
     
     if return_ship_diagnostics:
-        return positions_history, rotations_history, bonds_history, ship_history, ship_diagnostics
-    return positions_history, rotations_history, bonds_history, ship_history
+        return positions_history, rotations_history, bonds_history, ship_history, submergence_history, ship_diagnostics
+    return positions_history, rotations_history, bonds_history, ship_history, submergence_history
 
 
 # ============================================================================
@@ -1233,16 +1260,36 @@ def animate_ice_ship_2d(
 # ============================================================================
 
 def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_history,
-                           ship_length, ship_beam, ship_draft, n_elements):
+                           ship_length, ship_beam, ship_draft, n_elements,
+                           submergence_history=None):
     """
-    Add 3D ice dynamics: ice bends and submerges under ship hull when pushed.
-    Broken ice goes under the hull; intact ice bends at the bow.
+    Add 3D ice dynamics: z from submergence (3.1) when available, else heuristic.
+    When submergence_history is provided: z = -submergence (waterline at 0; below = submerged).
     """
     n_frames = len(positions_history)
     z_positions = [np.zeros(n_elements) for _ in range(n_frames)]
     tilts_x = [np.zeros(n_elements) for _ in range(n_frames)]
     tilts_y = [np.zeros(n_elements) for _ in range(n_frames)]
     
+    use_submergence = (submergence_history is not None and
+                       len(submergence_history) == n_frames and
+                       all(len(s) == n_elements for s in submergence_history))
+    
+    if use_submergence:
+        z_ship_bottom = -ship_draft
+        for frame in range(n_frames):
+            # z = -submergence: surface at 0, submerged ice below waterline
+            z_positions[frame] = -np.array(submergence_history[frame], dtype=float)
+            # Ice under the ship must be at or below hull bottom (never penetrate into ship)
+            ship_pos, ship_psi = ship_history[min(frame, len(ship_history) - 1)]
+            hull_pts = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_psi)
+            positions = positions_history[frame]
+            for i in range(n_elements):
+                if point_in_polygon((positions[i, 0], positions[i, 1]), hull_pts):
+                    z_positions[frame][i] = min(z_positions[frame][i], z_ship_bottom)
+        return z_positions, tilts_x, tilts_y
+    
+    # Heuristic fallback when no submergence data
     for frame in range(1, n_frames):
         positions = positions_history[frame]
         intact = bonds_history[frame]
@@ -1295,6 +1342,12 @@ def simulate_3d_ice_physics(positions_history, bonds_history, bonds, ship_histor
             if new_z[i] < -0.3 and dist_to_ship > ship_length:
                 new_z[i] += 0.02
         
+        # Ice under ship must be at or below hull bottom (never penetrate into ship)
+        hull_pts = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_psi)
+        for i in range(n_elements):
+            if point_in_polygon((positions[i, 0], positions[i, 1]), hull_pts):
+                new_z[i] = min(new_z[i], -ship_draft)
+        
         z_positions[frame] = new_z
         tilts_x[frame] = new_tilt_x
         tilts_y[frame] = new_tilt_y
@@ -1306,11 +1359,13 @@ def animate_ice_ship_3d(
     polygons, positions_history, rotations_history, bonds_history, bonds,
     ship_history, ship_length, ship_beam, ship_draft,
     initial_centroids, thicknesses,
-    output_file='medea_ship_fracture_3d.gif', fps=15, frame_skip=2
+    output_file='medea_ship_fracture_3d.gif', fps=15, frame_skip=2,
+    submergence_history=None,
 ):
     """
-    Create 3D animation matching 2D: same ice map, ship motion, plus 3D ice dynamics
-    (bending, submerging under hull).
+    Create 3D animation matching 2D: same ice map, ship motion, plus 3D ice dynamics.
+    When submergence_history is provided, z = -submergence (waterline at 0) and a
+    waterline plane is drawn so submerged vs surfaced ice is clear.
     """
     n_frames = len(positions_history)
     n_elements = len(polygons)
@@ -1329,11 +1384,19 @@ def animate_ice_ship_3d(
     print(f"  Computing 3D ice dynamics (bending, submerging)...", flush=True)
     z_positions, tilts_x, tilts_y = simulate_3d_ice_physics(
         positions_history, bonds_history, bonds, ship_history,
-        ship_length, ship_beam, ship_draft, n_elements
+        ship_length, ship_beam, ship_draft, n_elements,
+        submergence_history=submergence_history,
     )
+    # When submergence data exists, color by submerged (blue) vs surfaced (ice white) instead of waterline
+    color_by_submergence = submergence_history is not None
+    SURFACED_FACE = '#D8ECF8'   # ice white / light — at waterline
+    SURFACED_SIDE = '#C0E0F0'
+    SUBMERGED_FACE = '#2E6A9E'  # dark blue — below water
+    SUBMERGED_SIDE = '#4A8AC4'
+    Z_SURFACE_THRESHOLD = 0.05  # m; z_center < -this => submerged
     
     thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
-    ice_colors = []
+    ice_colors = []  # used when not color_by_submergence
     for t in thickness_norm:
         r = int(230 - 80 * t)
         g = int(245 - 60 * t)
@@ -1373,13 +1436,21 @@ def animate_ice_ship_3d(
         ax.set_box_aspect([domain_width, domain_height, (ship_draft + 8) * 2])
         ax.view_init(elev=30, azim=-60 + frame * 0.15)
         
-        # Draw ice with 3D dynamics (z offset, tilt)
+        # Draw ice with 3D dynamics (z offset, tilt); color by submerged vs surfaced when available
         for i in range(n_elements):
             rotated = rotate_poly(local_polys[i], rotations[i])
             world_poly = rotated + positions[i]
             z_center = z_pos[i]
             tx, ty = tilt_x[i], tilt_y[i]
             h = thicknesses[i]
+            
+            if color_by_submergence:
+                submerged = z_center < -Z_SURFACE_THRESHOLD
+                face_color = SUBMERGED_FACE if submerged else SURFACED_FACE
+                side_color = SUBMERGED_SIDE if submerged else SURFACED_SIDE
+            else:
+                face_color = ice_colors[i]
+                side_color = '#C8E0F0'
             
             n_verts = len(world_poly)
             center_xy = positions[i]
@@ -1399,14 +1470,14 @@ def animate_ice_ship_3d(
             edge_color = '#2080A0' if has_breaks else '#A0C8D8'
             
             ax.add_collection3d(Poly3DCollection(
-                [top_verts], facecolor=ice_colors[i], edgecolor=edge_color,
+                [top_verts], facecolor=face_color, edgecolor=edge_color,
                 linewidth=0.5 if has_breaks else 0.2, alpha=0.9
             ))
             for j in range(n_verts):
                 k = (j + 1) % n_verts
                 side = np.array([bottom_verts[j], bottom_verts[k], top_verts[k], top_verts[j]])
                 ax.add_collection3d(Poly3DCollection(
-                    [side], facecolor='#C8E0F0', edgecolor=edge_color, linewidth=0.1, alpha=0.8
+                    [side], facecolor=side_color, edgecolor=edge_color, linewidth=0.1, alpha=0.8
                 ))
         
         # Draw 3D ship hull at correct position and heading
@@ -1473,7 +1544,10 @@ def animate_ice_ship_3d(
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')
         ax.set_zlabel('Z [m]')
-        ax.set_title(f'DPDEM 3D Ice-Ship Simulation (MEDEA)\nFrame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken')
+        title = f'DPDEM 3D Ice-Ship Simulation (MEDEA)\nFrame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken'
+        if color_by_submergence:
+            title += '\nBlue = submerged | Light = at surface'
+        ax.set_title(title)
         return []
     
     anim = FuncAnimation(fig, update, frames=len(frames_to_render), blit=False)
@@ -1484,8 +1558,58 @@ def animate_ice_ship_3d(
 
 
 # ============================================================================
+# 5.2 Save / load state for scenario replay
+# ============================================================================
+
+def save_simulation_state(
+    polygons, centroids, bonds, thicknesses,
+    positions_history, rotations_history, bonds_history, ship_history, submergence_history,
+    ship_length, ship_beam, ship_draft, n_frames, dt,
+    output_2d=None, output_3d=None, simple_mode=False,
+    filepath=None,
+):
+    """Save full simulation state to a pickle file for replay (visualization without re-running)."""
+    import pickle
+    state = {
+        'polygons': polygons,
+        'centroids': centroids,
+        'bonds': bonds,
+        'thicknesses': thicknesses,
+        'positions_history': positions_history,
+        'rotations_history': rotations_history,
+        'bonds_history': bonds_history,
+        'ship_history': ship_history,
+        'submergence_history': submergence_history,
+        'ship_length': ship_length,
+        'ship_beam': ship_beam,
+        'ship_draft': ship_draft,
+        'n_frames': n_frames,
+        'dt': dt,
+        'output_2d': output_2d,
+        'output_3d': output_3d,
+        'simple_mode': simple_mode,
+    }
+    with open(filepath, 'wb') as f:
+        pickle.dump(state, f)
+    print(f"  Saved state to {filepath}", flush=True)
+
+
+def load_simulation_state(filepath):
+    """Load simulation state from a pickle file. Returns dict with all fields needed for replay."""
+    import pickle
+    with open(filepath, 'rb') as f:
+        state = pickle.load(f)
+    print(f"  Loaded state from {filepath} ({state['n_frames']} frames)", flush=True)
+    return state
+
+
+# ============================================================================
 # Main
 # ============================================================================
+
+# 5.1: Default seed for reproducibility (tessellation, thickness noise, angular noise)
+DEFAULT_SEED = 42
+
 
 def main():
     parser = argparse.ArgumentParser(description='MEDEA Ice Ship Fracture Simulation')
@@ -1495,9 +1619,42 @@ def main():
                         help='Use full ice map; ship starts bottom-left, moves diagonally to top-right')
     parser.add_argument('--simple', action='store_true',
                         help='Use minimal synthetic ice field (3 floes) for fast testing (no MEDEA data)')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED,
+                        help=f'Random seed for reproducibility (default: {DEFAULT_SEED})')
+    parser.add_argument('--save-state', type=str, metavar='FILE', default=None,
+                        help='Save full simulation state to FILE for replay (pickle)')
+    parser.add_argument('--load-state', type=str, metavar='FILE', default=None,
+                        help='Load state from FILE and run visualization only (no re-simulation)')
     args = parser.parse_args()
     
     total_start = time.time()
+    np.random.seed(args.seed)  # 5.1: Reproducibility for tessellation, thickness noise, angular noise
+    
+    # 5.2: Replay from saved state (skip simulation, run visualization only)
+    if args.load_state:
+        state = load_simulation_state(args.load_state)
+        out_2d = state.get('output_2d') or 'replay_2d.gif'
+        out_3d = state.get('output_3d') or 'replay_3d.gif'
+        print("\nGenerating 2D animation (replay)...", flush=True)
+        animate_ice_ship_2d(
+            state['polygons'], state['positions_history'], state['rotations_history'],
+            state['bonds_history'], state['bonds'],
+            state['ship_history'], state['ship_length'], state['ship_beam'],
+            state['centroids'], state['thicknesses'],
+            output_file=out_2d, fps=20
+        )
+        if not args.no_3d:
+            print("\nGenerating 3D animation (replay)...", flush=True)
+            animate_ice_ship_3d(
+                state['polygons'], state['positions_history'], state['rotations_history'],
+                state['bonds_history'], state['bonds'],
+                state['ship_history'], state['ship_length'], state['ship_beam'], state['ship_draft'],
+                state['centroids'], state['thicknesses'],
+                output_file=out_3d, fps=15, frame_skip=2,
+                submergence_history=state.get('submergence_history'),
+            )
+        print(f"\nReplay complete. Output: {out_2d}" + (f", {out_3d}" if not args.no_3d else ""))
+        return
     
     print("=" * 70)
     print("DPDEM: MEDEA Satellite Ice + Ship Fracture Simulation")
@@ -1525,11 +1682,11 @@ def main():
         # Minimal synthetic ice field: 3 floes of different sizes, no MEDEA
         t0 = time.time()
         print("Creating simple synthetic ice field (3 floes)...", flush=True)
-        sat_polygons, sat_centroids = create_simple_ice_field(seed=42)
+        sat_polygons, sat_centroids = create_simple_ice_field(seed=args.seed)
         print(f"  Created {len(sat_polygons)} floes ({time.time()-t0:.1f}s)", flush=True)
         CELLS_PER_100M2 = 0.25
         all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
-            sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=42
+            sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=args.seed
         )
         polygons = all_cells
         centroids = all_cell_centroids
@@ -1565,7 +1722,7 @@ def main():
         print("Tessellating floes internally for fracturing...", flush=True)
         CELLS_PER_100M2 = 0.8
         all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
-            sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=42
+            sat_polygons, sat_centroids, cells_per_100m2=CELLS_PER_100M2, seed=args.seed
         )
         print(f"  Created {len(all_cells)} total cells", flush=True)
         if args.full_map:
@@ -1614,8 +1771,8 @@ def main():
     print(f"  Ice domain X: {x_min:.1f} to {x_max:.1f}m, Y: {y_min:.1f} to {y_max:.1f}m", flush=True)
     
     if args.simple:
-        # Simple mode: ship crosses small field along x; enough frames for dynamics to navigate through ice
-        n_frames = 250
+        # Simple mode: ship crosses small field along x; enough frames to see evolution
+        n_frames = 600
         ship_start = np.array([x_min - ship_length / 2 - 20.0, (y_min + y_max) / 2])
         ship_end = np.array([x_max + ship_length / 2 + 20.0, (y_min + y_max) / 2])
         ship_heading = 0.0  # bow in +x
@@ -1659,7 +1816,7 @@ def main():
     t0 = time.time()
     print(f"\nRunning fracture simulation ({n_frames} frames)...", flush=True)
     
-    positions_history, rotations_history, bonds_history, ship_history = simulate_ice_ship_interaction(
+    sim_result = simulate_ice_ship_interaction(
         polygons=polygons,
         centroids=centroids.copy(),
         bonds=bonds,
@@ -1673,6 +1830,11 @@ def main():
         ship_props=ship_props,
         ship_trajectory=ship_trajectory,
     )
+    positions_history = sim_result[0]
+    rotations_history = sim_result[1]
+    bonds_history = sim_result[2]
+    ship_history = sim_result[3]
+    submergence_history = sim_result[4] if len(sim_result) > 4 else None
     sim_time = time.time() - t0
     
     # Stats
@@ -1682,6 +1844,17 @@ def main():
     pct = 100 * n_broken / n_initial if n_initial > 0 else 0
     print(f"\n  Final: {n_broken}/{n_initial} bonds broken ({pct:.0f}%)", flush=True)
     print(f"  Simulation time: {sim_time:.1f}s", flush=True)
+    
+    if args.save_state:
+        save_simulation_state(
+            polygons, centroids, bonds, thicknesses,
+            positions_history, rotations_history, bonds_history, ship_history, submergence_history,
+            ship_length, ship_beam, ship_draft, n_frames, dt=0.05,
+            output_2d='simple_ship_fracture.gif' if args.simple else 'medea_ship_fracture.gif',
+            output_3d='simple_ship_fracture_3d.gif' if args.simple else 'medea_ship_fracture_3d.gif',
+            simple_mode=args.simple,
+            filepath=args.save_state,
+        )
     
     if args.quick:
         print(f"\nQuick mode complete! Total: {time.time()-total_start:.1f}s")
@@ -1708,7 +1881,8 @@ def main():
             polygons, positions_history, rotations_history, bonds_history, bonds,
             ship_history, ship_length, ship_beam, ship_draft,
             centroids, thicknesses,
-            output_file=out_3d, fps=15, frame_skip=2
+            output_file=out_3d, fps=15, frame_skip=2,
+            submergence_history=submergence_history,
         )
         print(f"  3D animation time: {time.time()-t0:.1f}s", flush=True)
     

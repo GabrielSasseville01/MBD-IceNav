@@ -47,7 +47,8 @@ python run_medea_ship_fracture.py --simple --quick
 
 ## 3. 3D and thickness
 
-- [ ] **3.1** Optional: add simple 3D effects (e.g. buoyancy/effective force from thickness, or vertical motion of ice under the ship).
+- [x] **3.1** Optional: add simple 3D effects (e.g. buoyancy/effective force from thickness, or vertical motion of ice under the ship).  
+  **Implemented:** Per-element submergence state (m) when ice is pressed under the ship: increases with penetration while in contact (capped at thickness), decays when not in contact (0.5 s time constant). Buoyancy force F_buoy = ρ_water × g × area × min(submergence, thickness) applied on ice away from ship (normal direction); reaction force and moment on ship included so the ship feels extra resistance from “pushing ice down.”
 - [ ] **3.2** Support observed or prescribed thickness (e.g. from satellite) instead of area-based heuristic only.
 
 ---
@@ -62,8 +63,10 @@ python run_medea_ship_fracture.py --simple --quick
 
 ## 5. Reproducibility and structure
 
-- [ ] **5.1** Fix random seed(s) for tessellation and any stochastic parts; document in README.
-- [ ] **5.2** Add save/load of full state (positions, velocities, bonds, ship) for scenario replay.
+- [x] **5.1** Fix random seed(s) for tessellation and any stochastic parts; document in README.  
+  **Implemented:** Single seed at startup (`--seed`, default 42); used for create_simple_ice_field, tessellate_all_floes, and drives assign_thickness_by_area + angular_vels noise. Documented in README.
+- [x] **5.2** Add save/load of full state (positions, velocities, bonds, ship) for scenario replay.  
+  **Implemented:** `--save-state FILE` writes pickle (polygons, centroids, bonds, thicknesses, positions/rotations/bonds/ship/submergence history, ship params). `--load-state FILE` skips simulation and regenerates 2D/3D animations only.
 - [ ] **5.3** Refactor into modules (geometry, bonds, contact, integration, visualization) where useful.
 - [ ] **5.4** Centralize parameters (config or dataclass) for easier tuning and reporting.
 
