@@ -200,12 +200,18 @@ class RunConfig:
     path_margin: float = 20.0
     # Random seed for reproducibility (tessellation, thickness, etc.) when --seed not set.
     default_seed: int = 42
-    # Frames per second for 2D GIF animation.
+    # Frames per second for 2D animation.
     fps_2d: int = 20
-    # Frames per second for 3D GIF animation.
+    # Frames per second for 3D animation.
     fps_3d: int = 15
-    # Render every Nth frame in 3D to reduce file size (1 = all frames).
-    frame_skip_3d: int = 2
+    # Render every Nth frame in 2D (1 = all frames; 2 = half the frames, faster).
+    frame_skip_2d: int = 2
+    # Render every Nth frame in 3D (2 = 301 frames for 600 sim; 3 = 201 frames, faster).
+    frame_skip_3d: int = 3
+    # (width, height) inches for 3D figure; height 8.96 gives 896 px at 100 DPI (divisible by 16 for FFmpeg).
+    figsize_3d: Tuple[float, float] = (12.0, 8.96)
+    # Parallel animation workers (1 = sequential; 4+ = parallel render for MP4). Only used for MP4 output.
+    n_workers: int = 4
 
 
 # ---------------------------------------------------------------------------

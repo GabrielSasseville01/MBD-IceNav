@@ -1,24 +1,241 @@
 """2D and 3D animation for MEDEA ice–ship fracture simulation."""
 
+import multiprocessing
+import os
+import pickle
+import shutil
+import tempfile
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.patches import Polygon as MplPolygon
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from medea_ice_ship.geometry import polygon_centroid, create_ship_hull_at_position_heading, point_in_polygon
 from medea_ice_ship.config import VisualizationConfig, get_default_visualization_config
 
+# Process-global data for parallel workers (set by pool initializer)
+_DATA_2D = None
+_DATA_3D = None
+_RENDER_DPI = 100
+
+
+def _get_ffmpeg_path():
+    """Return path to ffmpeg: bundled (imageio-ffmpeg) first, then system PATH."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
+
+
+def _draw_2d_frame_to_array(data, frame_idx):
+    """Draw a single 2D frame; return RGB array (H, W, 3) uint8. Used by parallel workers."""
+    frame = data["frames_to_render"][frame_idx]
+    n_elements = data["n_elements"]
+    positions = data["positions_history"][frame]
+    rotations = data["rotations_history"][frame]
+    intact = data["bonds_history"][frame]
+    bonds = data["bonds"]
+    local_polys = data["local_polys"]
+    ice_colors = data["ice_colors"]
+    broken_neighbors = {i: set() for i in range(n_elements)}
+    for b, (i, j) in enumerate(bonds):
+        if not intact[b]:
+            broken_neighbors[i].add(j)
+            broken_neighbors[j].add(i)
+
+    fig, ax = plt.subplots(figsize=data["figsize"], dpi=data["dpi"])
+    ax.set_xlim(data["x_min"], data["x_max"])
+    ax.set_ylim(data["y_min"], data["y_max"])
+    ax.set_aspect("equal")
+    ax.set_facecolor(data["water_color"])
+    for i in range(n_elements):
+        c, s = np.cos(rotations[i]), np.sin(rotations[i])
+        rotated = local_polys[i] @ np.array([[c, -s], [s, c]]).T
+        world_poly = rotated + positions[i]
+        has_broken = len(broken_neighbors[i]) > 0
+        edge_color = "#1A4D70" if has_broken else ice_colors[i]
+        edge_width = 1.5 if has_broken else 0.5
+        patch = MplPolygon(world_poly, closed=True, facecolor=ice_colors[i], edgecolor=edge_color, linewidth=edge_width, alpha=0.95)
+        ax.add_patch(patch)
+    if frame < len(data["ship_history"]):
+        ship_pos_frame, ship_heading = data["ship_history"][frame]
+        ship_outline = create_ship_hull_at_position_heading(data["ship_length"], data["ship_beam"], ship_pos_frame, ship_heading)
+        ship_patch = MplPolygon(ship_outline, closed=True, facecolor=data["ship_color"], edgecolor="#202020", linewidth=2, alpha=0.95)
+        ax.add_patch(ship_patch)
+    n_broken = np.sum(~intact)
+    ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nFrame {frame}/{data['n_frames']-1} | Bonds: {n_broken}/{len(bonds)} broken", fontsize=14)
+    ax.set_xlabel("X [m]")
+    ax.set_ylabel("Y [m]")
+    fig.canvas.draw()
+    # buffer_rgba() is (height, width, 4); take RGB for imageio (tostring_rgb removed in newer matplotlib).
+    buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return buf
+
+
+def _init_worker_2d(data_path):
+    global _DATA_2D
+    with open(data_path, "rb") as f:
+        _DATA_2D = pickle.load(f)
+
+
+def _worker_2d(frame_idx):
+    return (frame_idx, _draw_2d_frame_to_array(_DATA_2D, frame_idx))
+
+
+def _draw_3d_frame_to_array(data, frame_idx):
+    """Draw a single 3D frame; return RGB array (H, W, 3) uint8. Used by parallel workers."""
+    frame = data["frames_to_render"][frame_idx]
+    n_elements = data["n_elements"]
+    ship_pos, ship_psi = data["ship_history"][min(frame, len(data["ship_history"]) - 1)]
+    ship_x, ship_y = ship_pos[0], ship_pos[1]
+    positions = data["positions_history"][frame]
+    rotations = data["rotations_history"][frame]
+    intact = data["bonds_history"][frame]
+    z_pos = data["z_positions"][frame]
+    tilt_x = data["tilts_x"][frame]
+    tilt_y = data["tilts_y"][frame]
+    bonds = data["bonds"]
+    thicknesses = data["thicknesses"]
+    local_polys = data["local_polys"]
+    ship_draft = data["ship_draft"]
+    ship_length = data["ship_length"]
+    ship_beam = data["ship_beam"]
+
+    fig = plt.figure(figsize=data["figsize"], dpi=data["dpi"])
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_xlim(data["x_min"], data["x_max"])
+    ax.set_ylim(data["y_min"], data["y_max"])
+    ax.set_zlim(-ship_draft - 3, 5)
+    ax.set_box_aspect([data["domain_width"], data["domain_height"], (ship_draft + 8) * 2])
+    ax.view_init(elev=data["view_elev"], azim=data["view_azim_start"] + frame * data["view_azim_per_frame"])
+
+    def rotate_poly(poly, angle):
+        c, s = np.cos(angle), np.sin(angle)
+        return poly @ np.array([[c, -s], [s, c]]).T
+
+    for i in range(n_elements):
+        rotated = rotate_poly(local_polys[i], rotations[i])
+        world_poly = rotated + positions[i]
+        z_center, tx, ty, h = z_pos[i], tilt_x[i], tilt_y[i], thicknesses[i]
+        if data["color_by_submergence"]:
+            submerged = z_center < -data["Z_SURFACE_THRESHOLD"]
+            face_color = data["SUBMERGED_FACE"] if submerged else data["SURFACED_FACE"]
+            side_color = data["SUBMERGED_SIDE"] if submerged else data["SURFACED_SIDE"]
+        else:
+            face_color, side_color = data["ice_colors"][i], "#C8E0F0"
+        center_xy = positions[i]
+        top_verts = []
+        bottom_verts = []
+        for v in world_poly:
+            dx, dy = v[0] - center_xy[0], v[1] - center_xy[1]
+            z_offset = dx * np.sin(tx) + dy * np.sin(ty)
+            top_verts.append([v[0], v[1], z_center + h * 0.1 + z_offset])
+            bottom_verts.append([v[0], v[1], z_center - h * 0.9 + z_offset])
+        top_verts = np.array(top_verts)
+        bottom_verts = np.array(bottom_verts)
+        has_breaks = any(not intact[b] for b, (pi, pj) in enumerate(bonds) if pi == i or pj == i)
+        edge_color = "#2080A0" if has_breaks else "#A0C8D8"
+        ax.add_collection3d(Poly3DCollection([top_verts], facecolor=face_color, edgecolor=edge_color, linewidth=0.5 if has_breaks else 0.2, alpha=0.9))
+        n_verts = len(world_poly)
+        for j in range(n_verts):
+            k = (j + 1) % n_verts
+            side = np.array([bottom_verts[j], bottom_verts[k], top_verts[k], top_verts[j]])
+            ax.add_collection3d(Poly3DCollection([side], facecolor=side_color, edgecolor=edge_color, linewidth=0.1, alpha=0.8))
+
+    c, s = np.cos(ship_psi), np.sin(ship_psi)
+    half_l, half_b = ship_length / 2, ship_beam / 2
+    deck_height = 1.5
+    n_sections = 10
+    hull_verts = []
+    for i in range(n_sections + 1):
+        t = i / n_sections
+        x_local = half_l - t * ship_length
+        x_rel = x_local / half_l
+        taper = max(1.0 - 0.9 * ((x_rel - 0.6) / 0.4) ** 1.5 if x_rel > 0.6 else 1.0, 0.05)
+        local_beam = ship_beam * taper
+        local_draft = ship_draft * taper
+        local_deck = deck_height * taper
+        hull_verts.extend([
+            [x_local, -local_beam/2, local_deck], [x_local, local_beam/2, local_deck],
+            [x_local, -local_beam/2*0.9, 0], [x_local, local_beam/2*0.9, 0],
+            [x_local, 0, -local_draft],
+        ])
+    hull_verts = np.array(hull_verts)
+    R_3d = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    hull_verts_world = hull_verts @ R_3d.T + np.array([ship_x, ship_y, 0])
+    verts_per_section = 5
+    deck_color, hull_above, hull_below = "#8B4513", "#C0C0C0", "#8B0000"
+    for i in range(n_sections):
+        base = i * verts_per_section
+        next_base = (i + 1) * verts_per_section
+        deck_face = np.array([hull_verts_world[base], hull_verts_world[next_base], hull_verts_world[next_base + 1], hull_verts_world[base + 1]])
+        ax.add_collection3d(Poly3DCollection([deck_face], facecolor=deck_color, edgecolor="#5D3A1A", linewidth=0.5, alpha=0.95))
+        port_top = np.array([hull_verts_world[base], hull_verts_world[base+2], hull_verts_world[next_base+2], hull_verts_world[next_base]])
+        ax.add_collection3d(Poly3DCollection([port_top], facecolor=hull_above, edgecolor="#808080", linewidth=0.3, alpha=0.95))
+        starboard_top = np.array([hull_verts_world[base+1], hull_verts_world[next_base+1], hull_verts_world[next_base+3], hull_verts_world[base+3]])
+        ax.add_collection3d(Poly3DCollection([starboard_top], facecolor=hull_above, edgecolor="#808080", linewidth=0.3, alpha=0.95))
+        port_bot = np.array([hull_verts_world[base+2], hull_verts_world[base+4], hull_verts_world[next_base+4], hull_verts_world[next_base+2]])
+        ax.add_collection3d(Poly3DCollection([port_bot], facecolor=hull_below, edgecolor="#5C0000", linewidth=0.3, alpha=0.95))
+        starboard_bot = np.array([hull_verts_world[base+3], hull_verts_world[next_base+3], hull_verts_world[next_base+4], hull_verts_world[base+4]])
+        ax.add_collection3d(Poly3DCollection([starboard_bot], facecolor=hull_below, edgecolor="#5C0000", linewidth=0.3, alpha=0.95))
+    ax.set_xlabel("X [m]")
+    ax.set_ylabel("Y [m]")
+    ax.set_zlabel("Z [m]")
+    n_broken = np.sum(~intact)
+    title = f"DPDEM 3D Ice-Ship Simulation (MEDEA)\nFrame {frame}/{data['n_frames']-1} | Bonds: {n_broken}/{len(bonds)} broken"
+    if data["color_by_submergence"]:
+        title += "\nBlue = submerged | Light = at surface"
+    ax.set_title(title)
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return buf
+
+
+def _init_worker_3d(data_path):
+    global _DATA_3D
+    with open(data_path, "rb") as f:
+        _DATA_3D = pickle.load(f)
+
+
+def _worker_3d(frame_idx):
+    return (frame_idx, _draw_3d_frame_to_array(_DATA_3D, frame_idx))
+
+
+def _animation_writer(output_file, fps):
+    """Use FFMpegWriter for .mp4 (faster, smaller), PillowWriter for .gif. Uses bundled ffmpeg (imageio-ffmpeg) or system ffmpeg; falls back to GIF if neither available."""
+    out = str(output_file)
+    if out.lower().endswith(".mp4"):
+        ffmpeg_path = _get_ffmpeg_path()
+        if ffmpeg_path is None:
+            output_file = out[:-4] + ".gif"
+            print("  ffmpeg not found; saving as GIF instead of MP4 (install imageio-ffmpeg or system ffmpeg for MP4).", flush=True)
+            return PillowWriter(fps=fps), output_file
+        import matplotlib
+        matplotlib.rcParams["animation.ffmpeg_path"] = ffmpeg_path
+        # Faster encoding (slightly larger file); use 'ultrafast' for max speed.
+        return FFMpegWriter(fps=fps, extra_args=["-preset", "veryfast"]), output_file
+    return PillowWriter(fps=fps), output_file
+
 
 def animate_ice_ship_2d(
     polygons, positions_history, rotations_history, bonds_history, bonds,
     ship_history, ship_length, ship_beam, initial_centroids, thicknesses,
-    output_file='medea_ship_fracture.gif', fps=20
+    output_file='medea_ship_fracture.gif', fps=20, frame_skip=1, n_workers=1,
+    figsize=(16, 12),
 ):
-    """Animate ice-ship interaction in 2D. Handles n_elements=0 (clear water: ship only)."""
+    """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame."""
     n_frames = len(positions_history)
+    frames_to_render = list(range(0, n_frames, frame_skip))
+    if frames_to_render[-1] != n_frames - 1:
+        frames_to_render.append(n_frames - 1)
+    n_render = len(frames_to_render)
     n_elements = len(polygons)
     local_polys = []
     for poly in polygons:
@@ -26,19 +243,18 @@ def animate_ice_ship_2d(
         local_polys.append(poly - centroid)
     if len(ship_history) > 0:
         ship_positions = np.array([h[0] for h in ship_history])
-        x_min = ship_positions[:, 0].min() - ship_length - 20
-        x_max = ship_positions[:, 0].max() + ship_length + 20
-        y_min = ship_positions[:, 1].min() - ship_beam - 20
-        y_max = ship_positions[:, 1].max() + ship_beam + 20
+        x_min = float(ship_positions[:, 0].min() - ship_length - 20)
+        x_max = float(ship_positions[:, 0].max() + ship_length + 20)
+        y_min = float(ship_positions[:, 1].min() - ship_beam - 20)
+        y_max = float(ship_positions[:, 1].max() + ship_beam + 20)
     else:
-        x_min, x_max, y_min, y_max = -50, 50, -50, 50
+        x_min, x_max, y_min, y_max = -50.0, 50.0, -50.0, 50.0
     if n_elements > 0:
         all_pos = np.concatenate(positions_history)
-        x_min = min(x_min, all_pos[:, 0].min() - 20)
-        x_max = max(x_max, all_pos[:, 0].max() + 20)
-        y_min = min(y_min, all_pos[:, 1].min() - 20)
-        y_max = max(y_max, all_pos[:, 1].max() + 20)
-    fig, ax = plt.subplots(figsize=(16, 12))
+        x_min = min(x_min, float(all_pos[:, 0].min() - 20))
+        x_max = max(x_max, float(all_pos[:, 0].max() + 20))
+        y_min = min(y_min, float(all_pos[:, 1].min() - 20))
+        y_max = max(y_max, float(all_pos[:, 1].max() + 20))
     water_color = '#1A4D70'
     ship_color = '#404040'
     if n_elements > 0 and len(thicknesses) > 0:
@@ -47,13 +263,66 @@ def animate_ice_ship_2d(
     else:
         ice_colors = []
 
+    writer, out_path = _animation_writer(output_file, fps)
+    use_mp4 = str(output_file).lower().endswith(".mp4") and out_path.lower().endswith(".mp4")
+
+    if n_workers > 1 and use_mp4 and n_render > 0:
+        print(f"Creating 2D animation with {n_render} frames (parallel, n_workers={n_workers})...", flush=True)
+        data = {
+            "positions_history": positions_history,
+            "rotations_history": rotations_history,
+            "bonds_history": bonds_history,
+            "bonds": bonds,
+            "frames_to_render": frames_to_render,
+            "n_frames": n_frames,
+            "n_elements": n_elements,
+            "local_polys": local_polys,
+            "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+            "ice_colors": ice_colors,
+            "ship_history": ship_history,
+            "ship_length": ship_length,
+            "ship_beam": ship_beam,
+            "water_color": water_color,
+            "ship_color": ship_color,
+            "figsize": figsize,
+            "dpi": _RENDER_DPI,
+        }
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            n_workers_actual = min(n_workers, n_render, multiprocessing.cpu_count() or 4)
+            ctx = multiprocessing.get_context("spawn")
+            import imageio
+            print(f"  Writing to {out_path}...", flush=True)
+            with ctx.Pool(n_workers_actual, initializer=_init_worker_2d, initargs=(tmp_path,)) as pool:
+                pending = {}
+                next_idx = 0
+                with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
+                    for (idx, arr) in pool.imap_unordered(_worker_2d, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
+                        pending[idx] = arr
+                        while next_idx in pending:
+                            vid.append_data(pending.pop(next_idx))
+                            next_idx += 1
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        print(f"Saving to {out_path}...", flush=True)
+        print("Done!", flush=True)
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
     def rotate_polygon(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
         return poly @ np.array([[c, -s], [s, c]]).T
 
-    print(f"Creating 2D animation with {n_frames} frames...", flush=True)
+    print(f"Creating 2D animation with {n_render} frames (frame_skip={frame_skip})...", flush=True)
 
-    def update(frame):
+    def update(frame_idx):
+        frame = frames_to_render[frame_idx]
         ax.clear()
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
@@ -91,9 +360,9 @@ def animate_ice_ship_2d(
         ax.set_ylabel('Y [m]')
         return []
 
-    anim = FuncAnimation(fig, update, frames=n_frames, blit=False)
-    print(f"Saving to {output_file}...", flush=True)
-    anim.save(output_file, writer=PillowWriter(fps=fps))
+    anim = FuncAnimation(fig, update, frames=n_render, blit=False)
+    print(f"Saving to {out_path}...", flush=True)
+    anim.save(out_path, writer=writer)
     print("Done!", flush=True)
     plt.close(fig)
 
@@ -176,15 +445,17 @@ def animate_ice_ship_3d(
     output_file='medea_ship_fracture_3d.gif', fps=15, frame_skip=2,
     submergence_history=None,
     viz_config=None,
+    figsize=(12, 8.96),  # 1200×896 px at 100 DPI; divisible by 16 for FFmpeg macro_block_size
+    n_workers=1,
 ):
-    """3D animation with z from submergence; color by submerged (blue) vs surfaced (light)."""
+    """3D animation with z from submergence. n_workers>1 uses parallel rendering (faster)."""
     vc = viz_config or get_default_visualization_config()
     n_frames = len(positions_history)
     n_elements = len(polygons)
     local_polys = [poly - polygon_centroid(poly) for poly in polygons]
     all_pos = np.concatenate(positions_history)
-    x_min, x_max = all_pos[:, 0].min() - 50, all_pos[:, 0].max() + 50
-    y_min, y_max = all_pos[:, 1].min() - 50, all_pos[:, 1].max() + 50
+    x_min, x_max = float(all_pos[:, 0].min() - 50), float(all_pos[:, 0].max() + 50)
+    y_min, y_max = float(all_pos[:, 1].min() - 50), float(all_pos[:, 1].max() + 50)
     domain_width = x_max - x_min
     domain_height = y_max - y_min
     print(f"  Computing 3D ice dynamics (bending, submerging)...", flush=True)
@@ -199,12 +470,75 @@ def animate_ice_ship_3d(
     Z_SURFACE_THRESHOLD = vc.z_surface_threshold
     thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
     ice_colors = [f'#{int(230-80*t):02x}{int(245-60*t):02x}{int(255-30*t):02x}' for t in thickness_norm]
-    fig = plt.figure(figsize=(16, 12))
-    ax = fig.add_subplot(111, projection='3d')
     frames_to_render = list(range(0, n_frames, frame_skip))
     if frames_to_render[-1] != n_frames - 1:
         frames_to_render.append(n_frames - 1)
-    print(f"  Creating 3D animation with {len(frames_to_render)} frames...", flush=True)
+    n_render = len(frames_to_render)
+    writer, out_path = _animation_writer(output_file, fps)
+    use_mp4 = str(output_file).lower().endswith(".mp4") and out_path.lower().endswith(".mp4")
+
+    if n_workers > 1 and use_mp4 and n_render > 0:
+        print(f"  Creating 3D animation with {n_render} frames (parallel, n_workers={n_workers})...", flush=True)
+        data = {
+            "positions_history": positions_history,
+            "rotations_history": rotations_history,
+            "bonds_history": bonds_history,
+            "bonds": bonds,
+            "ship_history": ship_history,
+            "z_positions": z_positions,
+            "tilts_x": tilts_x,
+            "tilts_y": tilts_y,
+            "thicknesses": thicknesses,
+            "local_polys": local_polys,
+            "n_elements": n_elements,
+            "n_frames": n_frames,
+            "frames_to_render": frames_to_render,
+            "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+            "domain_width": domain_width,
+            "domain_height": domain_height,
+            "ship_length": ship_length,
+            "ship_beam": ship_beam,
+            "ship_draft": ship_draft,
+            "color_by_submergence": color_by_submergence,
+            "SURFACED_FACE": SURFACED_FACE, "SURFACED_SIDE": SURFACED_SIDE,
+            "SUBMERGED_FACE": SUBMERGED_FACE, "SUBMERGED_SIDE": SUBMERGED_SIDE,
+            "Z_SURFACE_THRESHOLD": Z_SURFACE_THRESHOLD,
+            "ice_colors": ice_colors,
+            "view_elev": vc.view_elev,
+            "view_azim_start": vc.view_azim_start,
+            "view_azim_per_frame": vc.view_azim_per_frame,
+            "figsize": figsize,
+            "dpi": _RENDER_DPI,
+        }
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            n_workers_actual = min(n_workers, n_render, multiprocessing.cpu_count() or 4)
+            ctx = multiprocessing.get_context("spawn")
+            import imageio
+            print(f"  Writing to {out_path}...", flush=True)
+            with ctx.Pool(n_workers_actual, initializer=_init_worker_3d, initargs=(tmp_path,)) as pool:
+                pending = {}
+                next_idx = 0
+                with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
+                    for (idx, arr) in pool.imap_unordered(_worker_3d, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
+                        pending[idx] = arr
+                        while next_idx in pending:
+                            vid.append_data(pending.pop(next_idx))
+                            next_idx += 1
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        print("  Done!", flush=True)
+        return
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    print(f"  Creating 3D animation with {n_render} frames...", flush=True)
 
     def rotate_poly(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -309,7 +643,8 @@ def animate_ice_ship_3d(
         return []
 
     anim = FuncAnimation(fig, update, frames=len(frames_to_render), blit=False)
-    print(f"  Saving to {output_file}...", flush=True)
-    anim.save(output_file, writer=PillowWriter(fps=fps))
+    writer, out_path = _animation_writer(output_file, fps)
+    print(f"  Saving to {out_path}...", flush=True)
+    anim.save(out_path, writer=writer)
     print("  Done!", flush=True)
     plt.close(fig)
