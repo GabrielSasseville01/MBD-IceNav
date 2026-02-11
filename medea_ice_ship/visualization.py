@@ -5,12 +5,14 @@ import os
 import pickle
 import shutil
 import tempfile
+import warnings
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.patches import Polygon as MplPolygon
+from matplotlib import colors as mpl_colors
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from medea_ice_ship.geometry import polygon_centroid, create_ship_hull_at_position_heading, point_in_polygon
@@ -19,6 +21,7 @@ from medea_ice_ship.config import VisualizationConfig, get_default_visualization
 # Process-global data for parallel workers (set by pool initializer)
 _DATA_2D = None
 _DATA_3D = None
+_DATA_COSTMAP = None
 _RENDER_DPI = 100
 
 
@@ -221,7 +224,226 @@ def _animation_writer(output_file, fps):
         matplotlib.rcParams["animation.ffmpeg_path"] = ffmpeg_path
         # Faster encoding (slightly larger file); use 'ultrafast' for max speed.
         return FFMpegWriter(fps=fps, extra_args=["-preset", "veryfast"]), output_file
-    return PillowWriter(fps=fps), output_file
+
+
+def _draw_costmap_frame_to_array(data, frame_idx):
+    """Draw one frame of the costmap movie: costmap + path-so-far + ship. Used by parallel workers."""
+    k = data["frames_to_render"][frame_idx]
+    cost_grid = data["cost_grid"]
+    x_origin = data["x_origin"]
+    y_origin = data["y_origin"]
+    resolution = data["resolution"]
+    cols, rows = data["cols"], data["rows"]
+    ship_history = data["ship_history"]
+    path = data.get("path")
+    polygons = data.get("polygons") or []
+    ship_length = data["ship_length"]
+    ship_beam = data["ship_beam"]
+    x_min_ax, x_max_ax = data["x_min_ax"], data["x_max_ax"]
+    y_min_ax, y_max_ax = data["y_min_ax"], data["y_max_ax"]
+
+    X = x_origin + np.arange(cols + 1) * resolution
+    Y = y_origin + np.arange(rows + 1) * resolution
+    cost = np.asarray(cost_grid)
+    norm = mpl_colors.LogNorm(vmin=max(0.5, float(cost.min())), vmax=float(cost.max()))
+
+    fig, ax = plt.subplots(figsize=data["figsize"], dpi=data["dpi"])
+    ax.pcolormesh(X, Y, cost, norm=norm, cmap="viridis", shading="flat")
+    for poly in polygons:
+        closed = np.vstack([poly, poly[0:1]])
+        ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+    if path is not None and len(path) > 0:
+        ax.plot(path[:, 0], path[:, 1], "k--", linewidth=1, alpha=0.6, label="Planned path")
+    trail_end = min(k + 1, len(ship_history))
+    if trail_end >= 2:
+        trail_x = [ship_history[i][0][0] for i in range(trail_end)]
+        trail_y = [ship_history[i][0][1] for i in range(trail_end)]
+        ax.plot(trail_x, trail_y, "r-", linewidth=2, label="Ship path", zorder=5)
+    if k < len(ship_history):
+        ship_pos, ship_heading = ship_history[k][0], ship_history[k][1]
+        ax.plot(ship_pos[0], ship_pos[1], "ro", markersize=8, zorder=6)
+        hull = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_heading)
+        patch = MplPolygon(hull, closed=True, facecolor="#C03030", edgecolor="#802020", linewidth=1.5, alpha=0.9, zorder=6)
+        ax.add_patch(patch)
+    if len(ship_history) > 0:
+        start_pos = ship_history[0][0]
+        ax.plot(start_pos[0], start_pos[1], "go", markersize=10, label="Start", zorder=7)
+    if path is not None and len(path) > 0:
+        ax.plot(path[-1, 0], path[-1, 1], "rs", markersize=10, label="Goal", zorder=7)
+    ax.set_xlim(x_min_ax, x_max_ax)
+    ax.set_ylim(y_min_ax, y_max_ax)
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"Costmap + ship trajectory (AUTO-IceNav style)\nFrame {k}/{data['n_frames']-1}")
+    ax.grid(True, alpha=0.3)
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return buf
+
+
+def _init_worker_costmap(data_path):
+    global _DATA_COSTMAP
+    with open(data_path, "rb") as f:
+        _DATA_COSTMAP = pickle.load(f)
+
+
+def _worker_costmap(frame_idx):
+    return (frame_idx, _draw_costmap_frame_to_array(_DATA_COSTMAP, frame_idx))
+
+
+def animate_costmap_movie(
+    cost_map,
+    bounds,
+    ship_history,
+    path=None,
+    polygons=None,
+    ship_length=158.0,
+    ship_beam=28.0,
+    output_file="costmap_movie.mp4",
+    fps=20,
+    frame_skip=1,
+    n_workers=1,
+    figsize=(10.08, 6.08),
+):
+    """
+    Generate a costmap movie (AUTO-IceNav style): costmap as background, ship trajectory
+    drawing over time, optional planned path and ice outlines.
+
+    cost_map: object with .cost_map (2D array), .x_origin, .y_origin, .resolution, .cols, .rows
+    bounds: dict with x_min, x_max, y_min, y_max (for optional ice domain rect)
+    ship_history: list of (position_2d, heading) per frame
+    path: Nx3 planned path [x,y,heading] or None
+    polygons: list of polygon arrays for ice outline overlay, or None
+    """
+    n_frames = len(ship_history)
+    if n_frames == 0:
+        print("animate_costmap_movie: ship_history is empty, skipping.", flush=True)
+        return
+    frames_to_render = list(range(0, n_frames, frame_skip))
+    if frames_to_render[-1] != n_frames - 1:
+        frames_to_render.append(n_frames - 1)
+    n_render = len(frames_to_render)
+    resolution = getattr(cost_map, "resolution", 2.0)
+    x_origin = getattr(cost_map, "x_origin", bounds.get("x_origin", 0))
+    y_origin = getattr(cost_map, "y_origin", bounds.get("y_origin", 0))
+    cols = getattr(cost_map, "cols", cost_map.cost_map.shape[1])
+    rows = getattr(cost_map, "rows", cost_map.cost_map.shape[0])
+    ship_positions = np.array([h[0] for h in ship_history])
+    x_min_ax = float(ship_positions[:, 0].min() - ship_length)
+    x_max_ax = float(ship_positions[:, 0].max() + ship_length)
+    y_min_ax = float(ship_positions[:, 1].min() - ship_beam)
+    y_max_ax = float(ship_positions[:, 1].max() + ship_beam)
+    if path is not None and len(path) > 0:
+        x_min_ax = min(x_min_ax, float(path[:, 0].min()))
+        x_max_ax = max(x_max_ax, float(path[:, 0].max()))
+        y_min_ax = min(y_min_ax, float(path[:, 1].min()))
+        y_max_ax = max(y_max_ax, float(path[:, 1].max()))
+    x_min_ax -= 20
+    x_max_ax += 20
+    y_min_ax -= 20
+    y_max_ax += 20
+
+    data = {
+        "cost_grid": cost_map.cost_map,
+        "x_origin": x_origin,
+        "y_origin": y_origin,
+        "resolution": resolution,
+        "cols": cols,
+        "rows": rows,
+        "ship_history": ship_history,
+        "path": np.asarray(path) if path is not None else None,
+        "polygons": list(polygons) if polygons is not None else [],
+        "ship_length": ship_length,
+        "ship_beam": ship_beam,
+        "frames_to_render": frames_to_render,
+        "n_frames": n_frames,
+        "x_min_ax": x_min_ax, "x_max_ax": x_max_ax,
+        "y_min_ax": y_min_ax, "y_max_ax": y_max_ax,
+        "figsize": figsize,
+        "dpi": _RENDER_DPI,
+    }
+    writer, out_path = _animation_writer(output_file, fps)
+    use_mp4 = str(output_file).lower().endswith(".mp4") and out_path.lower().endswith(".mp4")
+
+    if n_workers > 1 and use_mp4 and n_render > 0:
+        print(f"Creating costmap movie with {n_render} frames (parallel, n_workers={n_workers})...", flush=True)
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            n_workers_actual = min(n_workers, n_render, multiprocessing.cpu_count() or 4)
+            ctx = multiprocessing.get_context("spawn")
+            import imageio
+            print(f"  Writing to {out_path}...", flush=True)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning, module="subprocess")
+                pool = ctx.Pool(n_workers_actual, initializer=_init_worker_costmap, initargs=(tmp_path,))
+                with pool:
+                    pending = {}
+                    next_idx = 0
+                    with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
+                        for (idx, arr) in pool.imap_unordered(_worker_costmap, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
+                            pending[idx] = arr
+                            while next_idx in pending:
+                                vid.append_data(pending.pop(next_idx))
+                                next_idx += 1
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        print(f"  Costmap movie saved: {out_path}", flush=True)
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
+    print(f"Creating costmap movie with {n_render} frames (frame_skip={frame_skip})...", flush=True)
+
+    def update(frame_idx):
+        k = frames_to_render[frame_idx]
+        ax.clear()
+        X = x_origin + np.arange(cols + 1) * resolution
+        Y = y_origin + np.arange(rows + 1) * resolution
+        cost = np.asarray(cost_map.cost_map)
+        norm = mpl_colors.LogNorm(vmin=max(0.5, float(cost.min())), vmax=float(cost.max()))
+        ax.pcolormesh(X, Y, cost, norm=norm, cmap="viridis", shading="flat")
+        for poly in (polygons or []):
+            closed = np.vstack([poly, poly[0:1]])
+            ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+        if path is not None and len(path) > 0:
+            ax.plot(path[:, 0], path[:, 1], "k--", linewidth=1, alpha=0.6, label="Planned path")
+        trail_end = min(k + 1, len(ship_history))
+        if trail_end >= 2:
+            trail_x = [ship_history[i][0][0] for i in range(trail_end)]
+            trail_y = [ship_history[i][0][1] for i in range(trail_end)]
+            ax.plot(trail_x, trail_y, "r-", linewidth=2, label="Ship path", zorder=5)
+        if k < len(ship_history):
+            ship_pos, ship_heading = ship_history[k][0], ship_history[k][1]
+            ax.plot(ship_pos[0], ship_pos[1], "ro", markersize=8, zorder=6)
+            hull = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_heading)
+            ax.add_patch(MplPolygon(hull, closed=True, facecolor="#C03030", edgecolor="#802020", linewidth=1.5, alpha=0.9, zorder=6))
+        if len(ship_history) > 0:
+            ax.plot(ship_history[0][0][0], ship_history[0][0][1], "go", markersize=10, label="Start", zorder=7)
+        if path is not None and len(path) > 0:
+            ax.plot(path[-1, 0], path[-1, 1], "rs", markersize=10, label="Goal", zorder=7)
+        ax.set_xlim(x_min_ax, x_max_ax)
+        ax.set_ylim(y_min_ax, y_max_ax)
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_aspect("equal")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.set_title(f"Costmap + ship trajectory (AUTO-IceNav style)\nFrame {k}/{n_frames-1}")
+        ax.grid(True, alpha=0.3)
+        return []
+
+    anim = FuncAnimation(fig, update, frames=n_render, blit=False)
+    print(f"  Saving to {out_path}...", flush=True)
+    anim.save(out_path, writer=writer)
+    plt.close(fig)
+    print(f"  Costmap movie saved: {out_path}", flush=True)
 
 
 def animate_ice_ship_2d(
@@ -296,15 +518,18 @@ def animate_ice_ship_2d(
             ctx = multiprocessing.get_context("spawn")
             import imageio
             print(f"  Writing to {out_path}...", flush=True)
-            with ctx.Pool(n_workers_actual, initializer=_init_worker_2d, initargs=(tmp_path,)) as pool:
-                pending = {}
-                next_idx = 0
-                with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
-                    for (idx, arr) in pool.imap_unordered(_worker_2d, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
-                        pending[idx] = arr
-                        while next_idx in pending:
-                            vid.append_data(pending.pop(next_idx))
-                            next_idx += 1
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning, module="subprocess")
+                pool = ctx.Pool(n_workers_actual, initializer=_init_worker_2d, initargs=(tmp_path,))
+                with pool:
+                    pending = {}
+                    next_idx = 0
+                    with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
+                        for (idx, arr) in pool.imap_unordered(_worker_2d, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
+                            pending[idx] = arr
+                            while next_idx in pending:
+                                vid.append_data(pending.pop(next_idx))
+                                next_idx += 1
         finally:
             try:
                 os.unlink(tmp_path)
@@ -519,15 +744,18 @@ def animate_ice_ship_3d(
             ctx = multiprocessing.get_context("spawn")
             import imageio
             print(f"  Writing to {out_path}...", flush=True)
-            with ctx.Pool(n_workers_actual, initializer=_init_worker_3d, initargs=(tmp_path,)) as pool:
-                pending = {}
-                next_idx = 0
-                with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
-                    for (idx, arr) in pool.imap_unordered(_worker_3d, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
-                        pending[idx] = arr
-                        while next_idx in pending:
-                            vid.append_data(pending.pop(next_idx))
-                            next_idx += 1
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning, module="subprocess")
+                pool = ctx.Pool(n_workers_actual, initializer=_init_worker_3d, initargs=(tmp_path,))
+                with pool:
+                    pending = {}
+                    next_idx = 0
+                    with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps, codec="libx264", output_params=["-preset", "veryfast"]) as vid:
+                        for (idx, arr) in pool.imap_unordered(_worker_3d, range(n_render), chunksize=max(1, n_render // (n_workers_actual * 4))):
+                            pending[idx] = arr
+                            while next_idx in pending:
+                                vid.append_data(pending.pop(next_idx))
+                                next_idx += 1
         finally:
             try:
                 os.unlink(tmp_path)

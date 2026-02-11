@@ -31,6 +31,8 @@ class CostMap:
         width: float,
         height: float,
         resolution: float = 1.0,
+        x_origin: float = 0.0,
+        y_origin: float = 0.0,
         ship_mass: float = 1e6,
         base_cost: float = 1.0,
         collision_cost: float = 100.0,
@@ -38,11 +40,17 @@ class CostMap:
     ):
         """
         Initialize cost map.
-        
+
+        World coordinates (x, y) map to grid (row, col) via:
+          col = (x - x_origin) / resolution,  row = (y - y_origin) / resolution
+        so the map covers [x_origin, x_origin+width) x [y_origin, y_origin+height) in world units.
+
         Args:
             width: Map width [m]
             height: Map height [m]
             resolution: Grid resolution [m/cell]
+            x_origin: World x of grid column 0 [m]
+            y_origin: World y of grid row 0 [m]
             ship_mass: Ship mass for relative cost calculation [kg]
             base_cost: Base traversal cost per cell
             collision_cost: Cost for collision with ice
@@ -51,18 +59,20 @@ class CostMap:
         self.width = width
         self.height = height
         self.resolution = resolution
+        self.x_origin = x_origin
+        self.y_origin = y_origin
         self.ship_mass = ship_mass
         self.base_cost = base_cost
         self.collision_cost = collision_cost
         self.mass_cost_scale = mass_cost_scale
-        
+
         # Grid dimensions
         self.cols = int(np.ceil(width / resolution))
         self.rows = int(np.ceil(height / resolution))
-        
+
         # Cost grid
         self.cost_map = np.full((self.rows, self.cols), base_cost)
-        
+
         # Obstacle list
         self.obstacles: List[Obstacle] = []
     
@@ -73,14 +83,14 @@ class CostMap:
     
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         """Convert world coordinates to grid indices."""
-        col = int(x / self.resolution)
-        row = int(y / self.resolution)
+        col = int((x - self.x_origin) / self.resolution)
+        row = int((y - self.y_origin) / self.resolution)
         return (row, col)
-    
+
     def grid_to_world(self, row: int, col: int) -> Tuple[float, float]:
         """Convert grid indices to world coordinates (cell center)."""
-        x = (col + 0.5) * self.resolution
-        y = (row + 0.5) * self.resolution
+        x = self.x_origin + (col + 0.5) * self.resolution
+        y = self.y_origin + (row + 0.5) * self.resolution
         return (x, y)
     
     def in_bounds(self, row: int, col: int) -> bool:

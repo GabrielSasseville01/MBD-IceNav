@@ -192,16 +192,15 @@ class LatticePlanner:
         y: float,
         heading_idx: int,
     ) -> Tuple[int, int, int]:
-        """Discretize continuous state to grid cell."""
-        # Discretize position to grid
-        grid_x = int(x / self.cost_map.resolution)
-        grid_y = int(y / self.cost_map.resolution)
-        return (grid_x, grid_y, heading_idx)
+        """Discretize continuous state to grid cell (same frame as cost map)."""
+        row, col = self.cost_map.world_to_grid(x, y)
+        return (col, row, heading_idx)
     
     def _in_bounds(self, x: float, y: float) -> bool:
-        """Check if position is within map bounds."""
-        return (0 <= x < self.cost_map.width and 
-                0 <= y < self.cost_map.height)
+        """Check if position is within map bounds (world coords)."""
+        ox, oy = self.cost_map.x_origin, self.cost_map.y_origin
+        return (ox <= x < ox + self.cost_map.width and
+                oy <= y < oy + self.cost_map.height)
     
     def _heuristic(self, x: float, y: float, goal: Tuple[float, float]) -> float:
         """

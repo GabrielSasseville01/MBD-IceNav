@@ -198,6 +198,23 @@ class RunConfig:
     domain_margin: float = 50.0
     # m — extra distance beyond domain for ship path start/end in simple mode.
     path_margin: float = 20.0
+    # --- Planning / lattice A* ---
+    # m/cell — resolution used for planning grid and motion primitives (coarser than ice mesh).
+    planning_resolution: float = 2.0
+    # m — extra margin around ice domain in planning costmap (should be large enough to contain ship start/end).
+    planning_margin: float = 200.0
+    # m — minimum turning radius for motion primitives (on order of a few ship lengths).
+    planning_turning_radius: float = 350.0
+    # Number of discrete heading bins in lattice (e.g. 16 = 22.5° increments).
+    planning_num_headings: int = 16
+    # Weight for heuristic in weighted A* (1 = admissible A*, >1 = faster but less optimal).
+    planning_heuristic_weight: float = 1.5
+    # m — distance to goal within which planner terminates (ship considered “arrived”).
+    planning_goal_tolerance: float = 30.0
+    # Maximum number of A* node expansions before giving up (prevents runaway search).
+    planning_max_iterations: int = 20000
+    # Receding horizon (AUTO-IceNav style): replan every this many simulation frames (e.g. 60 ≈ 3 s at 0.05 s dt).
+    planning_replan_every_n_frames: int = 60
     # Random seed for reproducibility (tessellation, thickness, etc.) when --seed not set.
     default_seed: int = 42
     # Frames per second for 2D animation.

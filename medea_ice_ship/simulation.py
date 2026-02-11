@@ -70,10 +70,19 @@ def simulate_ice_ship_interaction(
     ship_trajectory=None,
     return_ship_diagnostics=False,
     config=None,
+    replan_every_n_frames=None,
+    replan_callback=None,
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
+
     config: SimulationConfig or None for defaults.
+    replan_every_n_frames: If set with replan_callback, call callback every N frames to get a new
+        trajectory segment (receding-horizon, AUTO-IceNav style). Callback receives current ice state
+        and ship state and returns a list of (position_2d, heading) for the remainder, or None to keep current.
+    replan_callback: Callable (frame, world_polygons, centroids, thicknesses, ship_pos, ship_heading, n_remaining)
+        -> Optional[list of (position_2d, heading)] of length n_remaining + 1.
+
     Returns (positions_history, rotations_history, bonds_history, ship_history, submergence_history[, ship_diagnostics]).
     """
     cfg = config or get_default_simulation_config()
@@ -97,6 +106,8 @@ def simulate_ice_ship_interaction(
     rest_lengths = np.array([np.linalg.norm(centroids[i] - centroids[j]) for i, j in bonds])
 
     bond_strengths = np.zeros(len(bonds))
+    bond_i = np.array([b[0] for b in bonds])
+    bond_j = np.array([b[1] for b in bonds])
     for b, (i, j) in enumerate(bonds):
         h = min(thicknesses[i], thicknesses[j])
         w = min((radii[i] + radii[j]) / 2, cfg.max_bond_width)
@@ -104,6 +115,10 @@ def simulate_ice_ship_interaction(
 
     if len(bonds) > 0:
         print(f"  Bond strengths: {bond_strengths.min()/1e6:.2f} - {bond_strengths.max()/1e6:.2f} MN", flush=True)
+
+    # Precompute pair indices for ice-ice contact (upper triangle i < j).
+    pair_i = np.repeat(np.arange(n), np.arange(n - 1, -1, -1))
+    pair_j = np.concatenate([np.arange(i + 1, n) for i in range(n)])
 
     positions_history = [positions.copy()]
     rotations_history = [rotations.copy()]
@@ -133,6 +148,30 @@ def simulate_ice_ship_interaction(
         Kd_ship = cfg.Kd_ship
 
     for frame in range(n_frames):
+        # Receding-horizon replan (AUTO-IceNav style): update trajectory from current ice state
+        if (
+            use_ship_dynamics
+            and replan_callback is not None
+            and replan_every_n_frames is not None
+            and replan_every_n_frames > 0
+            and frame % replan_every_n_frames == 0
+        ):
+            n_remaining = n_frames - frame
+            world_polygons = []
+            for i in range(n):
+                c, s = np.cos(rotations[i]), np.sin(rotations[i])
+                R = np.array([[c, -s], [s, c]])
+                world_polygons.append(local_polys[i] @ R.T + positions[i])
+            new_traj = replan_callback(
+                frame, world_polygons, positions.copy(), thicknesses,
+                ship_pos_dyn.copy(), float(ship_heading_dyn), n_remaining,
+            )
+            if new_traj is not None and len(new_traj) >= 1:
+                end_slice = frame + len(new_traj)
+                ship_trajectory[frame:end_slice] = new_traj
+                if end_slice < len(ship_trajectory):
+                    ship_trajectory[end_slice:] = [new_traj[-1]] * (len(ship_trajectory) - end_slice)
+
         if use_ship_dynamics:
             ship_pos_frame = ship_pos_dyn.copy()
             ship_heading = ship_heading_dyn
@@ -241,9 +280,8 @@ def simulate_ice_ship_interaction(
         F_ice_ship += F_ice_ship_collision
         M_ice_ship += M_ice_ship_collision
 
-        for i in range(n):
-            if ship_collision_force[i] <= 0:
-                submergence[i] = max(0, submergence[i] - (1.0 / cfg.rise_time_const) * submergence[i] * dt)
+        no_collision = ship_collision_force <= 0
+        submergence[no_collision] = np.maximum(0, submergence[no_collision] - (1.0 / cfg.rise_time_const) * submergence[no_collision] * dt)
 
         bow_contact_force = 0.0
         c_r, s_r = np.cos(ship_heading), np.sin(ship_heading)
@@ -260,27 +298,31 @@ def simulate_ice_ship_interaction(
             forward = np.array([c_r, s_r])
             F_ice_ship -= F_rubble_mag * forward
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = positions[j] - positions[i]
-                dist = np.linalg.norm(d)
-                min_dist = radii[i] + radii[j]
-                if dist < min_dist and dist > 1e-6:
-                    overlap = min_dist - dist
-                    direction = d / dist
-                    f_n_mag = cfg.hertz_factor * overlap ** cfg.hertz_exponent
-                    f_n = f_n_mag * direction
-                    forces[i] -= f_n
-                    forces[j] += f_n
-                    v_rel = velocities[j] - velocities[i]
-                    v_t = v_rel - np.dot(v_rel, direction) * direction
-                    v_t_mag = np.linalg.norm(v_t)
-                    if v_t_mag > 1e-6:
-                        t_hat = v_t / v_t_mag
-                        f_t_mag = min(cfg.ice_ice_friction * f_n_mag, cfg.friction_cap)
-                        f_t = -f_t_mag * t_hat
-                        forces[i] += f_t
-                        forces[j] -= f_t
+        # Ice-ice contact (vectorized over pairs i < j).
+        d_vec = positions[pair_j] - positions[pair_i]
+        dist = np.linalg.norm(d_vec, axis=1)
+        min_dist = radii[pair_i] + radii[pair_j]
+        overlap = np.where((dist < min_dist) & (dist > 1e-6), min_dist - dist, 0.0)
+        active = overlap > 0
+        if np.any(active):
+            direction = np.zeros_like(d_vec)
+            direction[active] = d_vec[active] / dist[active, np.newaxis]
+            f_n_mag = cfg.hertz_factor * overlap ** cfg.hertz_exponent
+            # Normal force: direction points i→j; force on i = -direction*f_n_mag (repel), on j = +direction*f_n_mag.
+            f_n_vec = direction * f_n_mag[:, np.newaxis]
+            np.add.at(forces, pair_i, -f_n_vec)
+            np.add.at(forces, pair_j, f_n_vec)
+            v_rel = velocities[pair_j] - velocities[pair_i]
+            v_t = v_rel - np.sum(v_rel * direction, axis=1, keepdims=True) * direction
+            v_t_mag = np.linalg.norm(v_t, axis=1)
+            friction_active = active & (v_t_mag > 1e-6)
+            if np.any(friction_active):
+                t_hat = np.zeros_like(v_t)
+                t_hat[friction_active] = -v_t[friction_active] / v_t_mag[friction_active, np.newaxis]
+                f_t_mag = np.minimum(cfg.ice_ice_friction * f_n_mag, cfg.friction_cap)
+                f_t_vec = t_hat * f_t_mag[:, np.newaxis]
+                np.add.at(forces, pair_i, f_t_vec)
+                np.add.at(forces, pair_j, -f_t_vec)
 
         if ship_trajectory is None:
             for comp in components:
@@ -290,15 +332,17 @@ def simulate_ice_ship_interaction(
                     forces[i, 0] += drift_force * masses[i] / total_mass
 
         RHO_WATER = IceProperties.WATER_DENSITY
-        for i in range(n):
-            v = velocities[i]
-            v_mag = np.linalg.norm(v)
-            A_drag = areas[i] * (thicknesses[i] / cfg.drag_ref_thickness)
-            if v_mag > 1e-6:
-                drag_mag = 0.5 * RHO_WATER * cfg.c_d_drag * A_drag * (v_mag ** 2)
-                forces[i] -= drag_mag * (v / v_mag)
-            else:
-                forces[i] -= 0.5 * RHO_WATER * cfg.c_d_drag * A_drag * cfg.linear_drag_factor * v
+        v_mag = np.linalg.norm(velocities, axis=1, keepdims=True)
+        v_mag_safe = np.maximum(v_mag, 1e-12)
+        v_mag_1d = v_mag_safe.ravel()
+        A_drag = areas * (thicknesses / cfg.drag_ref_thickness)
+        # Quadratic when v_mag > 1e-6, else linear (same formulas as before, vectorized).
+        drag_force = np.where(
+            v_mag > 1e-6,
+            (velocities / v_mag_safe) * (0.5 * RHO_WATER * cfg.c_d_drag * np.expand_dims(A_drag, axis=1) * (v_mag_1d ** 2)[:, np.newaxis]),
+            0.5 * RHO_WATER * cfg.c_d_drag * np.expand_dims(A_drag, axis=1) * cfg.linear_drag_factor * velocities,
+        )
+        forces -= drag_force
 
         new_velocities = velocities.copy()
         new_positions = positions.copy()
@@ -327,51 +371,40 @@ def simulate_ice_ship_interaction(
         positions = new_positions
 
         element_stress = ship_collision_force.copy()
-        for b, (i, j) in enumerate(bonds):
-            if not bond_intact[b]:
-                continue
-            d = positions[j] - positions[i]
-            dist = np.linalg.norm(d)
-            stretch = abs(dist - rest_lengths[b])
-            avg_thickness = (thicknesses[i] + thicknesses[j]) / 2
-            stiffness = IceProperties.YOUNGS_MODULUS * avg_thickness * cfg.bond_stiffness_factor
-            bond_force_mag = stiffness * stretch
-            element_stress[i] += bond_force_mag
-            element_stress[j] += bond_force_mag
+        # Bond stress accumulation (vectorized).
+        intact = bond_intact
+        d_bond = positions[bond_j] - positions[bond_i]
+        dist_bond = np.linalg.norm(d_bond, axis=1)
+        stretch_bond = np.abs(dist_bond - rest_lengths)
+        avg_thickness_bond = (thicknesses[bond_i] + thicknesses[bond_j]) * 0.5
+        stiffness_bond = IceProperties.YOUNGS_MODULUS * avg_thickness_bond * cfg.bond_stiffness_factor
+        bond_force_mag = stiffness_bond * stretch_bond
+        np.add.at(element_stress, bond_i, np.where(intact, bond_force_mag, 0))
+        np.add.at(element_stress, bond_j, np.where(intact, bond_force_mag, 0))
         for _ in range(cfg.stress_diffusion_steps):
             new_stress = element_stress.copy()
-            for b, (i, j) in enumerate(bonds):
-                if bond_intact[b]:
-                    if element_stress[i] > element_stress[j]:
-                        new_stress[j] += element_stress[i] * cfg.stress_transfer
-                    else:
-                        new_stress[i] += element_stress[j] * cfg.stress_transfer
+            transfer_i_to_j = intact & (element_stress[bond_i] > element_stress[bond_j])
+            transfer_j_to_i = intact & (element_stress[bond_j] >= element_stress[bond_i])
+            np.add.at(new_stress, bond_j, np.where(transfer_i_to_j, element_stress[bond_i] * cfg.stress_transfer, 0))
+            np.add.at(new_stress, bond_i, np.where(transfer_j_to_i, element_stress[bond_j] * cfg.stress_transfer, 0))
             element_stress = new_stress
-
-        for b, (i, j) in enumerate(bonds):
-            if not bond_intact[b]:
-                continue
-            d = positions[j] - positions[i]
-            dist = np.linalg.norm(d)
-            stretch = abs(dist - rest_lengths[b])
-            avg_thickness = (thicknesses[i] + thicknesses[j]) / 2
-            stiffness = IceProperties.YOUNGS_MODULUS * avg_thickness * cfg.bond_stiffness_factor
-            bond_force = stiffness * stretch
-            propagated_stress = max(element_stress[i], element_stress[j])
-            bond_force += propagated_stress * cfg.propagated_stress_factor
-            base_strength = bond_strengths[b]
-            collision_on_bond = ship_collision_force[i] > 0 or ship_collision_force[j] > 0
-            if collision_on_bond:
-                effective_strength = base_strength * cfg.effective_strength_collision
-            elif propagated_stress > base_strength * cfg.effective_strength_stress_threshold:
-                effective_strength = base_strength * cfg.effective_strength_stress
-            else:
-                effective_strength = base_strength
-            collision_force_on_bond = max(ship_collision_force[i], ship_collision_force[j])
-            if collision_on_bond and collision_force_on_bond > effective_strength:
-                bond_intact[b] = False
-            elif bond_force > effective_strength:
-                bond_intact[b] = False
+        # Bond breaking (vectorized condition evaluation).
+        bond_force = stiffness_bond * stretch_bond + np.maximum(element_stress[bond_i], element_stress[bond_j]) * cfg.propagated_stress_factor
+        propagated_stress_bond = np.maximum(element_stress[bond_i], element_stress[bond_j])
+        collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+        collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
+        effective_strength = np.where(
+            collision_on_bond,
+            bond_strengths * cfg.effective_strength_collision,
+            np.where(
+                propagated_stress_bond > bond_strengths * cfg.effective_strength_stress_threshold,
+                bond_strengths * cfg.effective_strength_stress,
+                bond_strengths,
+            ),
+        )
+        break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
+        break_force = intact & (bond_force > effective_strength)
+        bond_intact[break_collision | break_force] = False
 
         angular_vels += np.random.randn(n) * cfg.angular_noise
         angular_vels *= cfg.angular_damping
