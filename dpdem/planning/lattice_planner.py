@@ -6,7 +6,7 @@ Plans paths through ice fields by searching a graph of motion primitives.
 
 import numpy as np
 import heapq
-from typing import List, Tuple, Optional, Dict, Set
+from typing import List, Tuple, Optional, Dict, Set, Union
 from dataclasses import dataclass, field
 
 from .primitives import Primitives, Primitive
@@ -70,7 +70,8 @@ class LatticePlanner:
         start: Tuple[float, float, float],
         goal: Tuple[float, float],
         max_iterations: int = 10000,
-    ) -> Optional[np.ndarray]:
+        return_search_history: bool = False,
+    ) -> Union[Optional[np.ndarray], Tuple[Optional[np.ndarray], List]]:
         """
         Plan a path from start to goal.
         
@@ -78,12 +79,17 @@ class LatticePlanner:
             start: Start pose (x, y, heading)
             goal: Goal position (x, y)
             max_iterations: Maximum search iterations
+            return_search_history: If True, return (path, search_history) for visualization.
+                search_history is a list of (expanded_xyh, edges) where edges is a list of
+                (path_world Nx3, end_xy) for each neighbor added this expansion.
             
         Returns:
-            Path as Nx3 array [x, y, heading], or None if no path found
+            Path as Nx3 array [x, y, heading], or None if no path found.
+            If return_search_history is True, returns (path, search_history).
         """
         self.nodes_expanded = 0
         self.nodes_generated = 0
+        search_history: List = []  # list of ((x,y,heading_idx), [(path_world, (end_x,end_y)), ...])
         
         # Convert start heading to index
         start_heading_idx = self.primitives.world_heading_to_index(start[2])
@@ -125,9 +131,13 @@ class LatticePlanner:
             # Check if goal reached
             dist_to_goal = np.sqrt((current.x - goal[0])**2 + (current.y - goal[1])**2)
             if dist_to_goal < self.goal_tolerance:
-                return self._reconstruct_path(current)
+                path = self._reconstruct_path(current)
+                return (path, search_history) if return_search_history else path
             
-            # Expand node
+            # Expand node: record edges we add (for search-history visualization)
+            expanded_xyh = (current.x, current.y, current.heading_idx)
+            edges_this_step: List[Tuple[np.ndarray, Tuple[float, float]]] = []
+            
             for primitive in self.primitives.get_primitives(current.heading_idx):
                 # Transform primitive to world coordinates
                 world_heading = self.primitives.index_to_world_heading(current.heading_idx)
@@ -160,6 +170,9 @@ class LatticePlanner:
                 
                 g_costs[neighbor_key] = new_g
                 
+                if return_search_history:
+                    edges_this_step.append((path.copy(), (end_x, end_y)))
+                
                 # Compute heuristic
                 h = self._heuristic(end_x, end_y, goal)
                 f = new_g + self.heuristic_weight * h
@@ -178,9 +191,12 @@ class LatticePlanner:
                 
                 heapq.heappush(open_set, neighbor)
                 self.nodes_generated += 1
+            
+            if return_search_history:
+                search_history.append((expanded_xyh, edges_this_step))
         
         # No path found
-        return None
+        return (None, search_history) if return_search_history else None
     
     def _state_key(self, node: Node) -> Tuple[int, int, int]:
         """Get discretized state key for a node."""

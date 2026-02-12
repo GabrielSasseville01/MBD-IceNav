@@ -89,7 +89,8 @@ def plan_path(
     goal: Tuple[float, float],
     run_cfg: RunConfig,
     cost_map: Optional[CostMap] = None,
-) -> Optional[np.ndarray]:
+    return_search_history: bool = False,
+):
     """
     Run the lattice planner from start to goal (Section 3).
 
@@ -106,17 +107,25 @@ def plan_path(
         goal: (x, y) in world coordinates [m, m].
         run_cfg: RunConfig for planning_max_iterations and optional path optimizer.
         cost_map: CostMap (required when planning_use_path_optimizer is True).
+        return_search_history: If True, return (path, search_history) for visualization.
 
     Returns:
-        Path as Nx3 array [x, y, heading] in world coordinates, or None if no path found.
+        Path as Nx3 array [x, y, heading], or None if no path found.
+        If return_search_history is True, returns (path, search_history).
     """
-    path = planner.plan(
+    result = planner.plan(
         start=start,
         goal=goal,
         max_iterations=run_cfg.planning_max_iterations,
+        return_search_history=return_search_history,
     )
+    if return_search_history:
+        path, search_history = result
+    else:
+        path = result
+        search_history = None
     if path is None:
-        return None
+        return (None, search_history) if return_search_history else None
     if getattr(run_cfg, "planning_use_path_optimizer", False) and cost_map is not None:
         refined = refine_path_nlp(
             path,
@@ -132,7 +141,7 @@ def plan_path(
         )
         if refined is not None:
             path = refined
-    return path
+    return (path, search_history) if return_search_history else path
 
 
 def path_to_ship_trajectory(

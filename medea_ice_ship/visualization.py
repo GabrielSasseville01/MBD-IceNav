@@ -238,6 +238,135 @@ def plot_hull_impact_vectors(
     plt.close(fig)
 
 
+def animate_lattice_search(
+    cost_map,
+    search_history: list,
+    path,
+    start: tuple,
+    goal: tuple,
+    output_file: str = "lattice_search.mp4",
+    frame_stride: int = 1,
+    fps: int = 15,
+    figsize: tuple = (10, 8),
+):
+    """
+    Generate a movie showing the A* lattice graph search evolution.
+
+    Frames show the costmap, start/goal, and the growing set of expanded nodes
+    and edges (motion primitives) as the search progresses. The final chosen path
+    is drawn at the end.
+
+    Args:
+        cost_map: CostMap (dpdem.planning.cost_map) with .cost_map, .x_origin, .y_origin, .width, .height
+        search_history: From planner.plan(..., return_search_history=True); list of
+            ( (x, y, heading_idx), [ (path_world Nx3, (end_x, end_y)), ... ] )
+        path: Nx3 [x, y, heading] or None (the planned path)
+        start: (x, y, heading)
+        goal: (x, y)
+        output_file: Output path (.mp4 or .gif)
+        frame_stride: Show every Nth expansion (1 = every step; 5 = fewer, faster video)
+        fps: Frames per second
+        figsize: Figure size (inches)
+    """
+    ox = cost_map.x_origin
+    oy = cost_map.y_origin
+    w = cost_map.width
+    h = cost_map.height
+    # cost_map: row = (y - y_origin)/resolution, so row 0 = bottom (y_origin); imshow origin='lower' draws row 0 at bottom
+    grid = np.asarray(cost_map.cost_map)
+
+    # Build cumulative nodes and edges per display frame
+    all_nodes = []  # list of (x, y) for each expansion
+    all_edges = []  # list of (path_xy Nx2) for each edge
+    for (xyh, edges) in search_history:
+        x, y, _ = xyh
+        all_nodes.append((x, y))
+        for (path_world, _) in edges:
+            all_edges.append(path_world[:, :2].copy())
+
+    # Display frames: show state after expansion 0, stride, 2*stride, ... then final
+    n_expansions = len(search_history)
+    if n_expansions == 0:
+        frame_indices = [0]
+    else:
+        frame_indices = list(range(0, n_expansions, frame_stride))
+        if frame_indices[-1] != n_expansions - 1:
+            frame_indices.append(n_expansions - 1)
+
+    n_frames = len(frame_indices)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_aspect("equal")
+    ax.set_xlim(ox, ox + w)
+    ax.set_ylim(oy, oy + h)
+
+    # Static: costmap background
+    im = ax.imshow(
+        grid,
+        extent=[ox, ox + w, oy, oy + h],
+        origin="lower",
+        cmap="viridis",
+        alpha=0.85,
+        vmin=0,
+        vmax=max(1.0, float(np.nanmax(grid))),
+    )
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+
+    # Start and goal (persistent)
+    ax.plot(start[0], start[1], "go", markersize=12, label="Start", zorder=5)
+    ax.plot(goal[0], goal[1], "r*", markersize=16, label="Goal", zorder=5)
+
+    # Dynamic: edges (LineCollection of segments) and nodes (scatter), path (line)
+    edge_collection = LineCollection([], colors="b", linewidths=0.5, alpha=0.7, label="Explored edges")
+    ax.add_collection(edge_collection)
+    node_scatter = ax.scatter([], [], c="cyan", s=6, alpha=0.9, label="Expanded nodes", zorder=3)
+    path_line = ax.plot([], [], "r-", linewidth=2.5, label="Chosen path", zorder=4)[0]
+
+    def init():
+        edge_collection.set_segments([])
+        node_scatter.set_offsets(np.empty((0, 2)))
+        path_line.set_data([], [])
+        return edge_collection, node_scatter, path_line
+
+    def update(frame_idx):
+        k = frame_indices[frame_idx]
+        # Nodes up to and including expansion k
+        nodes_xy = all_nodes[: k + 1]
+        if nodes_xy:
+            node_scatter.set_offsets(np.array(nodes_xy))
+        else:
+            node_scatter.set_offsets(np.empty((0, 2)))
+
+        # Edges: list of (Nx2) arrays for each primitive path
+        segments = []
+        for (_, edges) in search_history[: k + 1]:
+            for (path_world, _) in edges:
+                segments.append(path_world[:, :2])
+        edge_collection.set_segments(segments if segments else [[]])
+
+        # On last frame, draw chosen path
+        if path is not None and frame_idx == n_frames - 1 and len(path) > 0:
+            path_line.set_data(path[:, 0], path[:, 1])
+        else:
+            path_line.set_data([], [])
+
+        ax.set_title(f"A* lattice search — expansion {k + 1}/{n_expansions}" if n_expansions else "A* lattice search (no expansions)")
+        return edge_collection, node_scatter, path_line
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=n_frames,
+        init_func=init,
+        blit=False,
+        interval=1000 / fps,
+    )
+    writer, out_path = _animation_writer(output_file, fps)
+    anim.save(out_path, writer=writer, dpi=120)
+    plt.close(fig)
+
+
 # Process-global data for parallel workers (set by pool initializer)
 _DATA_2D = None
 _DATA_3D = None
