@@ -74,6 +74,7 @@ def simulate_ice_ship_interaction(
     replan_every_n_frames=None,
     replan_callback=None,
     frame_callback=None,
+    kinematic_ship=False,
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
@@ -139,7 +140,7 @@ def simulate_ice_ship_interaction(
     collision_count = 0
     ever_collided = set()
 
-    use_ship_dynamics = ship_trajectory is not None
+    use_ship_dynamics = ship_trajectory is not None and not kinematic_ship
     ship_diagnostics = [] if (use_ship_dynamics and return_ship_diagnostics) else None
     J_cumul = 0.0  # cumulative impulse from ice on ship (damage proxy)
     N_HULL_SEG = 10  # longitudinal segments for per-hull impulse (AUTO-IceNav style)
@@ -152,6 +153,7 @@ def simulate_ice_ship_interaction(
         hull_impulse_segments = [
             [-half_len + (k + 0.5) * seg_len, 0.0, 0.0] for k in range(N_HULL_SEG)
         ]  # [x_center_body, Jx, Jy]
+    commanded_trajectory = []  # (pos_2d, heading) per frame — what we commanded the ship to follow (for costmap movie)
     if use_ship_dynamics:
         ship_pos_dyn = np.array(ship_trajectory[0][0], dtype=float)
         ship_heading_dyn = float(ship_trajectory[0][1])
@@ -513,6 +515,7 @@ def simulate_ice_ship_interaction(
             ship_pos_dyn[0] += dt * u_g
             ship_pos_dyn[1] += dt * v_g
             ship_heading_dyn = (ship_heading_dyn + dt * ship_r) % (2 * np.pi)
+            commanded_trajectory.append((desired_pos.copy(), desired_heading))
             ship_history.append((ship_pos_dyn.copy(), float(ship_heading_dyn)))
             if ship_diagnostics is not None:
                 desired_vel = desired_vel_world
@@ -527,6 +530,8 @@ def simulate_ice_ship_interaction(
                     'impulse_cumul': J_cumul,
                 })
         else:
+            if ship_trajectory is not None and frame < len(ship_trajectory):
+                commanded_trajectory.append((np.array(ship_trajectory[frame][0]), float(ship_trajectory[frame][1])))
             ship_history.append((ship_pos_frame, ship_heading))
 
         positions_history.append(positions.copy())
@@ -565,11 +570,15 @@ def simulate_ice_ship_interaction(
             ]
         if hull_impulse_contacts is not None and hull_impulse_contacts:
             damage_summary['hull_impulse_contacts'] = hull_impulse_contacts
+        if commanded_trajectory:
+            damage_summary['commanded_trajectory'] = commanded_trajectory
+    elif kinematic_ship and commanded_trajectory:
+        damage_summary = {'commanded_trajectory': commanded_trajectory}
 
     if return_ship_diagnostics:
         if ship_diagnostics is not None and damage_summary is not None:
             ship_diagnostics.append({'damage_summary': damage_summary})
         return positions_history, rotations_history, bonds_history, ship_history, submergence_history, ship_diagnostics
-    if use_ship_dynamics:
+    if damage_summary is not None:
         return positions_history, rotations_history, bonds_history, ship_history, submergence_history, damage_summary
     return positions_history, rotations_history, bonds_history, ship_history, submergence_history

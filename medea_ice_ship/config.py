@@ -206,7 +206,9 @@ class RunConfig:
     domain_margin: float = 50.0
     # m — extra distance beyond domain for ship path start/end in simple mode.
     path_margin: float = 20.0
-    # --- Planning / lattice A* ---
+    # --- Planning (lattice A* or Diffusion MPC) ---
+    # Planner type: "lattice" (A* on motion primitives; matches AUTO-IceNav) or "diffusion_mpc" (sampling-based MPC, alternative).
+    planning_planner: str = "lattice"
     # m/cell — resolution used for planning grid and motion primitives (coarser than ice mesh).
     planning_resolution: float = 2.0
     # m — extra margin around ice domain in planning costmap (should be large enough to contain ship start/end).
@@ -236,6 +238,23 @@ class RunConfig:
     # Damage-aware cost: if > 0, costmap includes thickness-based damage potential (safer paths).
     planning_damage_cost_scale: float = 0.0
     planning_damage_thickness_exponent: float = 0.5
+    # Diffusion MPC only (sampling-based): number of primitive steps per rollout.
+    planning_diffusion_horizon_steps: int = 12
+    # Diffusion MPC only: number of candidate rollouts to score (sampling) or samples per diffusion step (model-based).
+    planning_diffusion_num_samples: int = 64
+    # Diffusion MPC only: weight for goal distance in score (sampling-based).
+    planning_diffusion_goal_weight: float = 2.0
+    # Diffusion MPC only: random seed (None = no fixed seed).
+    planning_diffusion_seed: Optional[int] = None
+    # Model-based diffusion (AUTO-IceNav): controller horizon (time steps); trajectory length = horizon+1.
+    planning_diffusion_controller_horizon: int = 80
+    # Model-based diffusion: number of reverse diffusion steps.
+    planning_diffusion_num_diffusion_steps: int = 30
+    # Model-based diffusion: softmax temperature for reward weighting.
+    planning_diffusion_temperature: float = 0.1
+    # Model-based diffusion: noise schedule (beta0, betaT).
+    planning_diffusion_beta0: float = 1e-4
+    planning_diffusion_betaT: float = 1e-2
     # Random seed for reproducibility (tessellation, thickness, etc.) when --seed not set.
     default_seed: int = 42
     # Frames per second for 2D animation.

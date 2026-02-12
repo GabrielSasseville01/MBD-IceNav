@@ -5,10 +5,16 @@ Provides mass matrix M and damping D for surge–sway–yaw (3-DOF) ship motion,
 matching the structure used in AUTO-IceNav / Marine Systems Simulator (MSS).
 M = M_RB + M_A (rigid body + added mass), D = linear hydrodynamic damping.
 Coriolis C(nu) is computed from M when advancing the state.
+
+Also provides rollout_3dof for model-based diffusion: given initial (eta, nu)
+and a control sequence u_seq (body-frame force/torque [X, Y, N]), returns
+trajectory (x, y, psi) over horizon.
 """
 
 from typing import Tuple
 import numpy as np
+
+from medea_ice_ship.properties import R_xy
 
 
 def get_mss_style_3dof(
@@ -76,3 +82,50 @@ def coriolis_3dof(M3: np.ndarray, nu: np.ndarray) -> np.ndarray:
     C[2, 0] = m22 * v
     C[2, 1] = -m11 * u
     return C
+
+
+def rollout_3dof(
+    eta_start: np.ndarray,
+    nu_start: np.ndarray,
+    u_seq: np.ndarray,
+    dt: float,
+    M3: np.ndarray,
+    D3: np.ndarray,
+) -> np.ndarray:
+    """
+    Roll out 3-DOF vessel dynamics for a sequence of body-frame controls.
+
+    M * nu_dot + C(nu)*nu + D*nu = tau (tau = u_control in body frame).
+    eta = [x, y, psi]; nu = [u, v, r]. Kinematics: eta_dot from R_xy(psi) @ nu.
+
+    Args:
+        eta_start: (3,) initial pose [x, y, psi] in world frame [m, m, rad].
+        nu_start: (3,) initial body-frame velocity [u, v, r] [m/s, m/s, rad/s].
+        u_seq: (horizon, 3) body-frame force/torque [X, Y, N] per step [N, N, N·m].
+        dt: Time step [s].
+        M3: 3×3 mass matrix.
+        D3: 3×3 damping matrix.
+
+    Returns:
+        trajectory: (horizon+1, 3) array of [x, y, psi] in world frame.
+    """
+    eta = np.array(eta_start, dtype=float).copy()
+    nu = np.array(nu_start, dtype=float).copy()
+    horizon = len(u_seq)
+    trajectory = np.zeros((horizon + 1, 3))
+    trajectory[0] = eta
+
+    for t in range(horizon):
+        tau = np.array(u_seq[t], dtype=float)
+        C = coriolis_3dof(M3, nu)
+        nu_dot = np.linalg.solve(M3, tau - C @ nu - D3 @ nu)
+        nu = nu + dt * nu_dot
+        # Kinematics: eta_dot = R_xy(psi) @ [u, v] for position; psi_dot = r
+        vel_global = R_xy(eta[2]) @ np.array([nu[0], nu[1]])
+        eta[0] += dt * vel_global[0]
+        eta[1] += dt * vel_global[1]
+        eta[2] = (eta[2] + dt * nu[2]) % (2 * np.pi)
+        eta[2] = (eta[2] + np.pi) % (2 * np.pi) - np.pi
+        trajectory[t + 1] = eta
+
+    return trajectory
