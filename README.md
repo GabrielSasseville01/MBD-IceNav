@@ -3,6 +3,7 @@
 Implementation of ice–ship interaction simulation based on:
 
 > Liu et al. (2021) — *Dilated-polyhedron-based DEM analysis of the ice resistance on ship hulls in escort operations in level ice* — Marine Structures 80
+
 > Wang et al. (2024) — *Interaction between ice cover and floating platform simulated by dilated-polyhedron-based DEM* — Ocean Engineering 301
 
 The main entry point is **MEDEA ship–ice fracture**: satellite-derived ice floes (MEDEA Fram Strait) with DPDEM-style bond fracture and ship–ice interaction. The run script supports several toy scenarios, two planners (lattice A* and diffusion-MPC), and multiple visualizations.
