@@ -11,6 +11,7 @@ from medea_ice_ship.geometry import (
 )
 from medea_ice_ship.bonds import find_connected_components
 from medea_ice_ship.config import SimulationConfig, get_default_simulation_config
+from medea_ice_ship.vessel_dynamics import get_mss_style_3dof, coriolis_3dof
 
 
 def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_start=0.6, ship_heading=0.0):
@@ -72,6 +73,7 @@ def simulate_ice_ship_interaction(
     config=None,
     replan_every_n_frames=None,
     replan_callback=None,
+    frame_callback=None,
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
@@ -82,8 +84,13 @@ def simulate_ice_ship_interaction(
         and ship state and returns a list of (position_2d, heading) for the remainder, or None to keep current.
     replan_callback: Callable (frame, world_polygons, centroids, thicknesses, ship_pos, ship_heading, n_remaining)
         -> Optional[list of (position_2d, heading)] of length n_remaining + 1.
+    frame_callback: Optional callable(frame, positions, rotations, bond_intact, ship_pos, ship_heading)
+        called at the end of each frame (e.g. for real-time 2D view). Called with current state copies.
 
-    Returns (positions_history, rotations_history, bonds_history, ship_history, submergence_history[, ship_diagnostics]).
+    Returns (positions_history, rotations_history, bonds_history, ship_history, submergence_history[, ship_diagnostics or damage_summary]).
+    When ship_trajectory is not None and return_ship_diagnostics is False, the 6th element is damage_summary
+    (dict with 'impulse_total': cumulative impulse from ice on ship). When return_ship_diagnostics is True,
+    the 6th element is ship_diagnostics (list) and the last entry includes 'damage_summary'.
     """
     cfg = config or get_default_simulation_config()
     n = len(polygons)
@@ -134,15 +141,36 @@ def simulate_ice_ship_interaction(
 
     use_ship_dynamics = ship_trajectory is not None
     ship_diagnostics = [] if (use_ship_dynamics and return_ship_diagnostics) else None
+    J_cumul = 0.0  # cumulative impulse from ice on ship (damage proxy)
+    N_HULL_SEG = 10  # longitudinal segments for per-hull impulse (AUTO-IceNav style)
+    hull_impulse_segments = []  # list of (x_body, Jx, Jy) per segment
+    hull_impulse_contacts = None  # per-contact (AUTO-IceNav): list of (cx_body, cy_body, Jx_body, Jy_body)
+    if ship_trajectory is not None:
+        hull_impulse_contacts = []
+        half_len = ship_length / 2
+        seg_len = ship_length / N_HULL_SEG
+        hull_impulse_segments = [
+            [-half_len + (k + 0.5) * seg_len, 0.0, 0.0] for k in range(N_HULL_SEG)
+        ]  # [x_center_body, Jx, Jy]
     if use_ship_dynamics:
         ship_pos_dyn = np.array(ship_trajectory[0][0], dtype=float)
         ship_heading_dyn = float(ship_trajectory[0][1])
         ship_u, ship_v, ship_r = 0.0, 0.0, 0.0
         m = ship_props.mass
         Izz = (1.0 / 12.0) * m * (ship_length**2 + ship_beam**2)
-        M3 = np.diag([m, m, Izz])
+        if getattr(cfg, "use_mss_style_dynamics", False):
+            M3, D3 = get_mss_style_3dof(
+                m, Izz,
+                ship_damping_xy=cfg.ship_damping_xy,
+                ship_damping_psi=cfg.ship_damping_psi,
+                added_mass_surge_frac=cfg.mss_added_mass_surge_frac,
+                added_mass_sway_frac=cfg.mss_added_mass_sway_frac,
+                added_mass_yaw_frac=cfg.mss_added_mass_yaw_frac,
+            )
+        else:
+            M3 = np.diag([m, m, Izz])
+            D3 = np.diag([m * cfg.ship_damping_xy, m * cfg.ship_damping_xy, Izz * cfg.ship_damping_psi])
         M3inv = np.linalg.inv(M3)
-        D3 = np.diag([m * cfg.ship_damping_xy, m * cfg.ship_damping_xy, Izz * cfg.ship_damping_psi])
         Kp_xy = ship_props.mass * cfg.Kp_xy_scale
         Kp_psi = cfg.Kp_psi
         Kd_ship = cfg.Kd_ship
@@ -197,6 +225,7 @@ def simulate_ice_ship_interaction(
         for i in range(n):
             px, py = positions[i]
             pen, nx, ny = 0, 0, 0
+            contact_x, contact_y = px, py  # contact point (world) for hull impulse
             angle = rotations[i]
             c, s = np.cos(angle), np.sin(angle)
             rotated = np.zeros_like(local_polys[i])
@@ -210,6 +239,7 @@ def simulate_ice_ship_interaction(
                 )
                 if test_pen > pen:
                     pen, nx, ny = test_pen, test_nx, test_ny
+                    contact_x, contact_y = vx, vy
 
             n_verts = len(world_poly)
             for j in range(n_verts):
@@ -223,12 +253,14 @@ def simulate_ice_ship_interaction(
                     )
                     if test_pen > pen:
                         pen, nx, ny = test_pen, test_nx, test_ny
+                        contact_x, contact_y = pt[0], pt[1]
 
             for sx, sy in ship_hull_pts:
                 if point_in_polygon((sx, sy), world_poly):
                     test_pen, test_nx, test_ny = point_inside_polygon_penetration(sx, sy, world_poly)
                     if test_pen > pen:
                         pen, nx, ny = test_pen, test_nx, test_ny
+                        contact_x, contact_y = sx, sy
 
             if pen > 0:
                 collision_count += 1
@@ -248,6 +280,34 @@ def simulate_ice_ship_interaction(
                 F_ship_i = np.array([force_mag * nx, force_mag * ny + side_push])
                 F_ship_on_ice[i] = F_ship_i
                 F_ice_ship_collision -= F_ship_i
+                # Per-hull-segment and per-contact impulse (AUTO-IceNav style): store in body frame
+                rel_world = np.array([contact_x - ship_pos_frame[0], contact_y - ship_pos_frame[1]])
+                contact_body = R_xy(ship_heading).T @ rel_world
+                J_world = F_ship_i * dt
+                J_body = R_xy(ship_heading).T @ J_world
+                if hull_impulse_contacts is not None:
+                    # Approach speed along contact normal (for plot-only scaling: bow = approaching = large, stern/wake = receding = small)
+                    ship_vel_world = (
+                        R_xy(ship_heading) @ np.array([ship_u, ship_v])
+                        if use_ship_dynamics
+                        else np.zeros(2)
+                    )
+                    rel_vel = ship_vel_world - velocities[i]
+                    # n = outward normal from hull; (ship - ice)·n > 0 when ship is moving into ice
+                    approach_speed = max(0.0, float(np.dot(rel_vel, np.array([nx, ny]))))
+                    hull_impulse_contacts.append((
+                        float(contact_body[0]), float(contact_body[1]),
+                        float(J_body[0]), float(J_body[1]),
+                        approach_speed,
+                    ))
+                if hull_impulse_segments:
+                    dx = contact_body[0]
+                    half_len = ship_length / 2
+                    seg_len = ship_length / len(hull_impulse_segments)
+                    k = int((dx + half_len) / seg_len)
+                    k = max(0, min(k, len(hull_impulse_segments) - 1))
+                    hull_impulse_segments[k][1] += J_body[0]
+                    hull_impulse_segments[k][2] += J_body[1]
                 r_vec = positions[i] - ship_pos_frame
                 M_ice_ship_collision += r_vec[0] * (-F_ship_i[1]) - r_vec[1] * (-F_ship_i[0])
                 submergence[i] = min(
@@ -297,6 +357,9 @@ def simulate_ice_ship_interaction(
             F_rubble_mag = min(cfg.rubble_coef * bow_contact_force, cfg.rubble_cap_n)
             forward = np.array([c_r, s_r])
             F_ice_ship -= F_rubble_mag * forward
+
+        # Ship damage proxy: cumulative impulse from ice on ship (AUTO-IceNav style; used for risk/cost)
+        J_cumul += np.linalg.norm(F_ice_ship) * dt
 
         # Ice-ice contact (vectorized over pairs i < j).
         d_vec = positions[pair_j] - positions[pair_i]
@@ -432,10 +495,13 @@ def simulate_ice_ship_interaction(
                 Kp_xy * e_xy_body[1] + Kd_ship * (nu_des[1] - nu[1]),
                 Kp_psi * e_psi - Kd_ship * nu[2],
             ])
-            C = np.zeros((3, 3))
-            C[0, 2] = -m * nu[1]
-            C[1, 2] = m * nu[0]
-            C[2, 0], C[2, 1] = -C[0, 2], -C[1, 2]
+            if getattr(cfg, "use_mss_style_dynamics", False):
+                C = coriolis_3dof(M3, nu)
+            else:
+                C = np.zeros((3, 3))
+                C[0, 2] = -m * nu[1]
+                C[1, 2] = m * nu[0]
+                C[2, 0], C[2, 1] = -C[0, 2], -C[1, 2]
             nu_dot = M3inv @ (tau_control + tau_ice - D3 @ nu - C @ nu)
             nu = nu + nu_dot * dt
             vc = cfg.ship_velocity_clip
@@ -458,6 +524,7 @@ def simulate_ice_ship_interaction(
                     'ship_pos': ship_pos_dyn.copy(),
                     'desired_pos': desired_pos,
                     'desired_vel': desired_vel,
+                    'impulse_cumul': J_cumul,
                 })
         else:
             ship_history.append((ship_pos_frame, ship_heading))
@@ -466,6 +533,16 @@ def simulate_ice_ship_interaction(
         rotations_history.append(rotations.copy())
         bonds_history.append(bond_intact.copy())
         submergence_history.append(submergence.copy())
+
+        if frame_callback is not None:
+            frame_callback(
+                frame,
+                positions.copy(),
+                rotations.copy(),
+                bond_intact.copy(),
+                ship_pos_frame.copy(),
+                ship_heading,
+            )
 
     if collision_count > 0:
         print(f"  Total collisions: {collision_count}", flush=True)
@@ -480,6 +557,19 @@ def simulate_ice_ship_interaction(
     else:
         print("  WARNING: No collisions detected!", flush=True)
 
+    damage_summary = {'impulse_total': J_cumul} if use_ship_dynamics else None
+    if damage_summary is not None:
+        if hull_impulse_segments:
+            damage_summary['hull_impulse_segments'] = [
+                (x, Jx, Jy) for x, Jx, Jy in hull_impulse_segments
+            ]
+        if hull_impulse_contacts is not None and hull_impulse_contacts:
+            damage_summary['hull_impulse_contacts'] = hull_impulse_contacts
+
     if return_ship_diagnostics:
+        if ship_diagnostics is not None and damage_summary is not None:
+            ship_diagnostics.append({'damage_summary': damage_summary})
         return positions_history, rotations_history, bonds_history, ship_history, submergence_history, ship_diagnostics
+    if use_ship_dynamics:
+        return positions_history, rotations_history, bonds_history, ship_history, submergence_history, damage_summary
     return positions_history, rotations_history, bonds_history, ship_history, submergence_history

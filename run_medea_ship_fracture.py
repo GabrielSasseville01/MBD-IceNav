@@ -12,12 +12,15 @@ Usage (with uv):
 
   Plan then simulate (lattice planner path instead of straight line):
     uv run python run_medea_ship_fracture.py --simple --plan   # Planned path through ice (use with --simple or --full-map)
+  Real-time 2D view (debugging; opens a window that updates each frame):
+    uv run python run_medea_ship_fracture.py --simple --live   # Optional: --quick to skip writing movies
   Save/replay (run simulation once, generate animations later):
     uv run python run_medea_ship_fracture.py --simple --quick --save-state scenario.pkl   # Simulate + save, no animations
     uv run python run_medea_ship_fracture.py --load-state scenario.pkl                    # Generate 2D and 3D from saved state
     uv run python run_medea_ship_fracture.py --load-state scenario.pkl --no-3d             # Replay 2D only
 """
 
+import os
 import numpy as np
 from pathlib import Path
 import time
@@ -30,45 +33,19 @@ try:
 except RuntimeError:
     pass
 
-from medea_ice_ship import (
-    ShipProperties,
-    load_medea_floes,
-    scale_floes_to_world,
-    create_simple_ice_field,
-    polygon_area,
-    create_proximity_bonds,
-    assign_thickness_by_area,
-    tessellate_all_floes,
-    simulate_ice_ship_interaction,
-    animate_ice_ship_2d,
-    animate_ice_ship_3d,
-    animate_costmap_movie,
-    save_simulation_state,
-    load_simulation_state,
-    build_costmap_from_ice_state,
-    create_medea_lattice_planner,
-    plan_path,
-    path_to_ship_trajectory,
-)
-from medea_ice_ship.config import RunConfig, get_default_run_config, get_default_simulation_config
-from dataclasses import replace as replace_config
-
-# 5.1 / 5.4: Default seed and run parameters from config
-def _get_run_config():
-    return get_default_run_config()
-
 
 def main():
     parser = argparse.ArgumentParser(description='MEDEA Ice Ship Fracture Simulation')
+    parser.add_argument('--live', action='store_true',
+                        help='Open a 2D window and update it in real time during simulation (for debugging)')
     parser.add_argument('--quick', action='store_true', help='Simulation only, no animations')
     parser.add_argument('--no-3d', action='store_true', help='Skip 3D animation')
     parser.add_argument('--full-map', action='store_true',
                         help='Use full ice map; ship diagonal bottom-left to top-right')
     parser.add_argument('--simple', action='store_true',
                         help='Use minimal synthetic ice field (3 floes) for fast testing (no MEDEA data)')
-    default_seed = get_default_run_config().default_seed
-    parser.add_argument('--seed', type=int, default=default_seed,
-                        help=f'Random seed for reproducibility (default: {default_seed})')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility (default from config)')
     parser.add_argument('--save-state', type=str, metavar='FILE', default=None,
                         help='Save full simulation state to FILE for replay (pickle)')
     parser.add_argument('--load-state', type=str, metavar='FILE', default=None,
@@ -83,9 +60,53 @@ def main():
                         help='Output GIF instead of MP4 (slower, larger files)')
     parser.add_argument('--plan', action='store_true',
                         help='Use lattice planner to plan path (costmap + A*); only with --simple or --full-map')
+    parser.add_argument('--optimize-path', action='store_true',
+                        help='Refine planned path with NLP (path length + costmap + curvature); requires casadi; use with --plan')
+    parser.add_argument('--no-mss-dynamics', action='store_true',
+                        help='Use simple diagonal M/D instead of MSS-style 3-DOF (Fossen added mass + damping)')
+    parser.add_argument('--output-dir', type=str, default='outputs/default',
+                        help='Output directory for movies and plots (default: outputs/default)')
     args = parser.parse_args()
-    run_cfg = _get_run_config()
+
+    # Set interactive matplotlib backend before importing medea_ice_ship (so visualization uses it for --live)
+    if args.live:
+        os.environ['DPDEM_LIVE_VIEW'] = '1'
+        import matplotlib
+        matplotlib.use('TkAgg')
+    from medea_ice_ship import (
+        ShipProperties,
+        load_medea_floes,
+        scale_floes_to_world,
+        create_simple_ice_field,
+        polygon_area,
+        polygon_centroid,
+        create_proximity_bonds,
+        assign_thickness_by_area,
+        tessellate_all_floes,
+        simulate_ice_ship_interaction,
+        animate_ice_ship_2d,
+        animate_ice_ship_3d,
+    animate_costmap_movie,
+    make_live_2d_callback,
+    plot_hull_impact_vectors,
+        save_simulation_state,
+        load_simulation_state,
+        build_costmap_from_ice_state,
+        create_medea_lattice_planner,
+        plan_path,
+        path_to_ship_trajectory,
+    )
+    from medea_ice_ship.config import RunConfig, get_default_run_config, get_default_simulation_config
+    from dataclasses import replace as replace_config
+    if args.live:
+        import matplotlib.pyplot as plt
+
+    run_cfg = get_default_run_config()
+    if args.seed is None:
+        args.seed = run_cfg.default_seed
     video_ext = '.gif' if args.gif else '.mp4'
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     total_start = time.time()
     np.random.seed(args.seed)
@@ -250,21 +271,27 @@ def main():
     planned_bounds = None
     replan_callback = None
     replan_every_n_frames = None
+    costmap_snapshots = None  # (frame_idx, cost_map) for costmap movie (AUTO-IceNav: costmap updated at replan)
     # Plan-then-simulate: replace fixed trajectory with planned path (Section 5); enable receding-horizon replan (AUTO-IceNav style)
     if args.plan and (args.simple or args.full_map):
         plan_cfg = replace_config(run_cfg, planning_turning_radius=50.0)  # so primitive step length fits map
+        if args.optimize_path:
+            plan_cfg = replace_config(plan_cfg, planning_use_path_optimizer=True)
+            print("  Path refinement: NLP optimizer enabled (path length + costmap + curvature)", flush=True)
         cost_map, bounds = build_costmap_from_ice_state(
             polygons, centroids, thicknesses,
             x_min, x_max, y_min, y_max,
             resolution=plan_cfg.planning_resolution,
             margin=plan_cfg.planning_margin,
             ship_mass=plan_cfg.ship_displacement,
+            damage_cost_scale=plan_cfg.planning_damage_cost_scale,
+            damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
         )
         start_heading = (ship_heading if args.simple else diagonal_heading)
         start = (float(ship_start[0]), float(ship_start[1]), float(start_heading))
         goal = (float(ship_end[0]), float(ship_end[1]))
         planner = create_medea_lattice_planner(cost_map, bounds, start, goal, plan_cfg)
-        path = plan_path(planner, start, goal, plan_cfg)
+        path = plan_path(planner, start, goal, plan_cfg, cost_map=cost_map)
         if path is None:
             print("  Planner did not find a path; aborting. Try without --plan for fixed trajectory.", flush=True)
             return
@@ -273,6 +300,7 @@ def main():
         planned_path = path
         planned_cost_map = cost_map
         planned_bounds = bounds
+        costmap_snapshots = [(0, cost_map)]  # initial costmap for movie (AUTO-IceNav style)
         print(f"  Planned path: {len(path)} waypoints -> trajectory length {len(ship_trajectory)}", flush=True)
 
         # Receding-horizon callback (AUTO-IceNav style): rebuild costmap from current ice state and replan
@@ -288,13 +316,16 @@ def main():
                 resolution=plan_cfg.planning_resolution,
                 margin=plan_cfg.planning_margin,
                 ship_mass=plan_cfg.ship_displacement,
+                damage_cost_scale=plan_cfg.planning_damage_cost_scale,
+                damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
             )
+            costmap_snapshots.append((frame, cost_map_f))  # for costmap movie: update every replan
             start_f = (float(ship_pos_f[0]), float(ship_pos_f[1]), float(ship_heading_f))
             try:
                 planner_f = create_medea_lattice_planner(cost_map_f, {"x_origin": cost_map_f.x_origin, "y_origin": cost_map_f.y_origin, "width": cost_map_f.width, "height": cost_map_f.height}, start_f, goal, plan_cfg)
             except ValueError:
                 return None
-            path_f = plan_path(planner_f, start_f, goal, plan_cfg)
+            path_f = plan_path(planner_f, start_f, goal, plan_cfg, cost_map=cost_map_f)
             if path_f is None:
                 return None
             return path_to_ship_trajectory(path_f, n_remaining)
@@ -304,6 +335,9 @@ def main():
         print(f"  Receding horizon: replan every {replan_every_n_frames} frames", flush=True)
 
     sim_cfg = get_default_simulation_config()
+    if args.no_mss_dynamics:
+        sim_cfg = replace_config(sim_cfg, use_mss_style_dynamics=False)
+        print("  Ship dynamics: simple diagonal M/D (MSS-style disabled)", flush=True)
     if args.no_thrust_cap:
         from dataclasses import replace
         sim_cfg = replace(sim_cfg, max_ship_ice_force=None)
@@ -312,6 +346,15 @@ def main():
         from dataclasses import replace
         sim_cfg = replace(sim_cfg, max_ship_ice_force=args.thrust_cap)
         print(f"  Thrust cap: {args.thrust_cap/1e6:.1f} MN", flush=True)
+    frame_callback = None
+    if args.live:
+        local_polys_live = [np.asarray(p) - polygon_centroid(p) for p in polygons]
+        margin = 50.0
+        extent_live = (float(x_min) - margin, float(x_max) + margin, float(y_min) - margin, float(y_max) + margin)
+        _fig_live, _ax_live, frame_callback = make_live_2d_callback(
+            bonds, local_polys_live, ship_length, ship_beam, thicknesses, extent_live, n_frames,
+        )
+        print("  Live 2D view: window will update each frame", flush=True)
     t0 = time.time()
     print(f"\nRunning fracture simulation ({n_frames} frames)...", flush=True)
     sim_result = simulate_ice_ship_interaction(
@@ -322,12 +365,14 @@ def main():
         config=sim_cfg,
         replan_every_n_frames=replan_every_n_frames,
         replan_callback=replan_callback,
+        frame_callback=frame_callback,
     )
     positions_history = sim_result[0]
     rotations_history = sim_result[1]
     bonds_history = sim_result[2]
     ship_history = sim_result[3]
     submergence_history = sim_result[4] if len(sim_result) > 4 else None
+    damage_summary = sim_result[5] if len(sim_result) > 5 and isinstance(sim_result[5], dict) else None
     sim_time = time.time() - t0
 
     n_initial = len(bonds)
@@ -335,7 +380,24 @@ def main():
     n_broken = n_initial - n_intact
     pct = 100 * n_broken / n_initial if n_initial > 0 else 0
     print(f"\n  Final: {n_broken}/{n_initial} bonds broken ({pct:.0f}%)", flush=True)
+    if damage_summary is not None:
+        J = damage_summary.get('impulse_total', 0.0)
+        print(f"  Ship damage proxy (cumulative impulse): {J/1e6:.2f} MN·s", flush=True)
+        segs = damage_summary.get("hull_impulse_segments")
+        contacts = damage_summary.get("hull_impulse_contacts")
+        if contacts or segs:
+            hull_out = str(out_dir / (('hull_impact_simple' if args.simple else 'hull_impact_medea') + '.png'))
+            plot_hull_impact_vectors(
+                ship_length, ship_beam,
+                hull_impulse_segments=segs, hull_impulse_contacts=contacts,
+                output_file=hull_out,
+            )
+            print(f"  Saved hull impact vectors: {hull_out}", flush=True)
     print(f"  Simulation time: {sim_time:.1f}s", flush=True)
+
+    if args.live:
+        print("\n  Live view: close the window to continue (or to exit).", flush=True)
+        plt.show()
 
     if args.save_state:
         save_simulation_state(
@@ -351,8 +413,8 @@ def main():
         print(f"\nQuick mode complete! Total: {time.time()-total_start:.1f}s")
         return
 
-    out_2d = ('simple_ship_fracture' if args.simple else 'medea_ship_fracture') + video_ext
-    out_3d = ('simple_ship_fracture_3d' if args.simple else 'medea_ship_fracture_3d') + video_ext
+    out_2d = str(out_dir / (('simple_ship_fracture' if args.simple else 'medea_ship_fracture') + video_ext))
+    out_3d = str(out_dir / (('simple_ship_fracture_3d' if args.simple else 'medea_ship_fracture_3d') + video_ext))
     t0 = time.time()
     print("\nGenerating 2D animation...", flush=True)
     animate_ice_ship_2d(
@@ -375,24 +437,24 @@ def main():
         )
         print(f"  3D animation time: {time.time()-t0:.1f}s", flush=True)
     if args.plan and planned_path is not None and planned_cost_map is not None:
-        out_costmap = ('costmap_simple_ship_fracture' if args.simple else 'costmap_medea_ship_fracture') + video_ext
+        out_costmap = str(out_dir / (('costmap_simple_ship_fracture' if args.simple else 'costmap_medea_ship_fracture') + video_ext))
         t0 = time.time()
         print("\nGenerating costmap movie (AUTO-IceNav style)...", flush=True)
+        local_polygons = [np.asarray(p) - polygon_centroid(p) for p in polygons]
         animate_costmap_movie(
             planned_cost_map, planned_bounds, ship_history,
-            path=planned_path, polygons=polygons,
+            path=planned_path,
+            positions_history=positions_history,
+            rotations_history=rotations_history,
+            local_polygons=local_polygons,
+            costmap_snapshots=costmap_snapshots,
             ship_length=ship_length, ship_beam=ship_beam,
             output_file=out_costmap, fps=run_cfg.fps_2d, frame_skip=run_cfg.frame_skip_2d,
             n_workers=run_cfg.n_workers,
         )
         print(f"  Costmap movie time: {time.time()-t0:.1f}s", flush=True)
     print(f"\nTotal time: {time.time()-total_start:.1f}s")
-    outputs = [out_2d]
-    if not args.no_3d:
-        outputs.append(out_3d)
-    if args.plan and planned_path is not None and planned_cost_map is not None:
-        outputs.append(('costmap_simple_ship_fracture' if args.simple else 'costmap_medea_ship_fracture') + video_ext)
-    print(f"\nOutput: {', '.join(outputs)}")
+    print(f"\nOutput directory: {out_dir.resolve()}")
 
 
 if __name__ == '__main__':

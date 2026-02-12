@@ -23,3 +23,6 @@ opencv-python>=4.5.0
 
 # Polygon operations (clipping Voronoi cells to floe boundaries)
 shapely>=2.0.0
+
+# Optional: path refinement NLP (planning_use_path_optimizer / --optimize-path)
+# pip install casadi

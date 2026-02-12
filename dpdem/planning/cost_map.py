@@ -37,6 +37,9 @@ class CostMap:
         base_cost: float = 1.0,
         collision_cost: float = 100.0,
         mass_cost_scale: float = 1e-5,
+        damage_cost_scale: float = 0.0,
+        damage_thickness_exponent: float = 0.5,
+        thickness_ref: float = 1.0,
     ):
         """
         Initialize cost map.
@@ -55,6 +58,9 @@ class CostMap:
             base_cost: Base traversal cost per cell
             collision_cost: Cost for collision with ice
             mass_cost_scale: Scaling factor for mass-based costs
+            damage_cost_scale: If > 0, add damage-potential cost per cell (mass * (thickness/thickness_ref)^exponent).
+            damage_thickness_exponent: Exponent for thickness in damage potential (thicker ice = higher cost).
+            thickness_ref: Reference thickness [m] for damage potential scaling.
         """
         self.width = width
         self.height = height
@@ -65,6 +71,9 @@ class CostMap:
         self.base_cost = base_cost
         self.collision_cost = collision_cost
         self.mass_cost_scale = mass_cost_scale
+        self.damage_cost_scale = damage_cost_scale
+        self.damage_thickness_exponent = damage_thickness_exponent
+        self.thickness_ref = thickness_ref
 
         # Grid dimensions
         self.cols = int(np.ceil(width / resolution))
@@ -103,38 +112,41 @@ class CostMap:
         polygons: List[np.ndarray],
         masses: np.ndarray,
         angles: Optional[np.ndarray] = None,
+        thicknesses: Optional[np.ndarray] = None,
     ):
         """
         Update cost map from ice field state.
-        
+
         Args:
             positions: Nx2 array of ice floe positions
             polygons: List of polygon vertex arrays (local coordinates)
             masses: N array of floe masses
             angles: N array of floe orientations (optional)
+            thicknesses: N array of ice thicknesses [m] (optional; used for damage-potential cost when damage_cost_scale > 0)
         """
         # Reset cost map
         self.cost_map.fill(self.base_cost)
         self.obstacles.clear()
-        
+
         n_floes = len(positions)
         if angles is None:
             angles = np.zeros(n_floes)
-        
+
         for i in range(n_floes):
             pos = positions[i]
             poly_local = polygons[i]
             mass = masses[i]
             angle = angles[i]
-            
+            thick = float(thicknesses[i]) if thicknesses is not None and i < len(thicknesses) else None
+
             # Transform polygon to world coordinates
             c, s = np.cos(angle), np.sin(angle)
             R = np.array([[c, -s], [s, c]])
             poly_world = poly_local @ R.T + pos
-            
+
             # Compute area
             area = self._polygon_area(poly_world)
-            
+
             # Store obstacle
             self.obstacles.append(Obstacle(
                 vertices=poly_world,
@@ -142,9 +154,9 @@ class CostMap:
                 mass=mass,
                 area=area,
             ))
-            
-            # Rasterize polygon to grid
-            self._rasterize_polygon(poly_world, mass)
+
+            # Rasterize polygon to grid (optionally with damage potential from thickness)
+            self._rasterize_polygon(poly_world, mass, thickness=thick)
     
     def _polygon_area(self, vertices: np.ndarray) -> float:
         """Compute polygon area using shoelace formula."""
@@ -156,26 +168,31 @@ class CostMap:
             area -= vertices[j, 0] * vertices[i, 1]
         return abs(area) / 2.0
     
-    def _rasterize_polygon(self, vertices: np.ndarray, mass: float):
-        """Rasterize polygon to grid cells."""
+    def _rasterize_polygon(self, vertices: np.ndarray, mass: float, thickness: Optional[float] = None):
+        """Rasterize polygon to grid cells. Optionally add damage-potential cost when thickness and damage_cost_scale set."""
         # Get bounding box
         min_x, min_y = vertices.min(axis=0)
         max_x, max_y = vertices.max(axis=0)
-        
+
         min_row, min_col = self.world_to_grid(min_x, min_y)
         max_row, max_col = self.world_to_grid(max_x, max_y)
-        
+
         # Clamp to grid bounds
         min_row = max(0, min_row)
         min_col = max(0, min_col)
         max_row = min(self.rows - 1, max_row)
         max_col = min(self.cols - 1, max_col)
-        
-        # Cost based on mass
-        # Heavier ice is harder to push through
+
+        # Cost based on mass (heavier ice = higher traversal cost)
         relative_mass = mass / self.ship_mass
         cell_cost = self.collision_cost * (1.0 + relative_mass * self.mass_cost_scale)
-        
+
+        # Damage-potential cost: thicker/heavier ice increases expected ship damage (risk-aware planning)
+        if self.damage_cost_scale > 0 and thickness is not None and thickness > 0:
+            t_ratio = (thickness / self.thickness_ref) ** self.damage_thickness_exponent
+            damage_cost = self.damage_cost_scale * (mass / self.ship_mass) * t_ratio
+            cell_cost = max(cell_cost, damage_cost)
+
         # Simple rasterization: check each cell in bounding box
         for row in range(min_row, max_row + 1):
             for col in range(min_col, max_col + 1):

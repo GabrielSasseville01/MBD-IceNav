@@ -10,6 +10,7 @@ import numpy as np
 
 from dpdem.planning.lattice_planner import LatticePlanner, Primitives
 from dpdem.planning.cost_map import CostMap
+from dpdem.planning.path_optimizer import optimize_path as refine_path_nlp
 from medea_ice_ship.config import RunConfig
 
 
@@ -87,11 +88,15 @@ def plan_path(
     start: Tuple[float, float, float],
     goal: Tuple[float, float],
     run_cfg: RunConfig,
+    cost_map: Optional[CostMap] = None,
 ) -> Optional[np.ndarray]:
     """
     Run the lattice planner from start to goal (Section 3).
 
     Uses start and goal in the same world frame as the costmap/simulation.
+    If planning_use_path_optimizer is True and cost_map is provided, refines the path
+    with an NLP (path length + costmap integral + curvature penalty).
+
     **Behaviour when no path is found:** returns `None`. Callers should check
     and either abort with a clear message or fall back to a fixed trajectory.
 
@@ -99,16 +104,35 @@ def plan_path(
         planner: Configured LatticePlanner (from create_medea_lattice_planner).
         start: (x, y, heading) in world coordinates [m, m, rad].
         goal: (x, y) in world coordinates [m, m].
-        run_cfg: RunConfig for planning_max_iterations.
+        run_cfg: RunConfig for planning_max_iterations and optional path optimizer.
+        cost_map: CostMap (required when planning_use_path_optimizer is True).
 
     Returns:
         Path as Nx3 array [x, y, heading] in world coordinates, or None if no path found.
     """
-    return planner.plan(
+    path = planner.plan(
         start=start,
         goal=goal,
         max_iterations=run_cfg.planning_max_iterations,
     )
+    if path is None:
+        return None
+    if getattr(run_cfg, "planning_use_path_optimizer", False) and cost_map is not None:
+        refined = refine_path_nlp(
+            path,
+            cost_map,
+            start=start,
+            goal=goal,
+            ship_length=run_cfg.ship_length,
+            ship_beam=run_cfg.ship_beam,
+            n_waypoints=run_cfg.planning_optimizer_waypoints,
+            cost_weight=run_cfg.planning_optimizer_cost_weight,
+            curvature_weight=run_cfg.planning_optimizer_curvature_weight,
+            max_iter=run_cfg.planning_optimizer_max_iter,
+        )
+        if refined is not None:
+            path = refined
+    return path
 
 
 def path_to_ship_trajectory(

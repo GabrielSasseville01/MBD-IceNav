@@ -18,6 +18,9 @@ env/
 *.png
 *.mp4
 
+# Output directories (movies, plots)
+outputs/
+
 # Ignore generated GIFs (large files)
 autonomous_*.gif
 planned_navigation*.gif

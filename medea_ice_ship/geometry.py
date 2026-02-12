@@ -92,6 +92,55 @@ def _distance_point_to_segment(px, py, ax, ay, bx, by):
     return np.sqrt(dx * dx + dy * dy), cx, cy
 
 
+def closest_point_on_polygon_boundary(px, py, polygon):
+    """
+    Return the closest point on the closed polygon boundary to (px, py).
+    polygon: Nx2 array of vertices (closed: first and last need not repeat).
+    """
+    poly = np.asarray(polygon)
+    n = len(poly)
+    best_d = np.inf
+    best_qx, best_qy = px, py
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        d, qx, qy = _distance_point_to_segment(px, py, ax, ay, bx, by)
+        if d < best_d:
+            best_d, best_qx, best_qy = d, qx, qy
+    return best_qx, best_qy
+
+
+def closest_point_and_outward_normal(px, py, polygon):
+    """
+    Return (qx, qy, nx, ny): closest point on the closed polygon boundary to (px, py),
+    and the outward unit normal at that point (perpendicular to the edge, pointing
+    away from the polygon interior). polygon: Nx2 array (closed).
+    """
+    poly = np.asarray(polygon)
+    n = len(poly)
+    centroid = polygon_centroid(poly)
+    best_d = np.inf
+    best_qx, best_qy = px, py
+    best_nx, best_ny = 0.0, 0.0
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        d, qx, qy = _distance_point_to_segment(px, py, ax, ay, bx, by)
+        if d < best_d:
+            # Edge vector and perpendicular (outward = right of edge in CCW order)
+            ex, ey = bx - ax, by - ay
+            # Perp: (ey, -ex) is 90° counterclockwise from (ex, ey)
+            nx, ny = ey, -ex
+            nlen = np.sqrt(nx * nx + ny * ny) + 1e-20
+            nx, ny = nx / nlen, ny / nlen
+            # Outward: normal should point away from centroid
+            if (qx - centroid[0]) * nx + (qy - centroid[1]) * ny < 0:
+                nx, ny = -nx, -ny
+            best_d, best_qx, best_qy = d, qx, qy
+            best_nx, best_ny = nx, ny
+    return best_qx, best_qy, best_nx, best_ny
+
+
 def point_inside_polygon_penetration(px, py, polygon):
     """
     When point (px, py) is inside polygon, return penetration (distance to nearest edge)

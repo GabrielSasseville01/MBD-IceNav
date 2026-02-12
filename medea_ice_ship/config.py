@@ -137,10 +137,18 @@ class SimulationConfig:
     angular_cap: Tuple[float, float] = (-0.2, 0.2)
 
     # --- Ship dynamics (body-frame PD) ---
+    # Use MSS-style 3-DOF dynamics (Fossen: M = M_RB + M_A, D, C(nu)). If False, use simple diagonal M, D.
+    use_mss_style_dynamics: bool = True
     # Linear damping on surge/sway: force = -this × mass × velocity (xy).
     ship_damping_xy: float = 0.02
     # Linear damping on yaw: torque = -this × Izz × angular_velocity.
     ship_damping_psi: float = 0.15
+    # MSS-style: added mass in surge as fraction of ship mass (typical 0.05–0.2).
+    mss_added_mass_surge_frac: float = 0.05
+    # MSS-style: added mass in sway as fraction of ship mass (typical 0.3–0.8).
+    mss_added_mass_sway_frac: float = 0.5
+    # MSS-style: added inertia in yaw as fraction of Izz (typical 0.1–0.3).
+    mss_added_mass_yaw_frac: float = 0.2
     # Proportional gain for position error (xy): Kp = this × ship mass.
     Kp_xy_scale: float = 0.03
     # Proportional gain for heading error (yaw) in PD controller.
@@ -215,6 +223,19 @@ class RunConfig:
     planning_max_iterations: int = 20000
     # Receding horizon (AUTO-IceNav style): replan every this many simulation frames (e.g. 60 ≈ 3 s at 0.05 s dt).
     planning_replan_every_n_frames: int = 60
+    # If True, refine A* path with NLP (path length + costmap integral + curvature); requires casadi.
+    planning_use_path_optimizer: bool = False
+    # Path optimizer: number of waypoints (including start/goal).
+    planning_optimizer_waypoints: int = 41
+    # Path optimizer: weight for costmap integral in objective.
+    planning_optimizer_cost_weight: float = 0.1
+    # Path optimizer: weight for curvature penalty (delta_psi)^2.
+    planning_optimizer_curvature_weight: float = 10.0
+    # Path optimizer: max Ipopt iterations.
+    planning_optimizer_max_iter: int = 500
+    # Damage-aware cost: if > 0, costmap includes thickness-based damage potential (safer paths).
+    planning_damage_cost_scale: float = 0.0
+    planning_damage_thickness_exponent: float = 0.5
     # Random seed for reproducibility (tessellation, thickness, etc.) when --seed not set.
     default_seed: int = 42
     # Frames per second for 2D animation.

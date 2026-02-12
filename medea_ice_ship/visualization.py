@@ -8,15 +8,235 @@ import tempfile
 import warnings
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+if os.environ.get('DPDEM_LIVE_VIEW') != '1':
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from matplotlib.collections import LineCollection
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib import colors as mpl_colors
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from medea_ice_ship.geometry import polygon_centroid, create_ship_hull_at_position_heading, point_in_polygon
+from medea_ice_ship.geometry import (
+    polygon_centroid,
+    create_ship_hull_at_position_heading,
+    point_in_polygon,
+    closest_point_and_outward_normal,
+)
 from medea_ice_ship.config import VisualizationConfig, get_default_visualization_config
+
+
+def make_live_2d_callback(
+    bonds,
+    local_polys,
+    ship_length,
+    ship_beam,
+    thicknesses,
+    extent,
+    n_frames,
+    figsize=(12, 8),
+):
+    """
+    Create (fig, ax, callback) for real-time 2D view during simulation.
+
+    Use with simulate_ice_ship_interaction(..., frame_callback=callback).
+    extent: (x_min, x_max, y_min, y_max). After the sim, call plt.show() to keep the window open.
+    """
+    x_min, x_max, y_min, y_max = extent
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_aspect("equal")
+    water_color = "#1A4D70"
+    ship_color = "#404040"
+    n_elements = len(local_polys)
+    if n_elements > 0 and thicknesses is not None and len(thicknesses) == n_elements:
+        t = thicknesses
+        thickness_norm = (t - t.min()) / (t.max() - t.min() + 0.01)
+        ice_colors = [
+            f"#{int(240 - 100 * v):02x}{int(250 - 80 * v):02x}{int(255 - 40 * v):02x}"
+            for v in thickness_norm
+        ]
+    else:
+        ice_colors = ["#C0E0F0"] * max(n_elements, 1)
+
+    def callback(frame, positions, rotations, bond_intact, ship_pos, ship_heading):
+        ax.clear()
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_aspect("equal")
+        ax.set_facecolor(water_color)
+        broken_neighbors = {i: set() for i in range(n_elements)}
+        for b, (i, j) in enumerate(bonds):
+            if not bond_intact[b]:
+                broken_neighbors[i].add(j)
+                broken_neighbors[j].add(i)
+        for i in range(n_elements):
+            c, s = np.cos(rotations[i]), np.sin(rotations[i])
+            world_poly = local_polys[i] @ np.array([[c, -s], [s, c]]).T + positions[i]
+            has_broken = len(broken_neighbors[i]) > 0
+            edge_color = "#1A4D70" if has_broken else ice_colors[i]
+            edge_width = 1.5 if has_broken else 0.5
+            patch = MplPolygon(
+                world_poly,
+                closed=True,
+                facecolor=ice_colors[i],
+                edgecolor=edge_color,
+                linewidth=edge_width,
+                alpha=0.95,
+            )
+            ax.add_patch(patch)
+        ship_outline = create_ship_hull_at_position_heading(
+            ship_length, ship_beam, ship_pos, ship_heading
+        )
+        ship_patch = MplPolygon(
+            ship_outline,
+            closed=True,
+            facecolor=ship_color,
+            edgecolor="#202020",
+            linewidth=2,
+            alpha=0.95,
+        )
+        ax.add_patch(ship_patch)
+        n_broken = np.sum(~bond_intact)
+        ax.set_title(
+            f"DPDEM Ice-Ship (live)\nFrame {frame}/{n_frames - 1} | Bonds: {n_broken}/{len(bonds)} broken",
+            fontsize=12,
+        )
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+        plt.pause(0.001)
+
+    return fig, ax, callback
+
+
+def plot_hull_impact_vectors(
+    ship_length: float,
+    ship_beam: float,
+    hull_impulse_segments: list = None,
+    hull_impulse_contacts: list = None,
+    output_file: str = "hull_impact_vectors.png",
+    figsize: tuple = (10, 6),
+    max_arrow_size: float = None,
+):
+    """
+    Plot impulse vectors at impact locations on the ship hull (AUTO-IceNav style).
+
+    When hull_impulse_contacts is provided: one line segment per contact (like
+    AUTO-IceNav impact_locations_impulse.pdf). Line length is normalized so no
+    segment exceeds max_arrow_size; color encodes impulse magnitude (plasma).
+    Otherwise uses segment-aggregated data with quiver arrows.
+
+    Args:
+        ship_length: Ship length [m]
+        ship_beam: Ship beam [m]
+        hull_impulse_segments: Optional list of (x_body, Jx, Jy) per segment (fallback)
+        hull_impulse_contacts: Optional list of (cx_body, cy_body, Jx, Jy) per contact
+        output_file: Output path (PNG)
+        figsize: Figure size (inches)
+        max_arrow_size: Max line length in plot units (default 0.12 * ship_length)
+    """
+    contacts = hull_impulse_contacts if hull_impulse_contacts else []
+    segments = hull_impulse_segments if hull_impulse_segments else []
+    if not contacts and not segments:
+        return
+    half_beam = ship_beam / 2
+    half_len = ship_length / 2
+    hull_outline = create_ship_hull_at_position_heading(
+        ship_length, ship_beam, (0.0, 0.0), 0.0
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_aspect("equal")
+    # Hull: AUTO-IceNav uses fill=False, alpha=0.1; we keep a light fill for visibility
+    ax.add_patch(
+        MplPolygon(
+            hull_outline,
+            fill=True,
+            facecolor="#404040",
+            edgecolor="#202020",
+            linewidth=2,
+            alpha=0.9,
+        )
+    )
+    use_contacts = len(contacts) > 0
+    if use_contacts:
+        # AUTO-IceNav style: one line per contact, length capped, color = magnitude
+        if max_arrow_size is None:
+            max_arrow_size = 0.24 * ship_length
+        max_impulse = max(
+            np.sqrt(c[2] ** 2 + c[3] ** 2) for c in contacts
+        ) or 1.0
+        cmap = plt.get_cmap("plasma")
+        # Optional approach-speed scaling (plot-only): 5-tuple (cx, cy, Jx, Jy, approach_speed)
+        has_approach = contacts and len(contacts[0]) >= 5
+        max_approach = (
+            max(c[4] for c in contacts if len(c) >= 5) if has_approach else 1.0
+        ) or 1.0
+        segs = []
+        color_list = []
+        for c in contacts:
+            cx, cy, Jx, Jy = c[0], c[1], c[2], c[3]
+            approach_speed = c[4] if len(c) >= 5 else None
+            norm_impulse = np.sqrt(Jx * Jx + Jy * Jy)
+            if norm_impulse < 1e-12:
+                continue
+            # Project onto hull and get outward normal (AUTO-IceNav: segments perpendicular to hull, outside ship)
+            hx, hy, nx, ny = closest_point_and_outward_normal(cx, cy, hull_outline)
+            # Segment: head on hull, tail outside along outward normal; length = magnitude
+            length = min(norm_impulse / max_impulse, 1.0) * max_arrow_size
+            # Scale length by approach speed (plot-only): bow (approaching) larger, stern/wake (receding) smaller
+            if approach_speed is not None and max_approach > 1e-6:
+                length *= max(0.2, approach_speed / max_approach)
+            tail_x = hx + nx * length
+            tail_y = hy + ny * length
+            segs.append([(tail_x, tail_y), (hx, hy)])
+            color_list.append(cmap(min(norm_impulse / max_impulse, 1.0)))
+        if segs:
+            lc = LineCollection(
+                segs,
+                colors=color_list,
+                linestyles="-",
+                linewidths=1,
+                alpha=0.7,
+                rasterized=True,
+            )
+            ax.add_collection(lc)
+            ax.set_xlim(np.min(hull_outline[:, 0]) - max_arrow_size, np.max(hull_outline[:, 0]) + max_arrow_size)
+            ax.set_ylim(np.min(hull_outline[:, 1]) - max_arrow_size, np.max(hull_outline[:, 1]) + max_arrow_size)
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=max_impulse))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, shrink=0.95)
+            cbar.set_label("Impulse magnitude (N·s)", fontsize=10)
+    else:
+        # Segment-aggregated fallback: quiver
+        xs = np.array([s[0] for s in segments])
+        jxs = np.array([s[1] for s in segments])
+        jys = np.array([s[2] for s in segments])
+        eps = 1e-9
+        y_contact = np.where(jys > eps, -half_beam, np.where(jys < -eps, half_beam, 0.0))
+        head_x, head_y = xs, y_contact
+        j_mag = np.sqrt(jxs**2 + jys**2)
+        if j_mag.size > 0 and j_mag.max() > 1e-3:
+            scale = 0.3 * ship_length / j_mag.max()
+            tail_x = head_x - jxs * scale
+            tail_y = head_y - jys * scale
+            q = ax.quiver(
+                tail_x, tail_y, jxs * scale, jys * scale,
+                j_mag, cmap="hot", scale=1.0, scale_units="xy",
+                width=0.008, alpha=0.9,
+            )
+            cbar = fig.colorbar(q, ax=ax, shrink=0.8)
+            cbar.set_label("Accumulated impulse [N·s]", fontsize=10)
+    ax.set_xlabel("x (body frame) [m]", fontsize=11)
+    ax.set_ylabel("y (body frame) [m]", fontsize=11)
+    ax.set_title("Impulse vectors at impact locations (AUTO-IceNav style)", fontsize=12)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
 
 # Process-global data for parallel workers (set by pool initializer)
 _DATA_2D = None
@@ -227,20 +447,41 @@ def _animation_writer(output_file, fps):
 
 
 def _draw_costmap_frame_to_array(data, frame_idx):
-    """Draw one frame of the costmap movie: costmap + path-so-far + ship. Used by parallel workers."""
+    """Draw one frame of the costmap movie (AUTO-IceNav style): costmap + ice + planned path (red) + actual path (blue) + ship. Used by parallel workers."""
     k = data["frames_to_render"][frame_idx]
-    cost_grid = data["cost_grid"]
-    x_origin = data["x_origin"]
-    y_origin = data["y_origin"]
-    resolution = data["resolution"]
-    cols, rows = data["cols"], data["rows"]
     ship_history = data["ship_history"]
     path = data.get("path")
-    polygons = data.get("polygons") or []
     ship_length = data["ship_length"]
     ship_beam = data["ship_beam"]
     x_min_ax, x_max_ax = data["x_min_ax"], data["x_max_ax"]
     y_min_ax, y_max_ax = data["y_min_ax"], data["y_max_ax"]
+
+    # Costmap: use snapshot for frame k if provided (AUTO-IceNav: costmap updated every replan, not every frame)
+    snapshots = data.get("costmap_snapshots")
+    if snapshots:
+        cm = None
+        for (fidx, cminst) in snapshots:
+            if fidx <= k:
+                cm = cminst
+        if cm is None:
+            cm = snapshots[0][1]
+        cost_grid = np.asarray(cm.cost_map)
+        x_origin = getattr(cm, "x_origin", 0)
+        y_origin = getattr(cm, "y_origin", 0)
+        resolution = getattr(cm, "resolution", 2.0)
+        cols, rows = cost_grid.shape[1], cost_grid.shape[0]
+    else:
+        cost_grid = data["cost_grid"]
+        x_origin = data["x_origin"]
+        y_origin = data["y_origin"]
+        resolution = data["resolution"]
+        cols, rows = data["cols"], data["rows"]
+
+    # Ice: either moving (per-frame positions/rotations) or static polygons
+    positions_history = data.get("positions_history")
+    rotations_history = data.get("rotations_history")
+    local_polygons = data.get("local_polygons")
+    static_polygons = data.get("polygons") or []
 
     X = x_origin + np.arange(cols + 1) * resolution
     Y = y_origin + np.arange(rows + 1) * resolution
@@ -249,27 +490,40 @@ def _draw_costmap_frame_to_array(data, frame_idx):
 
     fig, ax = plt.subplots(figsize=data["figsize"], dpi=data["dpi"])
     ax.pcolormesh(X, Y, cost, norm=norm, cmap="viridis", shading="flat")
-    for poly in polygons:
-        closed = np.vstack([poly, poly[0:1]])
-        ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+
+    if positions_history is not None and rotations_history is not None and local_polygons is not None and k < len(positions_history):
+        # Draw ice in current frame (moved/rotated by simulation)
+        pos = positions_history[k]
+        rot = rotations_history[k]
+        for i, local_poly in enumerate(local_polygons):
+            c, s = np.cos(rot[i]), np.sin(rot[i])
+            R = np.array([[c, -s], [s, c]])
+            world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
+            closed = np.vstack([world_poly, world_poly[0:1]])
+            ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+    else:
+        for poly in static_polygons:
+            closed = np.vstack([poly, poly[0:1]])
+            ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+    # AUTO-IceNav colors: planned path = red, actual path = blue
     if path is not None and len(path) > 0:
-        ax.plot(path[:, 0], path[:, 1], "k--", linewidth=1, alpha=0.6, label="Planned path")
+        ax.plot(path[:, 0], path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
     trail_end = min(k + 1, len(ship_history))
     if trail_end >= 2:
         trail_x = [ship_history[i][0][0] for i in range(trail_end)]
         trail_y = [ship_history[i][0][1] for i in range(trail_end)]
-        ax.plot(trail_x, trail_y, "r-", linewidth=2, label="Ship path", zorder=5)
+        ax.plot(trail_x, trail_y, "b-", linewidth=2, label="Actual path", zorder=5)
     if k < len(ship_history):
         ship_pos, ship_heading = ship_history[k][0], ship_history[k][1]
-        ax.plot(ship_pos[0], ship_pos[1], "ro", markersize=8, zorder=6)
+        ax.plot(ship_pos[0], ship_pos[1], "ko", markersize=6, zorder=6)
         hull = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_heading)
-        patch = MplPolygon(hull, closed=True, facecolor="#C03030", edgecolor="#802020", linewidth=1.5, alpha=0.9, zorder=6)
+        patch = MplPolygon(hull, closed=True, facecolor="#404040", edgecolor="black", linewidth=1.5, alpha=0.9, zorder=6)
         ax.add_patch(patch)
     if len(ship_history) > 0:
         start_pos = ship_history[0][0]
         ax.plot(start_pos[0], start_pos[1], "go", markersize=10, label="Start", zorder=7)
     if path is not None and len(path) > 0:
-        ax.plot(path[-1, 0], path[-1, 1], "rs", markersize=10, label="Goal", zorder=7)
+        ax.plot(path[-1, 0], path[-1, 1], "gs", markersize=10, label="Goal", zorder=7)
     ax.set_xlim(x_min_ax, x_max_ax)
     ax.set_ylim(y_min_ax, y_max_ax)
     ax.set_xlabel("x [m]")
@@ -300,6 +554,10 @@ def animate_costmap_movie(
     ship_history,
     path=None,
     polygons=None,
+    positions_history=None,
+    rotations_history=None,
+    local_polygons=None,
+    costmap_snapshots=None,
     ship_length=158.0,
     ship_beam=28.0,
     output_file="costmap_movie.mp4",
@@ -309,14 +567,19 @@ def animate_costmap_movie(
     figsize=(10.08, 6.08),
 ):
     """
-    Generate a costmap movie (AUTO-IceNav style): costmap as background, ship trajectory
-    drawing over time, optional planned path and ice outlines.
+    Generate a costmap movie (AUTO-IceNav style): costmap as background, moving ice,
+    planned path (red), actual path (blue), ship and start/goal. The costmap can be
+    updated every X frames (e.g. at replan times) via costmap_snapshots.
 
-    cost_map: object with .cost_map (2D array), .x_origin, .y_origin, .resolution, .cols, .rows
-    bounds: dict with x_min, x_max, y_min, y_max (for optional ice domain rect)
+    cost_map: default costmap (used for all frames if costmap_snapshots is None)
+    bounds: dict with x_min, x_max, y_min, y_max, x_origin, y_origin, etc.
     ship_history: list of (position_2d, heading) per frame
     path: Nx3 planned path [x,y,heading] or None
-    polygons: list of polygon arrays for ice outline overlay, or None
+    polygons: list of polygon arrays for static ice outline, or None (ignored if moving ice provided)
+    positions_history, rotations_history, local_polygons: per-frame ice state for moving ice
+    costmap_snapshots: optional list of (frame_idx, cost_map) so the costmap is updated only at
+        those frames (e.g. at replan times), not every frame. Each cost_map must have .cost_map,
+        .x_origin, .y_origin, .resolution, .cols, .rows. Like AUTO-IceNav planner_plots.
     """
     n_frames = len(ship_history)
     if n_frames == 0:
@@ -332,19 +595,22 @@ def animate_costmap_movie(
     cols = getattr(cost_map, "cols", cost_map.cost_map.shape[1])
     rows = getattr(cost_map, "rows", cost_map.cost_map.shape[0])
     ship_positions = np.array([h[0] for h in ship_history])
-    x_min_ax = float(ship_positions[:, 0].min() - ship_length)
-    x_max_ax = float(ship_positions[:, 0].max() + ship_length)
-    y_min_ax = float(ship_positions[:, 1].min() - ship_beam)
-    y_max_ax = float(ship_positions[:, 1].max() + ship_beam)
+    x_min_ax = float(ship_positions[:, 0].min() - ship_length - 20)
+    x_max_ax = float(ship_positions[:, 0].max() + ship_length + 20)
+    y_min_ax = float(ship_positions[:, 1].min() - ship_beam - 20)
+    y_max_ax = float(ship_positions[:, 1].max() + ship_beam + 20)
     if path is not None and len(path) > 0:
-        x_min_ax = min(x_min_ax, float(path[:, 0].min()))
-        x_max_ax = max(x_max_ax, float(path[:, 0].max()))
-        y_min_ax = min(y_min_ax, float(path[:, 1].min()))
-        y_max_ax = max(y_max_ax, float(path[:, 1].max()))
-    x_min_ax -= 20
-    x_max_ax += 20
-    y_min_ax -= 20
-    y_max_ax += 20
+        x_min_ax = min(x_min_ax, float(path[:, 0].min()) - 20)
+        x_max_ax = max(x_max_ax, float(path[:, 0].max()) + 20)
+        y_min_ax = min(y_min_ax, float(path[:, 1].min()) - 20)
+        y_max_ax = max(y_max_ax, float(path[:, 1].max()) + 20)
+    # Same view extent as 2D simulation when ice history is provided
+    if positions_history is not None and len(positions_history) > 0:
+        all_pos = np.concatenate(positions_history)
+        x_min_ax = min(x_min_ax, float(all_pos[:, 0].min()) - 20)
+        x_max_ax = max(x_max_ax, float(all_pos[:, 0].max()) + 20)
+        y_min_ax = min(y_min_ax, float(all_pos[:, 1].min()) - 20)
+        y_max_ax = max(y_max_ax, float(all_pos[:, 1].max()) + 20)
 
     data = {
         "cost_grid": cost_map.cost_map,
@@ -356,6 +622,10 @@ def animate_costmap_movie(
         "ship_history": ship_history,
         "path": np.asarray(path) if path is not None else None,
         "polygons": list(polygons) if polygons is not None else [],
+        "positions_history": positions_history,
+        "rotations_history": rotations_history,
+        "local_polygons": list(local_polygons) if local_polygons is not None else None,
+        "costmap_snapshots": list(costmap_snapshots) if costmap_snapshots else None,
         "ship_length": ship_length,
         "ship_beam": ship_beam,
         "frames_to_render": frames_to_render,
@@ -402,33 +672,63 @@ def animate_costmap_movie(
     fig, ax = plt.subplots(figsize=figsize)
     print(f"Creating costmap movie with {n_render} frames (frame_skip={frame_skip})...", flush=True)
 
+    positions_h = positions_history
+    rotations_h = rotations_history
+    local_polys = list(local_polygons) if local_polygons is not None else None
+    snapshots = list(costmap_snapshots) if costmap_snapshots else None
+
     def update(frame_idx):
         k = frames_to_render[frame_idx]
         ax.clear()
-        X = x_origin + np.arange(cols + 1) * resolution
-        Y = y_origin + np.arange(rows + 1) * resolution
-        cost = np.asarray(cost_map.cost_map)
+        if snapshots:
+            cm = None
+            for (fidx, cminst) in snapshots:
+                if fidx <= k:
+                    cm = cminst
+            if cm is None:
+                cm = snapshots[0][1]
+            cost = np.asarray(cm.cost_map)
+            x_orig = getattr(cm, "x_origin", 0)
+            y_orig = getattr(cm, "y_origin", 0)
+            res = getattr(cm, "resolution", 2.0)
+            ccols, crows = cost.shape[1], cost.shape[0]
+        else:
+            cost = np.asarray(cost_map.cost_map)
+            x_orig, y_orig, res = x_origin, y_origin, resolution
+            ccols, crows = cols, rows
+        X = x_orig + np.arange(ccols + 1) * res
+        Y = y_orig + np.arange(crows + 1) * res
         norm = mpl_colors.LogNorm(vmin=max(0.5, float(cost.min())), vmax=float(cost.max()))
         ax.pcolormesh(X, Y, cost, norm=norm, cmap="viridis", shading="flat")
-        for poly in (polygons or []):
-            closed = np.vstack([poly, poly[0:1]])
-            ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+        if positions_h is not None and rotations_h is not None and local_polys is not None and k < len(positions_h):
+            pos = positions_h[k]
+            rot = rotations_h[k]
+            for i, local_poly in enumerate(local_polys):
+                c, s = np.cos(rot[i]), np.sin(rot[i])
+                R = np.array([[c, -s], [s, c]])
+                world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
+                closed = np.vstack([world_poly, world_poly[0:1]])
+                ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+        else:
+            for poly in (polygons or []):
+                closed = np.vstack([poly, poly[0:1]])
+                ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
         if path is not None and len(path) > 0:
-            ax.plot(path[:, 0], path[:, 1], "k--", linewidth=1, alpha=0.6, label="Planned path")
+            ax.plot(path[:, 0], path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
         trail_end = min(k + 1, len(ship_history))
         if trail_end >= 2:
             trail_x = [ship_history[i][0][0] for i in range(trail_end)]
             trail_y = [ship_history[i][0][1] for i in range(trail_end)]
-            ax.plot(trail_x, trail_y, "r-", linewidth=2, label="Ship path", zorder=5)
+            ax.plot(trail_x, trail_y, "b-", linewidth=2, label="Actual path", zorder=5)
         if k < len(ship_history):
             ship_pos, ship_heading = ship_history[k][0], ship_history[k][1]
-            ax.plot(ship_pos[0], ship_pos[1], "ro", markersize=8, zorder=6)
+            ax.plot(ship_pos[0], ship_pos[1], "ko", markersize=6, zorder=6)
             hull = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_heading)
-            ax.add_patch(MplPolygon(hull, closed=True, facecolor="#C03030", edgecolor="#802020", linewidth=1.5, alpha=0.9, zorder=6))
+            ax.add_patch(MplPolygon(hull, closed=True, facecolor="#404040", edgecolor="black", linewidth=1.5, alpha=0.9, zorder=6))
         if len(ship_history) > 0:
             ax.plot(ship_history[0][0][0], ship_history[0][0][1], "go", markersize=10, label="Start", zorder=7)
         if path is not None and len(path) > 0:
-            ax.plot(path[-1, 0], path[-1, 1], "rs", markersize=10, label="Goal", zorder=7)
+            ax.plot(path[-1, 0], path[-1, 1], "gs", markersize=10, label="Goal", zorder=7)
         ax.set_xlim(x_min_ax, x_max_ax)
         ax.set_ylim(y_min_ax, y_max_ax)
         ax.set_xlabel("x [m]")
@@ -451,8 +751,10 @@ def animate_ice_ship_2d(
     ship_history, ship_length, ship_beam, initial_centroids, thicknesses,
     output_file='medea_ship_fracture.gif', fps=20, frame_skip=1, n_workers=1,
     figsize=(16, 12),
+    view_bounds=None,
 ):
-    """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame."""
+    """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame.
+    view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice."""
     n_frames = len(positions_history)
     frames_to_render = list(range(0, n_frames, frame_skip))
     if frames_to_render[-1] != n_frames - 1:
@@ -463,20 +765,28 @@ def animate_ice_ship_2d(
     for poly in polygons:
         centroid = polygon_centroid(poly)
         local_polys.append(poly - centroid)
-    if len(ship_history) > 0:
+    if view_bounds is not None:
+        x_min, x_max, y_min, y_max = view_bounds
+    elif len(ship_history) > 0:
         ship_positions = np.array([h[0] for h in ship_history])
         x_min = float(ship_positions[:, 0].min() - ship_length - 20)
         x_max = float(ship_positions[:, 0].max() + ship_length + 20)
         y_min = float(ship_positions[:, 1].min() - ship_beam - 20)
         y_max = float(ship_positions[:, 1].max() + ship_beam + 20)
+        if n_elements > 0:
+            all_pos = np.concatenate(positions_history)
+            x_min = min(x_min, float(all_pos[:, 0].min() - 20))
+            x_max = max(x_max, float(all_pos[:, 0].max() + 20))
+            y_min = min(y_min, float(all_pos[:, 1].min() - 20))
+            y_max = max(y_max, float(all_pos[:, 1].max() + 20))
     else:
         x_min, x_max, y_min, y_max = -50.0, 50.0, -50.0, 50.0
-    if n_elements > 0:
-        all_pos = np.concatenate(positions_history)
-        x_min = min(x_min, float(all_pos[:, 0].min() - 20))
-        x_max = max(x_max, float(all_pos[:, 0].max() + 20))
-        y_min = min(y_min, float(all_pos[:, 1].min() - 20))
-        y_max = max(y_max, float(all_pos[:, 1].max() + 20))
+        if n_elements > 0:
+            all_pos = np.concatenate(positions_history)
+            x_min = min(x_min, float(all_pos[:, 0].min() - 20))
+            x_max = max(x_max, float(all_pos[:, 0].max() + 20))
+            y_min = min(y_min, float(all_pos[:, 1].min() - 20))
+            y_max = max(y_max, float(all_pos[:, 1].max() + 20))
     water_color = '#1A4D70'
     ship_color = '#404040'
     if n_elements > 0 and len(thicknesses) > 0:

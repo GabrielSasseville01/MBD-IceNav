@@ -27,6 +27,9 @@ def build_costmap_from_ice_state(
     base_cost: float = 1.0,
     collision_cost: float = 100.0,
     mass_cost_scale: float = 1e-5,
+    damage_cost_scale: float = 0.0,
+    damage_thickness_exponent: float = 0.5,
+    thickness_ref: float = 1.0,
     ice_density: float = 920.0,
 ) -> Tuple[CostMap, dict]:
     """
@@ -46,6 +49,9 @@ def build_costmap_from_ice_state(
         base_cost: Base traversal cost per cell (open water).
         collision_cost: Cost for cells containing ice.
         mass_cost_scale: Scaling for mass-based cost (heavier ice = higher cost).
+        damage_cost_scale: If > 0, add damage-potential cost (thickness-aware) for safer path planning.
+        damage_thickness_exponent: Exponent for thickness in damage cost (default 0.5).
+        thickness_ref: Reference thickness [m] for damage scaling.
         ice_density: Ice density [kg/m³] for mass computation.
 
     Returns:
@@ -80,12 +86,16 @@ def build_costmap_from_ice_state(
         base_cost=base_cost,
         collision_cost=collision_cost,
         mass_cost_scale=mass_cost_scale,
+        damage_cost_scale=damage_cost_scale,
+        damage_thickness_exponent=damage_thickness_exponent,
+        thickness_ref=thickness_ref,
     )
     cost_map.update_from_ice_field(
         positions=centroids,
         polygons=local_polygons,
         masses=masses,
         angles=None,
+        thicknesses=thicknesses,
     )
 
     bounds = {
