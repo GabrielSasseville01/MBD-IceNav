@@ -111,7 +111,19 @@ uv run python examples/toy_planner_opening.py
 
 - **Output dir:** `outputs/toy_planner/`
 - **Generated:** `toy_planner_lattice_search.mp4`, `toy_planner_opening.mp4` (2D ship animation), `toy_planner_opening_costmap.mp4`, `toy_planner_hull_impact.png`.
-- Options: `--live` (real-time 2D window), `--damage-cost` (damage-aware costmap), `--no-lattice-search-movie`.
+- Options: `--live` (real-time 2D window), `--damage-cost` (damage-aware costmap), `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
+
+### 8. Toy planner: thin-ice corridor (thickness test)
+
+Dense ice band spanning the full width in y (ship must traverse). Most ice is 10 m thick; one horizontal strip at center y is 1 m. Tests whether the lattice planner prefers the thin-ice corridor when damage-aware cost is enabled.
+
+```bash
+uv run python examples/toy_planner_thin_corridor.py
+```
+
+- **Output dir:** `outputs/toy_planner_thin_corridor/`
+- **Generated:** `toy_thin_corridor_lattice_search.mp4`, `toy_thin_corridor.mp4`, `toy_thin_corridor_3d.mp4`, `toy_thin_corridor_costmap.mp4`, `toy_thin_corridor_hull_impact.png`.
+- Options: `--live`, `--no-damage-cost` (baseline: no thickness preference), `--damage-cost-scale SCALE`, `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
 
 ---
 

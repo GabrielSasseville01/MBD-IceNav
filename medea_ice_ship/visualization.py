@@ -15,6 +15,7 @@ from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib import colors as mpl_colors
+from matplotlib.colors import LogNorm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from medea_ice_ship.geometry import (
@@ -300,15 +301,20 @@ def animate_lattice_search(
     ax.set_xlim(ox, ox + w)
     ax.set_ylim(oy, oy + h)
 
-    # Static: costmap background
+    # Static: costmap background (log scale so open water, thin ice, thick ice are all visible)
+    grid_max = float(np.nanmax(grid))
+    grid_min = float(np.nanmin(grid[grid > 0])) if np.any(grid > 0) else 1.0
+    vmin = max(0.5, grid_min * 0.5)
+    vmax = max(2.0, grid_max)
+    # Avoid 0 for LogNorm (would be -inf)
+    grid_display = np.where(grid > 0, grid, vmin)
     im = ax.imshow(
-        grid,
+        grid_display,
         extent=[ox, ox + w, oy, oy + h],
         origin="lower",
         cmap="viridis",
         alpha=0.85,
-        vmin=0,
-        vmax=max(1.0, float(np.nanmax(grid))),
+        norm=LogNorm(vmin=vmin, vmax=vmax),
     )
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
