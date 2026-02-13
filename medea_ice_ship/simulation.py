@@ -10,6 +10,7 @@ from medea_ice_ship.geometry import (
     point_inside_polygon_penetration,
 )
 from medea_ice_ship.bonds import find_connected_components
+from medea_ice_ship.bond_fracture import update_bond_damage_state
 from medea_ice_ship.config import SimulationConfig, get_default_simulation_config
 from medea_ice_ship.vessel_dynamics import get_mss_style_3dof, coriolis_3dof
 
@@ -114,12 +115,31 @@ def simulate_ice_ship_interaction(
     rest_lengths = np.array([np.linalg.norm(centroids[i] - centroids[j]) for i, j in bonds])
 
     bond_strengths = np.zeros(len(bonds))
+    bond_areas = np.zeros(len(bonds))
     bond_i = np.array([b[0] for b in bonds])
     bond_j = np.array([b[1] for b in bonds])
     for b, (i, j) in enumerate(bonds):
         h = min(thicknesses[i], thicknesses[j])
         w = min((radii[i] + radii[j]) / 2, cfg.max_bond_width)
         bond_strengths[b] = IceProperties.breaking_force(h, w)
+        bond_areas[b] = w * h
+
+    use_dpdem_bonds = getattr(cfg, "use_dpdem_style_bonds", True)
+    if use_dpdem_bonds and len(bonds) > 0:
+        bond_damage = np.zeros(len(bonds))
+        bond_delta_m_0 = np.zeros(len(bonds))
+        bond_delta_m_max = np.zeros(len(bonds))
+        bond_delta_s = np.zeros(len(bonds))
+        nu = getattr(cfg, "poisson_ratio", 0.3)
+        E = IceProperties.YOUNGS_MODULUS
+        prefactor = E * (1.0 - nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
+        k_n = prefactor
+        k_s = prefactor * (1.0 - 2.0 * nu) / (2.0 * (1.0 - nu))
+        sigma_bar_bond = np.maximum(bond_strengths / np.maximum(bond_areas, 1e-10), 1e6)
+        print("  DPDEM-style bond fracture enabled (hybrid criterion, damage, Mohr-Coulomb)", flush=True)
+    else:
+        bond_damage = bond_delta_m_0 = bond_delta_m_max = bond_delta_s = None
+        k_n = k_s = sigma_bar_bond = None
 
     if len(bonds) > 0:
         print(f"  Bond strengths: {bond_strengths.min()/1e6:.2f} - {bond_strengths.max()/1e6:.2f} MN", flush=True)
@@ -436,10 +456,12 @@ def simulate_ice_ship_interaction(
         positions = new_positions
 
         element_stress = ship_collision_force.copy()
-        # Bond stress accumulation (vectorized).
+        # Bond stress accumulation and breaking (vectorized).
         intact = bond_intact
         d_bond = positions[bond_j] - positions[bond_i]
         dist_bond = np.linalg.norm(d_bond, axis=1)
+        dist_bond_safe = np.maximum(dist_bond, 1e-10)
+        bond_dir = d_bond / dist_bond_safe[:, np.newaxis]
         stretch_bond = np.abs(dist_bond - rest_lengths)
         avg_thickness_bond = (thicknesses[bond_i] + thicknesses[bond_j]) * 0.5
         stiffness_bond = IceProperties.YOUNGS_MODULUS * avg_thickness_bond * cfg.bond_stiffness_factor
@@ -453,23 +475,53 @@ def simulate_ice_ship_interaction(
             np.add.at(new_stress, bond_j, np.where(transfer_i_to_j, element_stress[bond_i] * cfg.stress_transfer, 0))
             np.add.at(new_stress, bond_i, np.where(transfer_j_to_i, element_stress[bond_j] * cfg.stress_transfer, 0))
             element_stress = new_stress
-        # Bond breaking (vectorized condition evaluation).
-        bond_force = stiffness_bond * stretch_bond + np.maximum(element_stress[bond_i], element_stress[bond_j]) * cfg.propagated_stress_factor
-        propagated_stress_bond = np.maximum(element_stress[bond_i], element_stress[bond_j])
-        collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
-        collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
-        effective_strength = np.where(
-            collision_on_bond,
-            bond_strengths * cfg.effective_strength_collision,
-            np.where(
-                propagated_stress_bond > bond_strengths * cfg.effective_strength_stress_threshold,
-                bond_strengths * cfg.effective_strength_stress,
-                bond_strengths,
-            ),
-        )
-        break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
-        break_force = intact & (bond_force > effective_strength)
-        bond_intact[break_collision | break_force] = False
+
+        if use_dpdem_bonds and len(bonds) > 0:
+            # Accumulate shear displacement from relative tangential velocity
+            v_rel = velocities[bond_j] - velocities[bond_i]
+            v_n = np.sum(v_rel * bond_dir, axis=1)
+            v_t_vec = v_rel - v_n[:, np.newaxis] * bond_dir
+            bond_delta_s[:] = bond_delta_s + np.linalg.norm(v_t_vec, axis=1) * dt
+            # Normal and shear deformation
+            delta_n = dist_bond - rest_lengths
+            delta_s = bond_delta_s
+            L0 = np.maximum(rest_lengths, 1e-10)
+            # Stress from strain with damage softening (Pa)
+            sigma_n_elastic = k_n * (delta_n / L0)
+            sigma_t_elastic = k_s * (delta_s / L0)
+            sigma_n = sigma_n_elastic * (1.0 - bond_damage)
+            sigma_t = sigma_t_elastic * (1.0 - bond_damage)
+            bond_damage[:], bond_delta_m_max[:], bond_delta_m_0[:], new_intact = update_bond_damage_state(
+                delta_n, delta_s, sigma_n, sigma_t, sigma_bar_bond,
+                cfg.bond_cohesion, cfg.bond_internal_friction,
+                cfg.bond_G_c_I, cfg.bond_G_c_II, cfg.bond_eta_bk,
+                bond_damage, bond_delta_m_max, bond_delta_m_0, intact,
+            )
+            bond_intact[:] = new_intact
+            # Ship collision can still break bonds
+            collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+            collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
+            effective_strength = bond_strengths * cfg.effective_strength_collision
+            break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
+            bond_intact[break_collision] = False
+        else:
+            # Legacy breaking: force vs effective strength
+            bond_force = stiffness_bond * stretch_bond + np.maximum(element_stress[bond_i], element_stress[bond_j]) * cfg.propagated_stress_factor
+            propagated_stress_bond = np.maximum(element_stress[bond_i], element_stress[bond_j])
+            collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+            collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
+            effective_strength = np.where(
+                collision_on_bond,
+                bond_strengths * cfg.effective_strength_collision,
+                np.where(
+                    propagated_stress_bond > bond_strengths * cfg.effective_strength_stress_threshold,
+                    bond_strengths * cfg.effective_strength_stress,
+                    bond_strengths,
+                ),
+            )
+            break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
+            break_force = intact & (bond_force > effective_strength)
+            bond_intact[break_collision | break_force] = False
 
         angular_vels += np.random.randn(n) * cfg.angular_noise
         angular_vels *= cfg.angular_damping
@@ -549,6 +601,7 @@ def simulate_ice_ship_interaction(
                 ship_heading,
             )
 
+    dpdem_bond_stats = None
     if collision_count > 0:
         print(f"  Total collisions: {collision_count}", flush=True)
         bonded_elements = set()
@@ -562,6 +615,26 @@ def simulate_ice_ship_interaction(
     else:
         print("  WARNING: No collisions detected!", flush=True)
 
+    if use_dpdem_bonds:
+        if len(bonds) > 0:
+            n_damaged = (bond_damage > 0.01).sum()
+            n_failed_by_damage = (bond_damage >= 1.0).sum()
+            dpdem_bond_stats = {
+                'n_damaged': int(n_damaged),
+                'n_bonds': len(bonds),
+                'mean_damage': float(bond_damage.mean()),
+                'max_damage': float(bond_damage.max()),
+                'n_failed_by_damage': int(n_failed_by_damage),
+            }
+            print(
+                f"  DPDEM bond stats: bonds with damage>0.01: {n_damaged}/{len(bonds)}, "
+                f"mean damage: {bond_damage.mean():.4f}, max: {bond_damage.max():.4f}, "
+                f"failed by damage (D>=1): {n_failed_by_damage}",
+                flush=True,
+            )
+        else:
+            print("  DPDEM bond stats: (no bonds)", flush=True)
+
     damage_summary = {'impulse_total': J_cumul} if use_ship_dynamics else None
     if damage_summary is not None:
         if hull_impulse_segments:
@@ -574,6 +647,8 @@ def simulate_ice_ship_interaction(
             damage_summary['commanded_trajectory'] = commanded_trajectory
     elif kinematic_ship and commanded_trajectory:
         damage_summary = {'commanded_trajectory': commanded_trajectory}
+    if damage_summary is not None and dpdem_bond_stats is not None:
+        damage_summary['dpdem_bond_stats'] = dpdem_bond_stats
 
     if return_ship_diagnostics:
         if ship_diagnostics is not None and damage_summary is not None:

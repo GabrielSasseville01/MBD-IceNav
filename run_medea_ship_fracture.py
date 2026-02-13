@@ -70,6 +70,8 @@ def main():
                         help='Use simple diagonal M/D instead of MSS-style 3-DOF (Fossen added mass + damping)')
     parser.add_argument('--kinematic-ship', action='store_true',
                         help='With --plan: place ship exactly on planned path each frame (no dynamics). Use to verify plan vs actual.')
+    parser.add_argument('--no-dpdem-bonds', action='store_true',
+                        help='Use legacy bond model (force vs strength) instead of default DPDEM-style (hybrid criterion, damage, Mohr-Coulomb)')
     parser.add_argument('--output-dir', type=str, default='outputs/default',
                         help='Output directory for movies and plots (default: outputs/default)')
     args = parser.parse_args()
@@ -389,6 +391,9 @@ def main():
         from dataclasses import replace
         sim_cfg = replace(sim_cfg, max_ship_ice_force=args.thrust_cap)
         print(f"  Thrust cap: {args.thrust_cap/1e6:.1f} MN", flush=True)
+    if args.no_dpdem_bonds:
+        sim_cfg = replace_config(sim_cfg, use_dpdem_style_bonds=False)
+        print("  Bond model: legacy (force vs strength)", flush=True)
     frame_callback = None
     if args.live:
         local_polys_live = [np.asarray(p) - polygon_centroid(p) for p in polygons]
@@ -427,6 +432,13 @@ def main():
     if damage_summary is not None:
         J = damage_summary.get('impulse_total', 0.0)
         print(f"  Ship damage proxy (cumulative impulse): {J/1e6:.2f} MN·s", flush=True)
+        dps = damage_summary.get("dpdem_bond_stats")
+        if dps is not None:
+            print(
+                f"  DPDEM bond stats: damage>0.01: {dps['n_damaged']}/{dps['n_bonds']}, "
+                f"mean: {dps['mean_damage']:.4f}, max: {dps['max_damage']:.4f}, failed by D>=1: {dps['n_failed_by_damage']}",
+                flush=True,
+            )
         segs = damage_summary.get("hull_impulse_segments")
         contacts = damage_summary.get("hull_impulse_contacts")
         if contacts or segs:

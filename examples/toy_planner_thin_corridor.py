@@ -17,6 +17,7 @@ Run:
   uv run python examples/toy_planner_thin_corridor.py --live
   uv run python examples/toy_planner_thin_corridor.py --no-damage-cost   # baseline: no thickness preference
   uv run python examples/toy_planner_thin_corridor.py --no-replan        # single initial path (no receding horizon)
+  uv run python examples/toy_planner_thin_corridor.py --no-dpdem-bonds  # legacy bond model (force vs strength)
 
 Output (default: outputs/toy_planner_thin_corridor/):
   - toy_thin_corridor_lattice_search.mp4
@@ -152,6 +153,11 @@ def main():
         "--no-replan",
         action="store_true",
         help="Disable receding-horizon replanning (use single initial path for whole run)",
+    )
+    parser.add_argument(
+        "--no-dpdem-bonds",
+        action="store_true",
+        help="Use legacy bond model (force vs strength) instead of default DPDEM-style",
     )
     args = parser.parse_args()
     out_dir = Path(args.output_dir)
@@ -324,6 +330,9 @@ def main():
         print("Live 2D view enabled.", flush=True)
     print("Running fracture simulation...", flush=True)
     sim_cfg = get_default_simulation_config()
+    if args.no_dpdem_bonds:
+        sim_cfg = replace(sim_cfg, use_dpdem_style_bonds=False)
+        print("  Bond model: legacy (force vs strength)", flush=True)
     sim_result = simulate_ice_ship_interaction(
         polygons=polygons,
         centroids=centroids.copy(),
@@ -348,6 +357,13 @@ def main():
     print("Simulation done.")
     if damage_summary is not None:
         print(f"  Ship damage proxy (cumulative impulse): {damage_summary.get('impulse_total', 0)/1e6:.2f} MN·s", flush=True)
+        dps = damage_summary.get("dpdem_bond_stats")
+        if dps is not None:
+            print(
+                f"  DPDEM bond stats: damage>0.01: {dps['n_damaged']}/{dps['n_bonds']}, "
+                f"mean: {dps['mean_damage']:.4f}, max: {dps['max_damage']:.4f}, failed by D>=1: {dps['n_failed_by_damage']}",
+                flush=True,
+            )
         segs = damage_summary.get("hull_impulse_segments")
         contacts = damage_summary.get("hull_impulse_contacts")
         if contacts or segs:

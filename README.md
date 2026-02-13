@@ -152,6 +152,7 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--planner diffusion-mpc` | Use lattice A* then model-based diffusion. |
 | `--kinematic-ship` | With `--plan`: ship follows path exactly (no dynamics). |
 | `--thick-ice M` | Override ice thickness to M metres. |
+| `--no-dpdem-bonds` | Use legacy bond model (force vs strength) instead of default DPDEM-style (hybrid criterion, damage, Mohr-Coulomb). |
 | `--quick` | Simulation only, no animations. |
 | `--no-3d` | Skip 3D animation. |
 | `--no-lattice-search-movie` | With `--plan --planner lattice`: skip A* search movie. |
@@ -162,7 +163,7 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--save-state FILE` | Save simulation state to pickle for replay. |
 | `--load-state FILE` | Replay: load state and generate animations only. |
 
-Optional tuning: `--thrust-cap N`, `--no-thrust-cap`, `--no-mss-dynamics`, `--optimize-path` (NLP path refinement; requires CasADi).
+Optional tuning: `--thrust-cap N`, `--no-thrust-cap`, `--no-mss-dynamics`, `--no-dpdem-bonds` (legacy bonds), `--optimize-path` (NLP path refinement; requires CasADi).
 
 ---
 
@@ -207,7 +208,7 @@ uv run python examples/visualize_planned_path.py # Plan and plot path on costmap
 ## Features
 
 - **Voronoi ice elements:** Irregular polygon shapes (paper Fig. 2); MEDEA floes tessellated for fracture.
-- **Bond mechanics:** Adjacent elements bonded; fracture under stress (mixed-mode, paper Eqs. 14–19).
+- **Bond mechanics:** Adjacent elements bonded; fracture under stress. **Default: DPDEM-style** (hybrid criterion (⟨σ⟩/σ̄)²+(τ/τ̄)², Mohr–Coulomb shear strength, damage variable D, Benzeggagh–Kenane Gc, paper Eqs. 14–19). Use `--no-dpdem-bonds` (run script or toy examples) or `SimulationConfig(use_dpdem_style_bonds=False)` for the legacy force-vs-strength model.
 - **Contact:** Hertz–Mindlin–style contact; in the MEDEA script, simplified repulsion and ship collision.
 - **3D visualization:** Ice z-offset and tilt from ship-relative position; tapered 3D hull.
 - **Ship dynamics:** Optional 3-DOF (Fossen-style M, D, Coriolis) with PD tracking; or kinematic mode for path verification.

@@ -88,6 +88,21 @@ class SimulationConfig:
     # Bond stiffness = youngs_modulus × avg_thickness × this factor.
     bond_stiffness_factor: float = 0.001
 
+    # --- DPDEM-style bond fracture (hybrid criterion, damage, Mohr–Coulomb) ---
+    # If True, use hybrid failure (⟨σ⟩/σ̄)²+(τ/τ̄)²≥1, damage variable D, stiffness softening. Default True; set False for legacy force-vs-strength bonds.
+    use_dpdem_style_bonds: bool = True
+    # Poisson ratio for bond stiffness split (k_n, k_s). Used when use_dpdem_style_bonds.
+    poisson_ratio: float = 0.3
+    # Pa — Mohr–Coulomb cohesion C (shear strength intercept).
+    bond_cohesion: float = 1.8e6
+    # Internal friction coefficient μ_b (shear strength τ̄ = C - μ_b·σ).
+    bond_internal_friction: float = 0.7
+    # J/m² — Mode I and Mode II critical fracture energies (Benzeggagh–Kenane).
+    bond_G_c_I: float = 12.0
+    bond_G_c_II: float = 12.0
+    # Benzeggagh–Kenane exponent η (1.75 for brittle materials).
+    bond_eta_bk: float = 1.75
+
     # --- Ice–ice contact ---
     # Coefficient of friction μ between ice elements.
     ice_ice_friction: float = 0.1
