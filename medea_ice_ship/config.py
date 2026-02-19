@@ -49,6 +49,10 @@ class SimulationConfig:
     # --- Time ---
     # s — fixed time step for integration.
     dt: float = 0.05
+    # If True, cap dt at Rayleigh-based stability limit (Eq. 11). Otherwise dt is unchanged (advisory only).
+    use_rayleigh_dt_cap: bool = False
+    # Safety factor b in Eq. 11 (e.g. 0.1 = 10% of theoretical max).
+    rayleigh_safety_factor: float = 0.1
 
     # --- Collision (ice–ship) ---
     # m — reference penetration depth at which normal force reaches F_break (at pen_crit_thickness_ref).
@@ -87,6 +91,10 @@ class SimulationConfig:
     max_bond_width: float = 4.0
     # Bond stiffness = youngs_modulus × avg_thickness × this factor.
     bond_stiffness_factor: float = 0.001
+    # If True, add bond forces Fb to equations of motion and integrate per-particle (Eq. 7). If False, rigid-body component motion (legacy).
+    use_bond_forces_in_dynamics: bool = True
+    # If True, use Verlet-style position update: x_new = x + v*dt + 0.5*a*dt^2 (then v_new = v + a*dt). Full velocity Verlet would require a second force evaluation.
+    use_verlet_position_update: bool = True
 
     # --- DPDEM-style bond fracture (hybrid criterion, damage, Mohr–Coulomb) ---
     # If True, use hybrid failure (⟨σ⟩/σ̄)²+(τ/τ̄)²≥1, damage variable D, stiffness softening. Default True; set False for legacy force-vs-strength bonds.
@@ -124,6 +132,8 @@ class SimulationConfig:
     drag_ref_thickness: float = 1.0
     # Linear drag term at low speed for numerical stability.
     linear_drag_factor: float = 0.1
+    # Rotational drag (Eq. 10): Md = 0.5·CMd·ρw·r³eff·ω·|ω|·Asub. Coefficient for moment [-].
+    drag_coefficient_moment: float = 0.4
 
     # --- Ice velocity clamp ---
     # (v_min, v_max) in m/s — ice element velocity clamped to this range (x and y).

@@ -305,6 +305,7 @@ def main():
         replan_every_n_frames=replan_every_n_frames,
         replan_callback=replan_callback,
         frame_callback=frame_callback,
+        parent_ids=parent_floe_ids,
     )
     positions_history = sim_result[0]
     rotations_history = sim_result[1]

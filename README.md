@@ -10,6 +10,48 @@ The main entry point is **MEDEA ship–ice fracture**: satellite-derived ice flo
 
 ---
 
+## Physics and equations of motion
+
+The simulation implements the equations of motion from the DPDEM papers (Liu et al. 2021; Wang et al. 2024). All physics are active by default.
+
+### Translational motion (Eq. 7)
+
+**m · du/dt = Fc + Fb + Fh + G**
+
+Each ice element is driven by four force categories:
+
+- **Fc** — contact forces from ship collision (penetration-based, with thrust cap) and ice-ice interaction (Hertz-like repulsion with Coulomb friction).
+- **Fb** — bond forces between bonded neighbours. Spring stiffness scales with ice thickness and Young's modulus; for DPDEM bonds the force is softened by the damage variable: `F = k · Δ · (1 − D)`.
+- **Fh** — hydrodynamic forces: buoyancy (`Ff = ρ_w · g · A · z_sub`) when pushed underwater by the ship, and quadratic drag (`Fd = 0.5 · C_Fd · ρ_w · A · v · |v|`, Eq. 9).
+- **G** — gravity, handled implicitly (2D horizontal plane; vertical buoyancy restores ice to the surface).
+
+Integration uses the Verlet algorithm (leapfrog/symplectic Euler form: `v += a·dt`, `x += v·dt`). Bonded components share a single centre-of-mass velocity (rigid-body component integration) for stability, while solo elements integrate independently.
+
+### Rotational motion (Eq. 8)
+
+**I · dω/dt = Mc + Mb + Mh**
+
+Torques from contact forces (`r × Fc`), bond forces (`r × Fb`), buoyancy moment (`rf × Ff`, Eq. 10), and rotational drag (`Md = 0.5 · C_Md · ρ_w · r³_eff · ω · |ω| · A_sub`, Eq. 10). The simulation is 2D, so scalar angular velocity and rotation angle are used (quaternions are unnecessary without out-of-plane rotation).
+
+### Rayleigh time step (Eq. 11)
+
+**Δt = b · πr / (0.163ν + 0.877) · √(ρ/G)**
+
+Computed at startup based on the smallest element radius, ice density, and shear modulus `G = E / (2(1+ν))`. Printed as an advisory reference; the rigid-body component integration does not require the Rayleigh cap for stability.
+
+### DPDEM bond fracture (Eqs. 14–19)
+
+Enabled by default (`use_dpdem_style_bonds = True`). Bonds accumulate damage through a hybrid failure criterion combining tensile and shear stress:
+
+- **Hybrid criterion:** `(⟨σ_n⟩/σ̄)² + (σ_t/τ̄)² ≥ 1` with Mohr–Coulomb shear strength `τ̄ = C + σ_n · tan(φ)`.
+- **Damage variable D:** Evolves from 0 → 1 based on Benzeggagh–Kenane mixed-mode fracture energy (G_c_I, G_c_II, η_BK).
+- **Spatial locality:** Damage only accumulates at the crack front — bonds adjacent to the ship contact or to already-broken bonds.
+- **Per-floe eligibility:** DPDEM damage is only enabled for floes where the ship's thrust-capped collision force exceeds the bond strength threshold (prevents thick ice from breaking unrealistically).
+
+Use `--no-dpdem-bonds` to fall back to the legacy force-vs-strength model.
+
+---
+
 ## Quick start
 
 ```bash
@@ -207,11 +249,51 @@ uv run python examples/visualize_planned_path.py # Plan and plot path on costmap
 
 ## Features
 
+- **Paper-accurate physics:** Full equations of motion (Eqs. 7–11) from the DPDEM papers — translational and rotational dynamics, quadratic hydrodynamic drag, buoyancy moments, rotational drag, Rayleigh time step. Active by default; no flags needed.
+- **DPDEM bond fracture (default):** Hybrid criterion (⟨σ⟩/σ̄)²+(τ/τ̄)², Mohr–Coulomb shear strength, damage variable D, Benzeggagh–Kenane mixed-mode fracture energy (Eqs. 14–19). Spatially-local crack propagation. Use `--no-dpdem-bonds` for the legacy force-vs-strength model.
 - **Voronoi ice elements:** Irregular polygon shapes (paper Fig. 2); MEDEA floes tessellated for fracture.
-- **Bond mechanics:** Adjacent elements bonded; fracture under stress. **Default: DPDEM-style** (hybrid criterion (⟨σ⟩/σ̄)²+(τ/τ̄)², Mohr–Coulomb shear strength, damage variable D, Benzeggagh–Kenane Gc, paper Eqs. 14–19). Use `--no-dpdem-bonds` (run script or toy examples) or `SimulationConfig(use_dpdem_style_bonds=False)` for the legacy force-vs-strength model.
-- **Contact:** Hertz–Mindlin–style contact; in the MEDEA script, simplified repulsion and ship collision.
+- **Contact:** Hertz-like normal repulsion with Coulomb friction for ice-ice contact; penetration-based ship collision with thrust cap.
 - **3D visualization:** Ice z-offset and tilt from ship-relative position; tapered 3D hull.
 - **Ship dynamics:** Optional 3-DOF (Fossen-style M, D, Coriolis) with PD tracking; or kinematic mode for path verification.
+
+---
+
+## Test suite
+
+Run all tests from the project root. Each generates 2D/3D animations and diagnostic output confirming the DPDEM physics are active.
+
+```bash
+# 1. Simple physics (DPDEM fracture, 3 floes, dynamic ship)
+uv run python run_medea_ship_fracture.py --simple --output-dir outputs/simple_physics
+
+# 2. Thick ice (10 m — ship cannot break, 0 bonds broken)
+uv run python run_medea_ship_fracture.py --simple --thick-ice 10 --output-dir outputs/simple_physics_thick
+
+# 3. Kinematic ship (straight path, no dynamics)
+uv run python run_medea_ship_fracture.py --simple --kinematic-ship --output-dir outputs/simple_straight
+
+# 4. Lattice planner (A* plans path around ice)
+uv run python run_medea_ship_fracture.py --simple --plan --output-dir outputs/simple_lattice
+
+# 5. Toy planner: wall with opening
+uv run python examples/toy_planner_opening.py --output-dir outputs/toy_planner
+
+# 6. Toy thin corridor (damage-aware planner routes through thin ice)
+uv run python examples/toy_planner_thin_corridor.py --output-dir outputs/toy_thin
+```
+
+Expected results:
+
+| Test | Bonds broken | Key behaviour |
+|------|-------------|---------------|
+| Simple physics | ~84% (49/58) | Progressive DPDEM fracture on ship contact |
+| Thick ice (10 m) | 0% (0/58) | Ship cannot break thick ice (force gating) |
+| Kinematic ship | ~91% (53/58) | More fracture (ship plows through at constant speed) |
+| Lattice planner | 0% (0/58) | Planner avoids all ice (no collisions) |
+| Toy opening | ~10% (49/512) | Ship navigates through gap, minor edge contact |
+| Toy thin corridor | ~20% (233/1164) | Planner routes through thin ice; thick ice unbroken |
+
+All tests print `DPDEM-style bond fracture enabled (hybrid criterion, damage, Mohr-Coulomb)` confirming the paper physics are active.
 
 ---
 

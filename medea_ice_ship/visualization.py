@@ -451,26 +451,43 @@ def _draw_3d_frame_to_array(data, frame_idx):
     frame = data["frames_to_render"][frame_idx]
     n_elements = data["n_elements"]
     ship_pos, ship_psi = data["ship_history"][min(frame, len(data["ship_history"]) - 1)]
-    ship_x, ship_y = ship_pos[0], ship_pos[1]
-    positions = data["positions_history"][frame]
-    rotations = data["rotations_history"][frame]
+    ship_x, ship_y = float(ship_pos[0]), float(ship_pos[1])
+    if not np.isfinite(ship_x):
+        ship_x = 0.0
+    if not np.isfinite(ship_y):
+        ship_y = 0.0
+    positions = np.asarray(data["positions_history"][frame], dtype=float)
+    rotations = np.asarray(data["rotations_history"][frame], dtype=float)
     intact = data["bonds_history"][frame]
-    z_pos = data["z_positions"][frame]
-    tilt_x = data["tilts_x"][frame]
-    tilt_y = data["tilts_y"][frame]
+    z_pos = np.asarray(data["z_positions"][frame], dtype=float)
+    tilt_x = np.asarray(data["tilts_x"][frame], dtype=float)
+    tilt_y = np.asarray(data["tilts_y"][frame], dtype=float)
+    # Sanitize so 3D projection never gets degenerate (avoids LinAlgError: Singular matrix)
+    x_center = 0.5 * (data["x_min"] + data["x_max"])
+    y_center = 0.5 * (data["y_min"] + data["y_max"])
+    bad_pos = ~np.isfinite(positions)
+    positions = np.where(bad_pos, np.array([x_center, y_center]), positions)
+    bad_rot = ~np.isfinite(rotations)
+    rotations = np.where(bad_rot, 0.0, rotations)
+    z_pos = np.where(np.isfinite(z_pos), z_pos, 0.0)
+    tilt_x = np.where(np.isfinite(tilt_x), tilt_x, 0.0)
+    tilt_y = np.where(np.isfinite(tilt_y), tilt_y, 0.0)
     bonds = data["bonds"]
     thicknesses = data["thicknesses"]
     local_polys = data["local_polys"]
     ship_draft = data["ship_draft"]
     ship_length = data["ship_length"]
     ship_beam = data["ship_beam"]
+    dw = max(float(data["domain_width"]), 1.0)
+    dh = max(float(data["domain_height"]), 1.0)
+    z_span = max((ship_draft + 8) * 2, 1.0)
 
     fig = plt.figure(figsize=data["figsize"], dpi=data["dpi"])
     ax = fig.add_subplot(111, projection="3d")
     ax.set_xlim(data["x_min"], data["x_max"])
     ax.set_ylim(data["y_min"], data["y_max"])
     ax.set_zlim(-ship_draft - 3, 5)
-    ax.set_box_aspect([data["domain_width"], data["domain_height"], (ship_draft + 8) * 2])
+    ax.set_box_aspect([dw, dh, z_span])
     ax.view_init(elev=data["view_elev"], azim=data["view_azim_start"] + frame * data["view_azim_per_frame"])
 
     def rotate_poly(poly, angle):
@@ -550,9 +567,15 @@ def _draw_3d_frame_to_array(data, frame_idx):
     if data["color_by_submergence"]:
         title += "\nBlue = submerged | Light = at surface"
     ax.set_title(title)
-    fig.canvas.draw()
-    buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
-    plt.close(fig)
+    try:
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    except np.linalg.LinAlgError:
+        # Degenerate 3D view (e.g. NaN/inf in data); return a gray frame so video completes
+        w, h = int(data["figsize"][0] * data["dpi"]), int(data["figsize"][1] * data["dpi"])
+        buf = np.full((h, w, 3), 128, dtype=np.uint8)
+    finally:
+        plt.close(fig)
     return buf
 
 
@@ -1124,10 +1147,22 @@ def animate_ice_ship_3d(
     n_elements = len(polygons)
     local_polys = [poly - polygon_centroid(poly) for poly in polygons]
     all_pos = np.concatenate(positions_history)
-    x_min, x_max = float(all_pos[:, 0].min() - 50), float(all_pos[:, 0].max() + 50)
-    y_min, y_max = float(all_pos[:, 1].min() - 50), float(all_pos[:, 1].max() + 50)
-    domain_width = x_max - x_min
-    domain_height = y_max - y_min
+    x_min_raw = np.nanmin(all_pos[:, 0])
+    x_max_raw = np.nanmax(all_pos[:, 0])
+    y_min_raw = np.nanmin(all_pos[:, 1])
+    y_max_raw = np.nanmax(all_pos[:, 1])
+    if not np.isfinite(x_min_raw):
+        x_min_raw, x_max_raw = 0.0, 100.0
+    if not np.isfinite(y_min_raw):
+        y_min_raw, y_max_raw = 0.0, 100.0
+    x_min, x_max = float(x_min_raw - 50), float(x_max_raw + 50)
+    y_min, y_max = float(y_min_raw - 50), float(y_max_raw + 50)
+    if x_max <= x_min:
+        x_min, x_max = x_min - 50, x_min + 50
+    if y_max <= y_min:
+        y_min, y_max = y_min - 50, y_min + 50
+    domain_width = max(x_max - x_min, 1.0)
+    domain_height = max(y_max - y_min, 1.0)
     print(f"  Computing 3D ice dynamics (bending, submerging)...", flush=True)
     z_positions, tilts_x, tilts_y = simulate_3d_ice_physics(
         positions_history, bonds_history, bonds, ship_history,

@@ -350,6 +350,7 @@ def main():
         replan_every_n_frames=replan_every_n_frames,
         replan_callback=replan_callback,
         frame_callback=frame_callback,
+        parent_ids=parent_floe_ids,
     )
     positions_history, rotations_history, bonds_history, ship_history = sim_result[0], sim_result[1], sim_result[2], sim_result[3]
     submergence_history = sim_result[4]

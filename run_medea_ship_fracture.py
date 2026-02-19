@@ -415,6 +415,7 @@ def main():
         replan_callback=replan_callback,
         frame_callback=frame_callback,
         kinematic_ship=args.kinematic_ship,
+        parent_ids=parent_floe_ids,
     )
     positions_history = sim_result[0]
     rotations_history = sim_result[1]
