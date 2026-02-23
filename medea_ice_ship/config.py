@@ -248,6 +248,9 @@ class RunConfig:
     planning_goal_tolerance: float = 150.0
     # Maximum number of A* node expansions before giving up (prevents runaway search).
     planning_max_iterations: int = 200000
+    # If True, use greedy best-first search (f = h) instead of weighted A*.
+    # Much faster (DFS-like depth-first toward goal) but paths may be suboptimal.
+    planning_greedy: bool = False
     # Receding horizon (AUTO-IceNav style): replan every this many simulation frames (e.g. 60 ≈ 3 s at 0.05 s dt).
     planning_replan_every_n_frames: int = 60
     # If True, refine A* path with NLP (path length + costmap integral + curvature); requires casadi.
@@ -260,9 +263,15 @@ class RunConfig:
     planning_optimizer_curvature_weight: float = 10.0
     # Path optimizer: max Ipopt iterations.
     planning_optimizer_max_iter: int = 500
-    # Damage-aware cost: if > 0, costmap includes thickness-based damage potential (safer paths).
+    # Damage-aware cost (legacy power-law model): if > 0, costmap includes thickness-based damage potential.
     planning_damage_cost_scale: float = 0.0
     planning_damage_thickness_exponent: float = 0.5
+    # Exponential thickness cost model: cost = collision_cost * exp(scale * h / h_ref).
+    # Gives thin ice (~0.5m) moderate cost (~60) and thick ice (~2.5m) near-impassable cost (~9000).
+    # Open water stays at base_cost (1.0). Set to 0 to disable and use legacy flat model.
+    planning_ice_cost_exp_scale: float = 3.0
+    # Base cost multiplier for ice cells (coefficient in front of the exponential).
+    planning_ice_collision_cost: float = 5.0
     # Diffusion MPC only (sampling-based): number of primitive steps per rollout.
     planning_diffusion_horizon_steps: int = 12
     # Diffusion MPC only: number of candidate rollouts to score (sampling) or samples per diffusion step (model-based).

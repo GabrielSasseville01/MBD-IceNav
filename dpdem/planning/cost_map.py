@@ -40,6 +40,7 @@ class CostMap:
         damage_cost_scale: float = 0.0,
         damage_thickness_exponent: float = 0.5,
         thickness_ref: float = 1.0,
+        ice_cost_exp_scale: float = 0.0,
     ):
         """
         Initialize cost map.
@@ -55,12 +56,19 @@ class CostMap:
             x_origin: World x of grid column 0 [m]
             y_origin: World y of grid row 0 [m]
             ship_mass: Ship mass for relative cost calculation [kg]
-            base_cost: Base traversal cost per cell
-            collision_cost: Cost for collision with ice
-            mass_cost_scale: Scaling factor for mass-based costs
-            damage_cost_scale: If > 0, add damage-potential cost per cell (mass * (thickness/thickness_ref)^exponent).
-            damage_thickness_exponent: Exponent for thickness in damage potential (thicker ice = higher cost).
-            thickness_ref: Reference thickness [m] for damage potential scaling.
+            base_cost: Base traversal cost per cell (open water)
+            collision_cost: Base cost multiplier for ice cells (used as the
+                coefficient in front of the exponential thickness model).
+            mass_cost_scale: Scaling factor for mass-based costs (legacy flat model)
+            damage_cost_scale: Legacy power-law damage cost (kept for backward compat).
+            damage_thickness_exponent: Legacy exponent for power-law damage cost.
+            thickness_ref: Reference thickness [m] for cost scaling.
+            ice_cost_exp_scale: Exponential growth rate for thickness-based cost.
+                When > 0 and thickness is provided, cell cost is:
+                  collision_cost * exp(ice_cost_exp_scale * thickness / thickness_ref)
+                This gives thin ice a moderate cost and thick ice an extremely
+                high cost while still keeping it technically traversable.
+                When 0, falls back to the legacy flat collision_cost model.
         """
         self.width = width
         self.height = height
@@ -74,6 +82,7 @@ class CostMap:
         self.damage_cost_scale = damage_cost_scale
         self.damage_thickness_exponent = damage_thickness_exponent
         self.thickness_ref = thickness_ref
+        self.ice_cost_exp_scale = ice_cost_exp_scale
 
         # Grid dimensions
         self.cols = int(np.ceil(width / resolution))
@@ -169,31 +178,25 @@ class CostMap:
         return abs(area) / 2.0
     
     def _rasterize_polygon(self, vertices: np.ndarray, mass: float, thickness: Optional[float] = None):
-        """Rasterize polygon to grid cells. Optionally add damage-potential cost when thickness and damage_cost_scale set."""
-        # Get bounding box
+        """Rasterize polygon to grid cells with thickness-dependent cost."""
         min_x, min_y = vertices.min(axis=0)
         max_x, max_y = vertices.max(axis=0)
 
         min_row, min_col = self.world_to_grid(min_x, min_y)
         max_row, max_col = self.world_to_grid(max_x, max_y)
 
-        # Clamp to grid bounds
         min_row = max(0, min_row)
         min_col = max(0, min_col)
         max_row = min(self.rows - 1, max_row)
         max_col = min(self.cols - 1, max_col)
 
-        # Cost based on mass (heavier ice = higher traversal cost)
-        relative_mass = mass / self.ship_mass
-        cell_cost = self.collision_cost * (1.0 + relative_mass * self.mass_cost_scale)
+        if self.ice_cost_exp_scale > 0 and thickness is not None and thickness > 0:
+            t_ratio = thickness / max(self.thickness_ref, 1e-6)
+            cell_cost = self.collision_cost * np.exp(self.ice_cost_exp_scale * t_ratio)
+        else:
+            relative_mass = mass / self.ship_mass
+            cell_cost = self.collision_cost * (1.0 + relative_mass * self.mass_cost_scale)
 
-        # Damage-potential cost: thicker/heavier ice increases expected ship damage (risk-aware planning)
-        if self.damage_cost_scale > 0 and thickness is not None and thickness > 0:
-            t_ratio = (thickness / self.thickness_ref) ** self.damage_thickness_exponent
-            damage_cost = self.damage_cost_scale * (mass / self.ship_mass) * t_ratio
-            cell_cost = max(cell_cost, damage_cost)
-
-        # Simple rasterization: check each cell in bounding box
         for row in range(min_row, max_row + 1):
             for col in range(min_col, max_col + 1):
                 x, y = self.grid_to_world(row, col)

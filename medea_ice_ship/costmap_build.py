@@ -25,18 +25,25 @@ def build_costmap_from_ice_state(
     margin: float = 20.0,
     ship_mass: float = 23e6,
     base_cost: float = 1.0,
-    collision_cost: float = 100.0,
+    collision_cost: float = 5.0,
     mass_cost_scale: float = 1e-5,
     damage_cost_scale: float = 0.0,
     damage_thickness_exponent: float = 0.5,
     thickness_ref: float = 1.0,
     ice_density: float = 920.0,
+    wall_bounds: Optional[Tuple[float, float, float, float]] = None,
+    ice_cost_exp_scale: float = 3.0,
 ) -> Tuple[CostMap, dict]:
     """
     Build a CostMap from MEDEA ice field state (polygons, centroids, thicknesses).
 
     Cell mass = area(polygon) × thickness × ice_density. The costmap covers the domain
     plus a margin on all sides so the planner can place start/goal just outside the ice.
+
+    Ice cell cost model (when ice_cost_exp_scale > 0):
+        cost = collision_cost * exp(ice_cost_exp_scale * thickness / thickness_ref)
+    This gives thin ice a moderate cost and thick ice an exponentially high
+    cost while keeping it technically traversable. Open water = base_cost.
 
     Args:
         polygons: List of N polygon vertex arrays in world coordinates (each Nx2).
@@ -47,18 +54,20 @@ def build_costmap_from_ice_state(
         margin: Extra margin around domain [m]; map covers [x_min-margin, x_max+margin] etc.
         ship_mass: Ship mass [kg] for relative cost (default 23 kt).
         base_cost: Base traversal cost per cell (open water).
-        collision_cost: Cost for cells containing ice.
-        mass_cost_scale: Scaling for mass-based cost (heavier ice = higher cost).
-        damage_cost_scale: If > 0, add damage-potential cost (thickness-aware) for safer path planning.
-        damage_thickness_exponent: Exponent for thickness in damage cost (default 0.5).
-        thickness_ref: Reference thickness [m] for damage scaling.
+        collision_cost: Base cost multiplier for ice (coefficient in exponential model).
+        mass_cost_scale: Legacy mass-based scaling (used when ice_cost_exp_scale=0).
+        damage_cost_scale: Legacy power-law damage cost.
+        damage_thickness_exponent: Legacy exponent for power-law damage cost.
+        thickness_ref: Reference thickness [m] for scaling.
         ice_density: Ice density [kg/m³] for mass computation.
+        wall_bounds: If set, (wx_min, wx_max, wy_min, wy_max) — cells outside these
+            world-coordinate bounds are filled with impassable cost.
+        ice_cost_exp_scale: Exponential growth rate for thickness-based cost.
+            At thickness_ref, cost = collision_cost * exp(ice_cost_exp_scale).
 
     Returns:
-        cost_map: DPDEM CostMap with origin (x_min - margin, y_min - margin) and
-            size (domain_width + 2*margin) × (domain_height + 2*margin).
-        bounds: Dict with keys x_min, x_max, y_min, y_max, x_origin, y_origin, width, height
-            (all in world units) so planner and trajectory conversion use the same frame.
+        cost_map: DPDEM CostMap.
+        bounds: Dict with domain bounds and costmap metadata.
     """
     n = len(polygons)
     assert n == len(centroids) == len(thicknesses), "polygons, centroids, thicknesses length mismatch"
@@ -66,7 +75,6 @@ def build_costmap_from_ice_state(
     areas = np.array([polygon_area(p) for p in polygons])
     masses = areas * thicknesses * ice_density
 
-    # CostMap expects polygons in local coordinates (centroid at origin); it applies rotation and translation.
     local_polygons = [np.asarray(p, dtype=float) - np.asarray(c, dtype=float) for p, c in zip(polygons, centroids)]
 
     domain_width = x_max - x_min
@@ -89,6 +97,7 @@ def build_costmap_from_ice_state(
         damage_cost_scale=damage_cost_scale,
         damage_thickness_exponent=damage_thickness_exponent,
         thickness_ref=thickness_ref,
+        ice_cost_exp_scale=ice_cost_exp_scale,
     )
     cost_map.update_from_ice_field(
         positions=centroids,
@@ -97,6 +106,17 @@ def build_costmap_from_ice_state(
         angles=None,
         thicknesses=thicknesses,
     )
+
+    if wall_bounds is not None:
+        wx_min, wx_max, wy_min, wy_max = wall_bounds
+        WALL_COST = 1e7
+        nrows, ncols = cost_map.rows, cost_map.cols
+        col_x = x_origin + (np.arange(ncols) + 0.5) * resolution
+        row_y = y_origin + (np.arange(nrows) + 0.5) * resolution
+        outside_x = (col_x < wx_min) | (col_x > wx_max)
+        outside_y = (row_y < wy_min) | (row_y > wy_max)
+        cost_map.cost_map[outside_y, :] = WALL_COST
+        cost_map.cost_map[:, outside_x] = WALL_COST
 
     bounds = {
         "x_min": x_min,

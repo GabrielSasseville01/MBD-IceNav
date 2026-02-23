@@ -36,6 +36,7 @@ def create_medea_lattice_planner(
     start: Tuple[float, float, float],
     goal: Tuple[float, float],
     run_cfg: RunConfig,
+    goal_y_line: Optional[float] = None,
 ) -> LatticePlanner:
     """
     Create a DPDEM LatticePlanner configured for the MEDEA costmap.
@@ -52,6 +53,7 @@ def create_medea_lattice_planner(
         start: Ship start pose (x, y, heading) in world coordinates [m, m, rad].
         goal: Ship goal position (x, y) in world coordinates [m, m].
         run_cfg: RunConfig providing ship size/mass and planning parameters.
+        goal_y_line: If set, goal is the horizontal line y = goal_y_line (any x).
 
     Returns:
         Configured LatticePlanner ready for planning (see Section 3).
@@ -59,28 +61,25 @@ def create_medea_lattice_planner(
     sx, sy, _ = start
     gx, gy = goal
 
-    # Ensure start/goal are inside the costmap bounds (same frame as simulation).
     if not _point_in_costmap_bounds(cost_map, sx, sy):
         raise ValueError(
             f"Start ({sx:.1f}, {sy:.1f}) is outside costmap bounds "
             f"[x={cost_map.x_origin:.1f}..{cost_map.x_origin + cost_map.width:.1f}, "
             f"y={cost_map.y_origin:.1f}..{cost_map.y_origin + cost_map.height:.1f}]"
         )
-    if not _point_in_costmap_bounds(cost_map, gx, gy):
+    if goal_y_line is None and not _point_in_costmap_bounds(cost_map, gx, gy):
         raise ValueError(
             f"Goal ({gx:.1f}, {gy:.1f}) is outside costmap bounds "
             f"[x={cost_map.x_origin:.1f}..{cost_map.x_origin + cost_map.width:.1f}, "
             f"y={cost_map.y_origin:.1f}..{cost_map.y_origin + cost_map.height:.1f}]"
         )
 
-    # Motion primitives: configured from planning parameters (resolution, turning radius, headings).
     primitives = Primitives(
         turning_radius=run_cfg.planning_turning_radius,
         num_headings=run_cfg.planning_num_headings,
         scale=run_cfg.planning_resolution,
     )
 
-    # Planner uses the existing MEDEA cost map (with correct origin and resolution).
     planner = LatticePlanner(
         primitives=primitives,
         cost_map=cost_map,
@@ -88,6 +87,8 @@ def create_medea_lattice_planner(
         ship_width=run_cfg.ship_beam,
         heuristic_weight=run_cfg.planning_heuristic_weight,
         goal_tolerance=run_cfg.planning_goal_tolerance,
+        goal_y_line=goal_y_line,
+        greedy=getattr(run_cfg, "planning_greedy", True),
     )
 
     return planner

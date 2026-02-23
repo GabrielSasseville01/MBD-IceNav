@@ -74,12 +74,19 @@ def main():
                         help='With --plan: place ship exactly on planned path each frame (no dynamics). Use to verify plan vs actual.')
     parser.add_argument('--no-dpdem-bonds', action='store_true',
                         help='Use legacy bond model (force vs strength) instead of default DPDEM-style (hybrid criterion, damage, Mohr-Coulomb)')
+    parser.add_argument('--view-map', action='store_true',
+                        help='Show the ice map in a matplotlib window and exit (no simulation or planning)')
+    parser.add_argument('--plan-only', action='store_true',
+                        help='Plan path and show it on the costmap, then exit (no simulation). Implies --plan')
     parser.add_argument('--output-dir', type=str, default='outputs/default',
                         help='Output directory for movies and plots (default: outputs/default)')
     args = parser.parse_args()
 
-    # Set interactive matplotlib backend before importing medea_ice_ship (so visualization uses it for --live)
-    if args.live:
+    if args.plan_only:
+        args.plan = True
+
+    # Set interactive matplotlib backend before importing medea_ice_ship (so visualization uses it for --live / --view-map / --plan-only)
+    if args.live or args.view_map or args.plan_only:
         os.environ['DPDEM_LIVE_VIEW'] = '1'
         import matplotlib
         matplotlib.use('TkAgg')
@@ -251,6 +258,48 @@ def main():
     y_min, y_max = all_verts[:, 1].min(), all_verts[:, 1].max()
     print(f"  Ice domain X: {x_min:.1f} to {x_max:.1f}m, Y: {y_min:.1f} to {y_max:.1f}m", flush=True)
 
+    DOMAIN_LIMIT = 700.0
+    if args.full_map:
+        x_min = -DOMAIN_LIMIT #max(x_min, -DOMAIN_LIMIT)
+        x_max = DOMAIN_LIMIT #min(x_max,  DOMAIN_LIMIT)
+        y_min = -DOMAIN_LIMIT #max(y_min, -DOMAIN_LIMIT)
+        y_max = DOMAIN_LIMIT #min(y_max,  DOMAIN_LIMIT)
+        print(f"  Clamped domain: X=[{x_min:.1f}, {x_max:.1f}], Y=[{y_min:.1f}, {y_max:.1f}]", flush=True)
+
+    if args.view_map:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Polygon as MplPolygon
+        from matplotlib.collections import PatchCollection
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+        patches = []
+        colors = []
+        for i, poly in enumerate(polygons):
+            patches.append(MplPolygon(poly, closed=True))
+            colors.append(thicknesses[i])
+        pc = PatchCollection(patches, cmap='Blues', edgecolor='#555555', linewidth=0.3)
+        pc.set_array(np.array(colors))
+        pc.set_clim(thicknesses.min(), thicknesses.max())
+        ax.add_collection(pc)
+        for i, j in bonds:
+            ax.plot([centroids[i, 0], centroids[j, 0]],
+                    [centroids[i, 1], centroids[j, 1]],
+                    'k-', lw=0.15, alpha=0.3)
+        pad = 30.0
+        ax.set_xlim(x_min - pad, x_max + pad)
+        ax.set_ylim(y_min - pad, y_max + pad)
+        ax.set_aspect('equal')
+        ax.set_xlabel('X [m]')
+        ax.set_ylabel('Y [m]')
+        mode = 'simple' if args.simple else ('full-map' if args.full_map else 'band')
+        ax.set_title(f'Ice Map ({mode}) — {len(polygons)} cells, {len(bonds)} bonds\n'
+                     f'Domain: [{x_min:.0f}, {x_max:.0f}] x [{y_min:.0f}, {y_max:.0f}] m')
+        cb = fig.colorbar(pc, ax=ax, shrink=0.7, label='Thickness [m]')
+        plt.tight_layout()
+        print(f"\n  Showing ice map ({len(polygons)} cells). Close the window to exit.", flush=True)
+        plt.show()
+        return
+
+    goal_y_line = None
     if args.simple:
         n_frames = run_cfg.n_frames_simple
         ship_start = np.array([x_min - ship_length / 2 - run_cfg.path_margin, (y_min + y_max) / 2])
@@ -261,15 +310,16 @@ def main():
         drift_vel = 0.0
         print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames", flush=True)
     elif args.full_map:
-        margin = run_cfg.domain_margin
-        ship_start = np.array([x_min - ship_length/2 + margin, y_min - ship_beam/2 + margin])
-        ship_end = np.array([x_max + ship_length/2 - margin, y_max + ship_beam/2 - margin])
+        inset = ship_length / 2 + run_cfg.path_margin
+        ship_start = np.array([-545.0, -600.0])
+        ship_end   = np.array([(x_min + x_max) / 2.0, y_max - inset])
+        goal_y_line = float(y_max)
         diagonal_heading = np.arctan2(ship_end[1] - ship_start[1], ship_end[0] - ship_start[0])
         n_frames = run_cfg.n_frames_medea
         ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
         ship_pos = ship_trajectory[0][0]
         drift_vel = 0.0
-        print(f"  Ship path: bottom-left -> top-right, heading {np.degrees(diagonal_heading):.0f}°", flush=True)
+        print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°", flush=True)
     else:
         rightmost_edge = max(centroids[i, 0] + radii[i] for i in range(len(centroids)))
         ship_bow_x = rightmost_edge + 5
@@ -302,14 +352,18 @@ def main():
         if args.optimize_path:
             plan_cfg = replace_config(plan_cfg, planning_use_path_optimizer=True)
             print("  Path refinement: NLP optimizer enabled (path length + costmap + curvature)", flush=True)
+        _wall = (x_min, x_max, y_min, y_max) if args.full_map else None
         cost_map, bounds = build_costmap_from_ice_state(
             polygons, centroids, thicknesses,
             x_min, x_max, y_min, y_max,
             resolution=plan_cfg.planning_resolution,
             margin=plan_cfg.planning_margin,
             ship_mass=plan_cfg.ship_displacement,
+            collision_cost=plan_cfg.planning_ice_collision_cost,
             damage_cost_scale=plan_cfg.planning_damage_cost_scale,
             damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
+            wall_bounds=_wall,
+            ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
         )
         start_heading = (ship_heading if args.simple else diagonal_heading)
         start = (float(ship_start[0]), float(ship_start[1]), float(start_heading))
@@ -319,18 +373,28 @@ def main():
         use_sqp = (args.planner == 'sqp')
         use_gradcem = (args.planner == 'gradcem')
         use_sampling_mpc = use_diffusion_mpc or use_mppi or use_sqp or use_gradcem
-        if use_sampling_mpc:
-            # AUTO-IceNav style: A* first, then model-based diffusion optimization
-            planner = create_medea_lattice_planner(cost_map, bounds, start, goal, plan_cfg)
-            planner_type = (
-                "model-based diffusion" if use_diffusion_mpc
-                else ("MPPI" if use_mppi else ("SQP" if use_sqp else "GradCEM"))
-            )
-            print(f"  Planner: Lattice A* (initial path) then {planner_type} refinement", flush=True)
+        skip_astar = use_sampling_mpc and args.no_warm_start
+        planner_type = (
+            "model-based diffusion" if use_diffusion_mpc
+            else ("MPPI" if use_mppi else ("SQP" if use_sqp else "GradCEM"))
+        ) if use_sampling_mpc else "Lattice A*"
+
+        if skip_astar:
+            print(f"  Planner: {planner_type} (cold start, no A*)", flush=True)
+            lattice_path_for_opt = np.array([
+                [start[0], start[1], start[2]],
+                [goal[0], goal[1], start[2]],
+            ])
         else:
-            planner = create_medea_lattice_planner(cost_map, bounds, start, goal, plan_cfg)
-            print("  Planner: Lattice A*", flush=True)
-        if not use_sampling_mpc and not args.no_lattice_search_movie:
+            planner = create_medea_lattice_planner(cost_map, bounds, start, goal, plan_cfg, goal_y_line=goal_y_line)
+            if use_sampling_mpc:
+                print(f"  Planner: Lattice A* (warm-start) then {planner_type} refinement", flush=True)
+            else:
+                print("  Planner: Lattice A*", flush=True)
+
+        if skip_astar:
+            path = lattice_path_for_opt
+        elif not use_sampling_mpc and not args.no_lattice_search_movie:
             result = plan_path(planner, start, goal, plan_cfg, cost_map=cost_map, return_search_history=True)
             path, search_history = result
             if path is None:
@@ -351,27 +415,28 @@ def main():
             if path is None:
                 print("  Planner did not find a path; aborting. Try without --plan for fixed trajectory.", flush=True)
                 return
-            if use_sampling_mpc:
-                if use_diffusion_mpc:
-                    print("  Running model-based diffusion optimization...", flush=True)
-                    path = optimize_with_diffusion(
-                        path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
-                    )
-                elif use_mppi:
-                    print("  Running MPPI optimization...", flush=True)
-                    path = optimize_with_mppi(
-                        path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
-                    )
-                elif use_sqp:
-                    print("  Running SQP optimization...", flush=True)
-                    path = optimize_with_sqp(
-                        path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
-                    )
-                else:
-                    print("  Running GradCEM optimization...", flush=True)
-                    path = optimize_with_gradcem(
-                        path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
-                    )
+
+        if use_sampling_mpc:
+            if use_diffusion_mpc:
+                print("  Running model-based diffusion optimization...", flush=True)
+                path = optimize_with_diffusion(
+                    path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
+                )
+            elif use_mppi:
+                print("  Running MPPI optimization...", flush=True)
+                path = optimize_with_mppi(
+                    path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
+                )
+            elif use_sqp:
+                print("  Running SQP optimization...", flush=True)
+                path = optimize_with_sqp(
+                    path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
+                )
+            else:
+                print("  Running GradCEM optimization...", flush=True)
+                path = optimize_with_gradcem(
+                    path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
+                )
         ship_trajectory = path_to_ship_trajectory(path, n_frames)
         ship_pos = ship_trajectory[0][0]
         planned_path = path
@@ -380,6 +445,64 @@ def main():
         costmap_snapshots = [(0, cost_map)]  # initial costmap for movie (AUTO-IceNav style)
         print(f"  Planned path: {len(path)} waypoints -> trajectory length {len(ship_trajectory)}", flush=True)
 
+        if args.plan_only:
+            import matplotlib.pyplot as plt
+            from matplotlib.patches import Polygon as MplPolygon
+            from matplotlib.collections import PatchCollection
+            fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+            # Costmap as background
+            grid = cost_map.cost_map
+            extent = [cost_map.x_origin, cost_map.x_origin + cost_map.width,
+                      cost_map.y_origin, cost_map.y_origin + cost_map.height]
+            ax.imshow(grid, origin='lower', extent=extent, cmap='YlOrRd', alpha=0.5,
+                      vmin=0, vmax=np.percentile(grid[grid > 0], 95) if np.any(grid > 0) else 1.0)
+            # Ice polygons
+            patches = []
+            colors_th = []
+            for i, poly in enumerate(polygons):
+                patches.append(MplPolygon(poly, closed=True))
+                colors_th.append(thicknesses[i])
+            pc = PatchCollection(patches, cmap='Blues', edgecolor='#555555', linewidth=0.3, alpha=0.6)
+            pc.set_array(np.array(colors_th))
+            pc.set_clim(thicknesses.min(), thicknesses.max())
+            ax.add_collection(pc)
+            fig.colorbar(pc, ax=ax, shrink=0.5, label='Thickness [m]', location='left')
+            # Planned path
+            ax.plot(path[:, 0], path[:, 1], 'r-', lw=2.5, label='Planned path', zorder=5)
+            ax.plot(path[0, 0], path[0, 1], 'go', ms=12, zorder=6, label='Start')
+            ax.plot(path[-1, 0], path[-1, 1], 'r*', ms=16, zorder=6, label='End')
+            # Goal line
+            if goal_y_line is not None:
+                ax.axhline(goal_y_line, color='lime', ls='--', lw=2, label=f'Goal line y={goal_y_line:.0f}', zorder=4)
+            else:
+                ax.plot(goal[0], goal[1], 'mx', ms=14, mew=3, zorder=6, label='Goal')
+            # Ship at start
+            from matplotlib.patches import FancyBboxPatch
+            sx, sy = float(ship_start[0]), float(ship_start[1])
+            sh = float(start_heading)
+            cos_h, sin_h = np.cos(sh), np.sin(sh)
+            hl, hw = ship_length / 2, ship_beam / 2
+            corners = np.array([[-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw]])
+            rot = np.array([[cos_h, -sin_h], [sin_h, cos_h]])
+            ship_poly = corners @ rot.T + np.array([sx, sy])
+            ax.add_patch(MplPolygon(ship_poly, closed=True, fc='orange', ec='black', lw=1.5, alpha=0.8, zorder=7))
+
+            pad = 30.0
+            ax.set_xlim(x_min - pad, x_max + pad)
+            ax.set_ylim(y_min - pad, y_max + pad)
+            ax.set_aspect('equal')
+            ax.set_xlabel('X [m]')
+            ax.set_ylabel('Y [m]')
+            mode = 'simple' if args.simple else ('full-map' if args.full_map else 'band')
+            planner_name = args.planner
+            ax.set_title(f'Planned Path ({planner_name}, {mode}) — {len(path)} waypoints\n'
+                         f'{len(polygons)} cells, domain [{x_min:.0f}, {x_max:.0f}] x [{y_min:.0f}, {y_max:.0f}] m')
+            ax.legend(loc='upper right', fontsize=9)
+            plt.tight_layout()
+            print(f"\n  --plan-only: showing planned path ({len(path)} pts). Close window to exit.", flush=True)
+            plt.show()
+            return
+
         # Receding-horizon callback (AUTO-IceNav style): rebuild costmap from current ice state and replan
         def _replan_callback(frame, world_polygons, centroids, thicknesses, ship_pos_f, ship_heading_f, n_remaining):
             all_verts = np.vstack(world_polygons)
@@ -387,25 +510,40 @@ def main():
             x_max_f = float(all_verts[:, 0].max())
             y_min_f = float(all_verts[:, 1].min())
             y_max_f = float(all_verts[:, 1].max())
+            if args.full_map:
+                x_min_f = max(x_min_f, -DOMAIN_LIMIT)
+                x_max_f = min(x_max_f,  DOMAIN_LIMIT)
+                y_min_f = max(y_min_f, -DOMAIN_LIMIT)
+                y_max_f = min(y_max_f,  DOMAIN_LIMIT)
+            _wall_f = (x_min_f, x_max_f, y_min_f, y_max_f) if args.full_map else None
             cost_map_f, _ = build_costmap_from_ice_state(
                 world_polygons, centroids, thicknesses,
                 x_min_f, x_max_f, y_min_f, y_max_f,
                 resolution=plan_cfg.planning_resolution,
                 margin=plan_cfg.planning_margin,
                 ship_mass=plan_cfg.ship_displacement,
+                collision_cost=plan_cfg.planning_ice_collision_cost,
                 damage_cost_scale=plan_cfg.planning_damage_cost_scale,
                 damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
+                wall_bounds=_wall_f,
+                ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
             )
-            costmap_snapshots.append((frame, cost_map_f))  # for costmap movie: update every replan
+            costmap_snapshots.append((frame, cost_map_f))
             start_f = (float(ship_pos_f[0]), float(ship_pos_f[1]), float(ship_heading_f))
             bounds_f = {"x_origin": cost_map_f.x_origin, "y_origin": cost_map_f.y_origin, "width": cost_map_f.width, "height": cost_map_f.height}
-            try:
-                planner_f = create_medea_lattice_planner(cost_map_f, bounds_f, start_f, goal, plan_cfg)
-            except ValueError:
-                return None
-            path_f = plan_path(planner_f, start_f, goal, plan_cfg, cost_map=cost_map_f)
-            if path_f is None:
-                return None
+            if skip_astar:
+                path_f = np.array([
+                    [start_f[0], start_f[1], start_f[2]],
+                    [goal[0], goal[1], start_f[2]],
+                ])
+            else:
+                try:
+                    planner_f = create_medea_lattice_planner(cost_map_f, bounds_f, start_f, goal, plan_cfg, goal_y_line=goal_y_line)
+                except ValueError:
+                    return None
+                path_f = plan_path(planner_f, start_f, goal, plan_cfg, cost_map=cost_map_f)
+                if path_f is None:
+                    return None
             if use_sampling_mpc:
                 if use_diffusion_mpc:
                     path_f = optimize_with_diffusion(

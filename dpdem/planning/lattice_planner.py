@@ -42,6 +42,8 @@ class LatticePlanner:
         ship_width: float,
         heuristic_weight: float = 1.0,
         goal_tolerance: float = 5.0,
+        goal_y_line: Optional[float] = None,
+        greedy: bool = False,
     ):
         """
         Initialize planner.
@@ -53,6 +55,12 @@ class LatticePlanner:
             ship_width: Ship width for swath computation [m]
             heuristic_weight: Weight for heuristic (>1 for weighted A*)
             goal_tolerance: Distance to goal for termination [m]
+            goal_y_line: If set, the goal is the horizontal line y = goal_y_line
+                (reached when y >= goal_y_line - goal_tolerance). The (x,y) goal
+                point is still used as a fallback attractor for heuristic tie-breaking.
+            greedy: If True, use greedy best-first search (f = h) instead of
+                weighted A* (f = g + w*h). Much faster (DFS-like depth-first
+                behaviour toward the goal) but may find suboptimal paths.
         """
         self.primitives = primitives
         self.cost_map = cost_map
@@ -60,6 +68,8 @@ class LatticePlanner:
         self.ship_width = ship_width
         self.heuristic_weight = heuristic_weight
         self.goal_tolerance = goal_tolerance
+        self.goal_y_line = goal_y_line
+        self.greedy = greedy
         
         # Search statistics
         self.nodes_expanded = 0
@@ -96,8 +106,9 @@ class LatticePlanner:
         
         # Initialize start node
         h_start = self._heuristic(start[0], start[1], goal)
+        f_start = h_start if self.greedy else self.heuristic_weight * h_start
         start_node = Node(
-            f_cost=h_start,
+            f_cost=f_start,
             g_cost=0.0,
             h_cost=h_start,
             x=start[0],
@@ -129,8 +140,11 @@ class LatticePlanner:
             self.nodes_expanded += 1
             
             # Check if goal reached
-            dist_to_goal = np.sqrt((current.x - goal[0])**2 + (current.y - goal[1])**2)
-            if dist_to_goal < self.goal_tolerance:
+            if self.goal_y_line is not None:
+                goal_reached = current.y >= self.goal_y_line - self.goal_tolerance
+            else:
+                goal_reached = np.sqrt((current.x - goal[0])**2 + (current.y - goal[1])**2) < self.goal_tolerance
+            if goal_reached:
                 path = self._reconstruct_path(current)
                 return (path, search_history) if return_search_history else path
             
@@ -175,7 +189,10 @@ class LatticePlanner:
                 
                 # Compute heuristic
                 h = self._heuristic(end_x, end_y, goal)
-                f = new_g + self.heuristic_weight * h
+                if self.greedy:
+                    f = h
+                else:
+                    f = new_g + self.heuristic_weight * h
                 
                 # Create neighbor node
                 neighbor = Node(
@@ -230,7 +247,11 @@ class LatticePlanner:
         Compute heuristic cost to goal.
         
         Uses Euclidean distance (admissible for Dubins paths).
+        When goal_y_line is set, uses vertical distance to the line
+        (admissible: always <= true path length).
         """
+        if self.goal_y_line is not None:
+            return max(0.0, self.goal_y_line - y)
         return np.sqrt((x - goal[0])**2 + (y - goal[1])**2)
     
     def _compute_path_cost(self, path: np.ndarray, primitive: Primitive) -> float:
