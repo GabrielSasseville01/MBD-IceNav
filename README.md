@@ -118,6 +118,16 @@ uv run python run_medea_ship_fracture.py --simple --plan --planner diffusion-mpc
 - **Planner:** Lattice A* (initial path) then model-based diffusion refinement.
 - **Generated:** Same as lattice (2D, 3D, costmap movie, hull impact) but **no** lattice search movie (search is not visualized for diffusion runs).
 
+### 4b. MPPI planner (lattice + Model Predictive Path Integral)
+
+Same pipeline as diffusion-MPC but uses **MPPI** (importance-weighted sampling with fixed-variance noise) instead of diffusion annealing. Same cost function (accumulated costmap + arc length + goal).
+
+```bash
+uv run python run_medea_ship_fracture.py --simple --plan --planner mppi
+```
+
+- **Planner:** Lattice A* (initial path) then MPPI refinement (JAX, GPU-friendly).
+
 ### 5. Kinematic ship (path verification)
 
 Ship is placed exactly on the planned path each frame (no dynamics). Use to check that the planned path is feasible and that red (plan) and blue (actual) coincide.
@@ -126,8 +136,9 @@ Ship is placed exactly on the planned path each frame (no dynamics). Use to chec
 # Lattice plan, kinematic execution
 uv run python run_medea_ship_fracture.py --simple --plan --planner lattice --kinematic-ship
 
-# Diffusion plan, kinematic execution
+# Diffusion or MPPI plan, kinematic execution
 uv run python run_medea_ship_fracture.py --simple --plan --planner diffusion-mpc --kinematic-ship
+uv run python run_medea_ship_fracture.py --simple --plan --planner mppi --kinematic-ship
 ```
 
 Use a dedicated output dir to compare: e.g. `--output-dir outputs/simple_lattice` or `outputs/simple_diffusion`.
@@ -139,6 +150,8 @@ Use the full satellite ice map; ship goes diagonal bottom-left → top-right. Re
 ```bash
 uv run python run_medea_ship_fracture.py --full-map
 uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice
+uv run python run_medea_ship_fracture.py --full-map --plan --planner diffusion-mpc
+uv run python run_medea_ship_fracture.py --full-map --plan --planner mppi
 ```
 
 Output filenames use `medea_` instead of `simple_` (e.g. `medea_ship_fracture.mp4`, `costmap_medea_ship_fracture.mp4`).
@@ -149,11 +162,13 @@ Standalone example: a wall of ice with one gap; the planner finds a path through
 
 ```bash
 uv run python examples/toy_planner_opening.py
+uv run python examples/toy_planner_opening.py --planner diffusion-mpc
+uv run python examples/toy_planner_opening.py --planner mppi
 ```
 
 - **Output dir:** `outputs/toy_planner/`
 - **Generated:** `toy_planner_lattice_search.mp4`, `toy_planner_opening.mp4` (2D ship animation), `toy_planner_opening_costmap.mp4`, `toy_planner_hull_impact.png`.
-- Options: `--live` (real-time 2D window), `--damage-cost` (damage-aware costmap), `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
+- Options: `--planner diffusion-mpc` or `--planner mppi` (sampling-based refinement), `--live` (real-time 2D window), `--damage-cost` (damage-aware costmap), `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
 
 ### 8. Toy planner: thin-ice corridor (thickness test)
 
@@ -161,11 +176,13 @@ Dense ice band spanning the full width in y (ship must traverse). Most ice is 10
 
 ```bash
 uv run python examples/toy_planner_thin_corridor.py
+uv run python examples/toy_planner_thin_corridor.py --planner diffusion-mpc
+uv run python examples/toy_planner_thin_corridor.py --planner mppi
 ```
 
 - **Output dir:** `outputs/toy_planner_thin_corridor/`
 - **Generated:** `toy_thin_corridor_lattice_search.mp4`, `toy_thin_corridor.mp4`, `toy_thin_corridor_3d.mp4`, `toy_thin_corridor_costmap.mp4`, `toy_thin_corridor_hull_impact.png`.
-- Options: `--live`, `--no-damage-cost` (baseline: no thickness preference), `--damage-cost-scale SCALE`, `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
+- Options: `--planner diffusion-mpc` or `--planner mppi` (sampling-based refinement), `--live`, `--no-damage-cost` (baseline: no thickness preference), `--damage-cost-scale SCALE`, `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
 
 ---
 
@@ -176,7 +193,7 @@ uv run python examples/toy_planner_thin_corridor.py
 | **2D animation** | Always (unless `--quick`) | Top-down view: ice floes, bonds, ship hull; fracture and motion over time. `simple_ship_fracture.mp4` or `medea_ship_fracture.mp4`. |
 | **3D animation** | Always unless `--no-3d` | Same run with z/tilt and submergence; 3D hull. `simple_ship_fracture_3d.mp4` or `medea_ship_fracture_3d.mp4`. |
 | **Costmap movie** | When `--plan` | Costmap as background, ice outline, **red** = initial planned path, **blue** = actual ship path. `costmap_simple_ship_fracture.mp4` or `costmap_medea_ship_fracture.mp4`. |
-| **Lattice search movie** | When `--plan --planner lattice` and not `--no-lattice-search-movie` | A* search expansion and chosen path on the costmap. `lattice_search_simple.mp4` or `lattice_search_medea.mp4`. |
+| **Lattice search movie** | When `--plan --planner lattice` (only for pure lattice; not for diffusion-mpc/mppi) and not `--no-lattice-search-movie` | A* search expansion and chosen path on the costmap. `lattice_search_simple.mp4` or `lattice_search_medea.mp4`. |
 | **Hull impact plot** | When ship has collisions (and not `--quick`) | Impulse vectors on the hull (AUTO-IceNav style). `hull_impact_simple.png` or `hull_impact_medea.png`. |
 
 File format: **MP4** by default; use `--gif` for GIF (slower, larger, no parallel workers). All paths are under the directory given by `--output-dir` (default `outputs/default`).
@@ -192,6 +209,10 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--plan` | Plan path (costmap + planner); only with `--simple` or `--full-map`. |
 | `--planner lattice` | Use lattice A* (default). |
 | `--planner diffusion-mpc` | Use lattice A* then model-based diffusion. |
+| `--planner mppi` | Use lattice A* then MPPI (importance-weighted sampling). |
+| `--planner sqp` | Use lattice A* then multiple-shooting SQP (jaxproxqp). |
+| `--planner gradcem` | Use lattice A* then GradCEM (gradient + Cross-Entropy Method). |
+| `--no-warm-start` | With diffusion-mpc/mppi/sqp/gradcem: disable A* warm-start (cold start). |
 | `--kinematic-ship` | With `--plan`: ship follows path exactly (no dynamics). |
 | `--thick-ice M` | Override ice thickness to M metres. |
 | `--no-dpdem-bonds` | Use legacy bond model (force vs strength) instead of default DPDEM-style (hybrid criterion, damage, Mohr-Coulomb). |
@@ -223,6 +244,9 @@ With `--plan`, the run script uses **receding-horizon planning** (AUTO-IceNav st
 
 - **Lattice (`--planner lattice`):** A* on motion primitives (Dubins-like), costmap, ship footprint and turning radius respected.
 - **Diffusion-MPC (`--planner diffusion-mpc`):** Lattice A* for an initial path, then model-based diffusion over control sequences (3-DOF dynamics, costmap, path/waypoint rewards). See [docs/DIFFUSION_MPC.md](docs/DIFFUSION_MPC.md).
+- **MPPI (`--planner mppi`):** Lattice A* for initial path, then Model Predictive Path Integral (importance-weighted sampling) with the same cost function.
+- **SQP (`--planner sqp`):** Lattice A* for initial path, then multiple-shooting Sequential Quadratic Programming (jaxproxqp) with 3-DOF dynamics and costmap.
+- **GradCEM (`--planner gradcem`):** Lattice A* for initial path, then GradCEM (gradient + Cross-Entropy Method) combining RMSprop with CEM elite selection and resampling.
 
 The `dpdem` library also provides planning and control modules used in examples:
 

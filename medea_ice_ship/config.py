@@ -243,11 +243,11 @@ class RunConfig:
     # Number of discrete heading bins in lattice (e.g. 16 = 22.5° increments).
     planning_num_headings: int = 16
     # Weight for heuristic in weighted A* (1 = admissible A*, >1 = faster but less optimal).
-    planning_heuristic_weight: float = 1.5
+    planning_heuristic_weight: float = 5.0
     # m — distance to goal within which planner terminates (ship considered “arrived”).
-    planning_goal_tolerance: float = 30.0
+    planning_goal_tolerance: float = 150.0
     # Maximum number of A* node expansions before giving up (prevents runaway search).
-    planning_max_iterations: int = 20000
+    planning_max_iterations: int = 200000
     # Receding horizon (AUTO-IceNav style): replan every this many simulation frames (e.g. 60 ≈ 3 s at 0.05 s dt).
     planning_replan_every_n_frames: int = 60
     # If True, refine A* path with NLP (path length + costmap integral + curvature); requires casadi.
@@ -280,6 +280,74 @@ class RunConfig:
     # Model-based diffusion: noise schedule (beta0, betaT).
     planning_diffusion_beta0: float = 1e-4
     planning_diffusion_betaT: float = 1e-2
+    # --- JAX Model-Based Diffusion (used when --planner diffusion-mpc) ---
+    # Planning horizon (number of action steps; trajectory length = horizon+1).
+    planning_jax_mbd_horizon: int = 80
+    # Monte Carlo samples per diffusion step (higher = better coverage of action space).
+    planning_jax_mbd_nsample: int = 512
+    # Number of reverse diffusion steps.
+    planning_jax_mbd_ndiffuse: int = 100
+    # Softmax temperature for importance weighting (lower = greedier).
+    planning_jax_mbd_temperature: float = 0.1
+    # Noise schedule endpoints.
+    planning_jax_mbd_beta0: float = 1e-4
+    planning_jax_mbd_betaT: float = 0.05
+    # Cost weight: accumulated costmap traversal (hull-aware, segment-length weighted).
+    # Mirrors the A* lattice planner's costmap integral.
+    planning_jax_mbd_costmap_weight: float = 1.0
+    # Cost weight: goal-reaching (small nudge; replaces A*'s heuristic guidance).
+    planning_jax_mbd_goal_weight: float = 0.1
+    # Cost weight: total arc length (matches A*'s base distance cost).
+    planning_jax_mbd_length_weight: float = 1.0
+    # Cost weight: control smoothness (penalise sudden changes).
+    planning_jax_mbd_smoothness_weight: float = 0.005
+    # Max surge force [N].
+    planning_jax_mbd_surge_max: float = 2e6
+    # Max sway force [N].
+    planning_jax_mbd_sway_max: float = 5e5
+    # Max yaw torque [N·m].
+    planning_jax_mbd_yaw_max: float = 5e8
+    # Euler sub-step size [s] for dynamics integration within each action step.
+    planning_jax_mbd_dt_substep: float = 1.0
+    # Number of Euler sub-steps per action step (dt_action = dt_substep × n_substeps).
+    planning_jax_mbd_n_substeps: int = 5
+    # Initial normalised surge bias (0.7 ≈ strong forward thrust at start of optimisation).
+    planning_jax_mbd_init_surge_bias: float = 0.7
+    # Warm-start MBD from the lattice A* path (seeds initial actions from path headings).
+    # When False, MBD starts from a constant forward-surge bias (pure diffusion, no A* prior).
+    planning_jax_mbd_warm_start: bool = True
+    # --- JAX MPPI (used when --planner mppi) ---
+    planning_mppi_horizon: int = 80
+    # More samples than MBD because MPPI relies on breadth per iteration.
+    planning_mppi_nsample: int = 2048
+    # More iterations so the nominal sequence converges (noise shrinks effectively
+    # because samples cluster around the improving nominal).
+    planning_mppi_n_iterations: int = 10
+    planning_mppi_temperature: float = 0.1
+    planning_mppi_noise_sigma: float = 0.3
+    planning_mppi_warm_start: bool = True
+    # --- JAX SQP multiple shooting (used when --planner sqp) ---
+    planning_sqp_horizon: int = 40
+    planning_sqp_max_iters: int = 20
+    planning_sqp_reg: float = 1e-3
+    planning_sqp_armijo_c: float = 1e-4
+    planning_sqp_armijo_beta: float = 0.5
+    planning_sqp_merit_mu: float = 100.0
+    planning_sqp_tol_grad: float = 1e-4
+    planning_sqp_tol_constraint: float = 1e-5
+    planning_sqp_warm_start: bool = True
+    planning_sqp_dt_substep: float = 1.0
+    planning_sqp_n_substeps: int = 5
+    # --- JAX GradCEM (used when --planner gradcem) ---
+    planning_gradcem_horizon: int = 80
+    planning_gradcem_nsample: int = 512
+    planning_gradcem_top_samples: int = 64
+    planning_gradcem_opt_iters: int = 10
+    planning_gradcem_lr: float = 0.1
+    planning_gradcem_grad_clip: bool = True
+    planning_gradcem_max_grad_norm: float = 1.0
+    planning_gradcem_noise_sigma: float = 1.0
+    planning_gradcem_warm_start: bool = True
     # Random seed for reproducibility (tessellation, thickness, etc.) when --seed not set.
     default_seed: int = 42
     # Frames per second for 2D animation.

@@ -7,9 +7,10 @@ Planner dynamics and footprint:
   - Lattice: motion primitives respect minimum turning_radius (Dubins-like arcs);
     path cost uses ship center + four hull corners (ship_length × ship_beam) so
     the plan avoids ice for the full ship footprint.
-  - Diffusion MPC: rollouts use 3-DOF dynamics (same M3/D3 as simulation) and
-    control limits; cost is evaluated at ship center and hull corners when
-    ship_length/ship_beam are passed, so optimized paths account for hull size.
+  - Diffusion MPC (JAX): reverse diffusion over body-frame control sequences,
+    rolled out through 3-DOF Fossen dynamics (same M3/D3 as simulation).
+    Cost is hull-aware (center + corners), with costmap, goal, effort,
+    smoothness, and optional path-following from lattice A*.
 """
 
 from typing import Tuple, Dict, Optional, List, Union
@@ -20,10 +21,7 @@ from dpdem.planning.lattice_planner import LatticePlanner, Primitives
 from dpdem.planning.cost_map import CostMap
 from dpdem.planning.path_optimizer import optimize_path as refine_path_nlp
 from dpdem.planning.diffusion_mpc import DiffusionMPCPlanner
-from medea_ice_ship.config import RunConfig, get_default_simulation_config
-from medea_ice_ship.vessel_dynamics import get_mss_style_3dof
-from medea_ice_ship.diffusion_controller import ModelBasedDiffusionController
-from medea_ice_ship.properties import R_xy
+from medea_ice_ship.config import RunConfig
 
 
 def _point_in_costmap_bounds(cost_map: CostMap, x: float, y: float) -> bool:
@@ -224,122 +222,183 @@ def optimize_with_diffusion(
     cost_map: CostMap,
     run_cfg: RunConfig,
     start_nu: Optional[Tuple[float, float, float]] = None,
+    warm_start: Optional[bool] = None,
 ) -> np.ndarray:
     """
-    Optimize a path using model-based diffusion (AUTO-IceNav style).
+    Optimize a path using JAX Model-Based Diffusion (3-DOF dynamics + costmap).
 
-    Uses the continuous path (e.g. from lattice A*) as reference. Builds waypoint
-    anchors from a downsampled path, warm-starts controls from path tracking,
-    runs ModelBasedDiffusionController to get an optimized trajectory.
+    The MBD optimises body-frame control sequences in normalised action space,
+    rolling them out through Fossen-style 3-DOF vessel dynamics to produce
+    physically smooth trajectories with hull-aware costmap evaluation.
+
+    The entire diffusion loop and parallel sampling are JIT-compiled via JAX
+    and will run on GPU when available.
 
     Args:
         continuous_path: (N, 3) path [x, y, heading] in world coordinates.
         start_pose: (x, y, psi) current pose.
         goal: (x, y) goal position.
         cost_map: CostMap for collision/path cost.
-        run_cfg: RunConfig for dt, ship params, and diffusion_* settings.
+        run_cfg: RunConfig for ship params and planning_jax_mbd_* settings.
         start_nu: Optional (u, v, r) initial velocities; default (2, 0, 0).
+        warm_start: If True, seed MBD from the A* path; if False, cold start.
+            Defaults to run_cfg.planning_jax_mbd_warm_start.
 
     Returns:
         Optimized path (K, 3) [x, y, heading] in world coordinates.
     """
+    from medea_ice_ship.jax_mbd_planner import jax_mbd_optimize
+
     continuous_path = np.asarray(continuous_path, dtype=float)
     if continuous_path.shape[0] < 2:
         return continuous_path
-    horizon = min(
-        getattr(run_cfg, "planning_diffusion_controller_horizon", 80),
-        continuous_path.shape[0],
+
+    optimized_traj = jax_mbd_optimize(
+        cost_map=cost_map,
+        start_pose=start_pose,
+        goal=goal,
+        run_cfg=run_cfg,
+        start_nu=start_nu,
+        lattice_path=continuous_path,
+        warm_start=warm_start,
     )
-    local_path = continuous_path[:horizon].copy()
-    if continuous_path.shape[0] < horizon:
-        last = local_path[-1:]
-        local_path = np.vstack([local_path, np.tile(last, (horizon - len(local_path), 1))])
-    goal_y = goal[1]
-    # Discrete waypoint anchors from path
-    n_discrete = min(10, horizon)
-    discrete_indices = np.linspace(0, horizon - 1, n_discrete).astype(int)
-    waypoint_anchors = {}
-    for idx in discrete_indices:
-        if idx < len(continuous_path):
-            waypoint_anchors[int(idx)] = continuous_path[idx].copy()
-    # Ship dynamics: use same Izz and M3/D3 as simulation so diffusion rollouts match sim behavior
-    mass = run_cfg.ship_displacement
-    L = run_cfg.ship_length
-    B = run_cfg.ship_beam
-    Izz = (1.0 / 12.0) * mass * (L ** 2 + B ** 2)
-    sim_cfg = get_default_simulation_config()
-    if getattr(sim_cfg, "use_mss_style_dynamics", True):
-        M3, D3 = get_mss_style_3dof(
-            mass, Izz,
-            ship_damping_xy=getattr(sim_cfg, "ship_damping_xy", 0.02),
-            ship_damping_psi=getattr(sim_cfg, "ship_damping_psi", 0.15),
-            added_mass_surge_frac=getattr(sim_cfg, "mss_added_mass_surge_frac", 0.05),
-            added_mass_sway_frac=getattr(sim_cfg, "mss_added_mass_sway_frac", 0.5),
-            added_mass_yaw_frac=getattr(sim_cfg, "mss_added_mass_yaw_frac", 0.2),
-        )
-    else:
-        M3 = np.diag([mass, mass, Izz])
-        D3 = np.diag([
-            mass * getattr(sim_cfg, "ship_damping_xy", 0.02),
-            mass * getattr(sim_cfg, "ship_damping_xy", 0.02),
-            Izz * getattr(sim_cfg, "ship_damping_psi", 0.15),
-        ])
-    dt = run_cfg.dt
-    target_speed = 2.0
-    # Controller
-    controller = ModelBasedDiffusionController(
-        horizon=horizon,
-        M3=M3,
-        D3=D3,
-        diffusion_noise_clipping=1e6,
-        num_samples=getattr(run_cfg, "planning_diffusion_num_samples", 64),
-        num_diffusion_steps=getattr(run_cfg, "planning_diffusion_num_diffusion_steps", 30),
-        temperature=getattr(run_cfg, "planning_diffusion_temperature", 0.1),
-        beta0=getattr(run_cfg, "planning_diffusion_beta0", 1e-4),
-        betaT=getattr(run_cfg, "planning_diffusion_betaT", 1e-2),
-        seed=run_cfg.planning_diffusion_seed or 0,
-        ship_length=L,
-        ship_beam=B,
-    )
-    controller.waypoint_anchors = waypoint_anchors
-    controller.enforce_forward_motion = True
-    controller.target_surge_speed = target_speed
-    # Warm start: bias toward turning to align heading then thrusting forward (minimize sway / crabbing)
-    eta = np.array(start_pose, dtype=float)
-    nu = np.array(start_nu if start_nu is not None else (target_speed, 0.0, 0.0), dtype=float)
-    warm_start = np.zeros((horizon, 3))
-    for t in range(horizon):
-        target = local_path[t] if t < len(local_path) else local_path[-1]
-        pos_err = target[:2] - eta[:2]
-        ang_err = (target[2] - eta[2] + np.pi) % (2 * np.pi) - np.pi
-        R = R_xy(eta[2])
-        body_err = R.T @ pos_err
-        warm_start[t, 0] = max(1e5, 9e5)
-        # Prefer yaw to align heading; use only modest sway so diffusion does not start from a crab
-        warm_start[t, 1] = np.clip(body_err[1] * 1.5e5, -2e5, 2e5)
-        warm_start[t, 2] = np.clip(ang_err * 4e6, -5e6, 5e6)
-        vel_global = R @ np.array([nu[0], nu[1]])
-        eta[0] += dt * vel_global[0] * 0.6
-        eta[1] += dt * vel_global[1] * 0.6
-        eta[2] = (eta[2] + dt * nu[2] * 0.6 + np.pi) % (2 * np.pi) - np.pi
-    # Run diffusion
-    pose = np.array(start_pose, dtype=float)
-    nu_start = np.array(start_nu if start_nu is not None else (target_speed, 0.0, 0.0), dtype=float)
-    optimized_traj = controller.run_diffusion(
-        pose=pose,
-        nu=nu_start,
-        local_path=local_path,
-        dt=dt,
-        costmap=cost_map,
-        goal_y=goal_y,
-        warm_start_controls=warm_start,
-    )
-    # Align headings with path direction (tangent) so commanded heading matches trajectory like lattice.
-    # Diffusion rollout gives psi = actual yaw from dynamics (can crab); we want heading = direction of travel.
+
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
-    # Extend with remaining continuous path if needed
-    if len(continuous_path) > horizon:
-        optimized_traj = np.vstack([optimized_traj, continuous_path[horizon:]])
+
+    # Extend with remaining lattice path beyond MBD coverage
+    end_pos = optimized_traj[-1, :2]
+    dists = np.linalg.norm(continuous_path[:, :2] - end_pos, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    if nearest_idx < len(continuous_path) - 1:
+        optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
+
+    return optimized_traj
+
+
+def optimize_with_mppi(
+    continuous_path: np.ndarray,
+    start_pose: Tuple[float, float, float],
+    goal: Tuple[float, float],
+    cost_map: CostMap,
+    run_cfg: RunConfig,
+    start_nu: Optional[Tuple[float, float, float]] = None,
+    warm_start: Optional[bool] = None,
+) -> np.ndarray:
+    """
+    Optimize a path using JAX MPPI (3-DOF dynamics + costmap).
+
+    Same interface as optimize_with_diffusion but uses MPPI instead of MBD:
+    importance-weighted sampling with fixed-variance noise, multiple warm-start
+    iterations. Reuses the same cost function (accumulated costmap + arc length + goal).
+    """
+    from medea_ice_ship.jax_mppi_planner import jax_mppi_optimize
+
+    continuous_path = np.asarray(continuous_path, dtype=float)
+    if continuous_path.shape[0] < 2:
+        return continuous_path
+
+    optimized_traj = jax_mppi_optimize(
+        cost_map=cost_map,
+        start_pose=start_pose,
+        goal=goal,
+        run_cfg=run_cfg,
+        start_nu=start_nu,
+        lattice_path=continuous_path,
+        warm_start=warm_start,
+    )
+
+    optimized_traj = _align_headings_to_path_direction(optimized_traj)
+
+    end_pos = optimized_traj[-1, :2]
+    dists = np.linalg.norm(continuous_path[:, :2] - end_pos, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    if nearest_idx < len(continuous_path) - 1:
+        optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
+
+    return optimized_traj
+
+
+def optimize_with_sqp(
+    continuous_path: np.ndarray,
+    start_pose: Tuple[float, float, float],
+    goal: Tuple[float, float],
+    cost_map: CostMap,
+    run_cfg: RunConfig,
+    start_nu: Optional[Tuple[float, float, float]] = None,
+    warm_start: Optional[bool] = None,
+) -> np.ndarray:
+    """
+    Optimize a path using JAX multiple-shooting SQP (jaxproxqp).
+
+    Same interface as optimize_with_diffusion/optimize_with_mppi but uses
+    gradient-based SQP with QP subproblems. Reuses the same cost function.
+    """
+    from medea_ice_ship.jax_sqp_planner import jax_sqp_optimize
+
+    continuous_path = np.asarray(continuous_path, dtype=float)
+    if continuous_path.shape[0] < 2:
+        return continuous_path
+
+    optimized_traj = jax_sqp_optimize(
+        cost_map=cost_map,
+        start_pose=start_pose,
+        goal=goal,
+        run_cfg=run_cfg,
+        start_nu=start_nu,
+        lattice_path=continuous_path,
+        warm_start=warm_start,
+    )
+
+    optimized_traj = _align_headings_to_path_direction(optimized_traj)
+
+    end_pos = optimized_traj[-1, :2]
+    dists = np.linalg.norm(continuous_path[:, :2] - end_pos, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    if nearest_idx < len(continuous_path) - 1:
+        optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
+
+    return optimized_traj
+
+
+def optimize_with_gradcem(
+    continuous_path: np.ndarray,
+    start_pose: Tuple[float, float, float],
+    goal: Tuple[float, float],
+    cost_map: CostMap,
+    run_cfg: RunConfig,
+    start_nu: Optional[Tuple[float, float, float]] = None,
+    warm_start: Optional[bool] = None,
+) -> np.ndarray:
+    """
+    Optimize a path using JAX GradCEM (gradient + Cross-Entropy Method).
+
+    Same interface as optimize_with_diffusion/optimize_with_mppi but uses
+    hybrid gradient + CEM elite selection. Reuses the same cost function.
+    """
+    from medea_ice_ship.jax_gradcem_planner import jax_gradcem_optimize
+
+    continuous_path = np.asarray(continuous_path, dtype=float)
+    if continuous_path.shape[0] < 2:
+        return continuous_path
+
+    optimized_traj = jax_gradcem_optimize(
+        cost_map=cost_map,
+        start_pose=start_pose,
+        goal=goal,
+        run_cfg=run_cfg,
+        start_nu=start_nu,
+        lattice_path=continuous_path,
+        warm_start=warm_start,
+    )
+
+    optimized_traj = _align_headings_to_path_direction(optimized_traj)
+
+    end_pos = optimized_traj[-1, :2]
+    dists = np.linalg.norm(continuous_path[:, :2] - end_pos, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    if nearest_idx < len(continuous_path) - 1:
+        optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
+
     return optimized_traj
 
 

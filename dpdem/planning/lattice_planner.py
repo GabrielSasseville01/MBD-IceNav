@@ -195,7 +195,14 @@ class LatticePlanner:
             if return_search_history:
                 search_history.append((expanded_xyh, edges_this_step))
         
-        # No path found
+        # No path found — provide diagnostics
+        if not open_set:
+            reason = "open set exhausted (all reachable states explored)"
+        else:
+            reason = f"max iterations ({max_iterations}) reached"
+        print(f"  A* failed: {reason}. "
+              f"Expanded {self.nodes_expanded}, generated {self.nodes_generated}, "
+              f"open set size {len(open_set)}", flush=True)
         return (None, search_history) if return_search_history else None
     
     def _state_key(self, node: Node) -> Tuple[int, int, int]:

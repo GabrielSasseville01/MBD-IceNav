@@ -14,6 +14,7 @@ prefers the thin-ice corridor when damage-aware cost is enabled.
 
 Run:
   uv run python examples/toy_planner_thin_corridor.py
+  uv run python examples/toy_planner_thin_corridor.py --planner diffusion-mpc   # diffusion refinement
   uv run python examples/toy_planner_thin_corridor.py --live
   uv run python examples/toy_planner_thin_corridor.py --no-damage-cost   # baseline: no thickness preference
   uv run python examples/toy_planner_thin_corridor.py --no-replan        # single initial path (no receding horizon)
@@ -52,6 +53,10 @@ from medea_ice_ship import (
     build_costmap_from_ice_state,
     create_medea_lattice_planner,
     plan_path,
+    optimize_with_diffusion,
+    optimize_with_mppi,
+    optimize_with_sqp,
+    optimize_with_gradcem,
     path_to_ship_trajectory,
     simulate_ice_ship_interaction,
     animate_ice_ship_2d,
@@ -145,6 +150,18 @@ def main():
         help="Output directory for movies and plots",
     )
     parser.add_argument(
+        "--planner",
+        type=str,
+        choices=["lattice", "diffusion-mpc", "mppi", "sqp", "gradcem"],
+        default="lattice",
+        help="Planner: lattice (A*), diffusion-mpc, mppi, or sqp (A* + MPC refinement)",
+    )
+    parser.add_argument(
+        "--no-warm-start",
+        action="store_true",
+        help="With diffusion-mpc/mppi/sqp/gradcem: cold start (no A* warm-start)",
+    )
+    parser.add_argument(
         "--no-lattice-search-movie",
         action="store_true",
         help="Skip A* lattice search visualization movie",
@@ -193,10 +210,18 @@ def main():
     run_cfg = replace(
         run_cfg,
         planning_turning_radius=50.0,
-        planning_resolution=4.0,           # coarser grid → smaller state space, longer steps
-        planning_max_iterations=200000,   # long path (-200 to 800)
-        planning_goal_tolerance=80.0,     # accept goal within 80 m
+        planning_resolution=4.0,
+        planning_max_iterations=200000,
+        planning_goal_tolerance=80.0,
     )
+    if args.no_warm_start:
+        run_cfg = replace(
+            run_cfg,
+            planning_jax_mbd_warm_start=False,
+            planning_mppi_warm_start=False,
+            planning_sqp_warm_start=False,
+            planning_gradcem_warm_start=False,
+        )
     if not args.no_damage_cost:
         run_cfg = replace(
             run_cfg,
@@ -241,10 +266,23 @@ def main():
         damage_thickness_exponent=run_cfg.planning_damage_thickness_exponent,
     )
 
+    use_diffusion = (args.planner == "diffusion-mpc")
+    use_mppi = (args.planner == "mppi")
+    use_sqp = (args.planner == "sqp")
+    use_gradcem = (args.planner == "gradcem")
+    use_sampling_mpc = use_diffusion or use_mppi or use_sqp or use_gradcem
     planner = create_medea_lattice_planner(
         cost_map=cost_map, bounds=bounds, start=start, goal=goal, run_cfg=run_cfg,
     )
-    if not args.no_lattice_search_movie:
+    if use_sampling_mpc:
+        planner_type = (
+            "model-based diffusion" if use_diffusion
+            else ("MPPI" if use_mppi else ("SQP" if use_sqp else "GradCEM"))
+        )
+        print(f"  Planner: Lattice A* (initial) + {planner_type} refinement", flush=True)
+    else:
+        print(f"  Planner: Lattice A*", flush=True)
+    if not use_sampling_mpc and not args.no_lattice_search_movie:
         result = plan_path(planner, start, goal, run_cfg, cost_map=cost_map, return_search_history=True)
         path, search_history = result
         if path is None:
@@ -260,6 +298,30 @@ def main():
         print(f"  Saved: {out_dir / 'toy_thin_corridor_lattice_search.mp4'}", flush=True)
     else:
         path = plan_path(planner, start, goal, run_cfg, cost_map=cost_map)
+        if path is None:
+            print("Planner did not find a path. Aborting.")
+            sys.exit(1)
+        if use_sampling_mpc:
+            if use_diffusion:
+                print("  Running model-based diffusion optimization...", flush=True)
+                path = optimize_with_diffusion(
+                    path, start, goal, cost_map, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                )
+            elif use_mppi:
+                print("  Running MPPI optimization...", flush=True)
+                path = optimize_with_mppi(
+                    path, start, goal, cost_map, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                )
+            elif use_sqp:
+                print("  Running SQP optimization...", flush=True)
+                path = optimize_with_sqp(
+                    path, start, goal, cost_map, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                )
+            else:
+                print("  Running GradCEM optimization...", flush=True)
+                path = optimize_with_gradcem(
+                    path, start, goal, cost_map, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                )
 
     if path is None:
         print("Planner did not find a path. Aborting.")
@@ -313,6 +375,23 @@ def main():
             path_f = plan_path(planner_f, start_f, goal, run_cfg, cost_map=cost_map_f)
             if path_f is None:
                 return None
+            if use_sampling_mpc:
+                if use_diffusion:
+                    path_f = optimize_with_diffusion(
+                        path_f, start_f, goal, cost_map_f, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                    )
+                elif use_mppi:
+                    path_f = optimize_with_mppi(
+                        path_f, start_f, goal, cost_map_f, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                    )
+                elif use_sqp:
+                    path_f = optimize_with_sqp(
+                        path_f, start_f, goal, cost_map_f, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                    )
+                else:
+                    path_f = optimize_with_gradcem(
+                        path_f, start_f, goal, cost_map_f, run_cfg, start_nu=(2.0, 0.0, 0.0),
+                    )
             return path_to_ship_trajectory(path_f, n_remaining)
 
         replan_every_n_frames = run_cfg.planning_replan_every_n_frames

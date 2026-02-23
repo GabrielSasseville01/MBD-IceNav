@@ -24,6 +24,9 @@ from medea_ice_ship.planning import (
     create_medea_diffusion_mpc_planner,
     plan_path,
     optimize_with_diffusion,
+    optimize_with_mppi,
+    optimize_with_sqp,
+    optimize_with_gradcem,
     path_to_ship_trajectory,
 )
 
@@ -59,5 +62,8 @@ __all__ = [
     'create_medea_diffusion_mpc_planner',
     'plan_path',
     'optimize_with_diffusion',
+    'optimize_with_mppi',
+    'optimize_with_sqp',
+    'optimize_with_gradcem',
     'path_to_ship_trajectory',
 ]
