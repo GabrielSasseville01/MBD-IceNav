@@ -14,6 +14,7 @@ from medea_ice_ship.bonds import find_connected_components
 from medea_ice_ship.bond_fracture import update_bond_damage_state
 from medea_ice_ship.config import SimulationConfig, get_default_simulation_config
 from medea_ice_ship.vessel_dynamics import get_mss_style_3dof, coriolis_3dof
+from medea_ice_ship.ocean_current import OceanCurrentModel, NoCurrentModel
 
 
 def point_to_ship_collision(px, py, ship_pos, ship_length, ship_beam, bow_taper_start=0.6, ship_heading=0.0):
@@ -78,6 +79,8 @@ def simulate_ice_ship_interaction(
     frame_callback=None,
     kinematic_ship=False,
     parent_ids=None,
+    ocean_current=None,
+    ship_drift_only=False,
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
@@ -90,6 +93,11 @@ def simulate_ice_ship_interaction(
         -> Optional[list of (position_2d, heading)] of length n_remaining + 1.
     frame_callback: Optional callable(frame, positions, rotations, bond_intact, ship_pos, ship_heading)
         called at the end of each frame (e.g. for real-time 2D view). Called with current state copies.
+    ocean_current: OceanCurrentModel or None (no current).  When set, drag
+        uses relative velocity v_ice - v_water(x,y) per Eq. 9, and the ship
+        damping uses relative velocity in the body frame.
+    ship_drift_only: If True and using ship dynamics, do not apply PD control
+        (tau_control = 0) so the ship drifts with currents/ice forces only.
 
     Returns (positions_history, rotations_history, bonds_history, ship_history, submergence_history[, ship_diagnostics or damage_summary]).
     When ship_trajectory is not None and return_ship_diagnostics is False, the 6th element is damage_summary
@@ -97,6 +105,11 @@ def simulate_ice_ship_interaction(
     the 6th element is ship_diagnostics (list) and the last entry includes 'damage_summary'.
     """
     cfg = config or get_default_simulation_config()
+    if ocean_current is None:
+        ocean_current = NoCurrentModel()
+    has_current = ocean_current.is_active
+    if has_current:
+        print(f"  Ocean current: {type(ocean_current).__name__}", flush=True)
     n = len(polygons)
     areas = np.array([polygon_area(p) for p in polygons])
     masses = areas * thicknesses * IceProperties.ICE_DENSITY
@@ -161,6 +174,9 @@ def simulate_ice_ship_interaction(
     dt_ice = min(dt, dt_rayleigh) if use_rayleigh_cap else dt
     if use_rayleigh_cap and dt_rayleigh < dt:
         print(f"  Using ice dt capped at Rayleigh: {dt_ice:.4f} s", flush=True)
+    n_ice_steps = max(1, int(round(dt / dt_ice))) if dt_ice > 0 else 1
+    if n_ice_steps > 1:
+        print(f"  Ice sub-steps per frame: {n_ice_steps} (ice time {n_ice_steps * dt_ice:.4f} s/frame)", flush=True)
 
     use_bond_forces = getattr(cfg, "use_bond_forces_in_dynamics", True)
 
@@ -441,232 +457,240 @@ def simulate_ice_ship_interaction(
         # Ship damage proxy: cumulative impulse from ice on ship (AUTO-IceNav style; used for risk/cost)
         J_cumul += np.linalg.norm(F_ice_ship) * dt
 
-        # ── Force accumulation (bonds, ice-ice contact, drag) ──────────
-        RHO_WATER = IceProperties.WATER_DENSITY
-        A_drag = areas * (thicknesses / cfg.drag_ref_thickness)
+        for ice_step in range(n_ice_steps):
+            if ice_step > 0:
+                forces = np.zeros_like(positions)
+                moments = np.zeros(n)
 
-        if use_bond_forces and len(bonds) > 0:
-            d_bond_pre = positions[bond_j] - positions[bond_i]
-            dist_bond_pre = np.linalg.norm(d_bond_pre, axis=1)
-            dist_bond_pre_safe = np.maximum(dist_bond_pre, 1e-10)
-            bond_dir_pre = d_bond_pre / dist_bond_pre_safe[:, np.newaxis]
-            avg_thickness_pre = (thicknesses[bond_i] + thicknesses[bond_j]) * 0.5
-            stiffness_pre = IceProperties.YOUNGS_MODULUS * avg_thickness_pre * cfg.bond_stiffness_factor
-            if use_dpdem_bonds:
-                F_mag_pre = stiffness_pre * (dist_bond_pre - rest_lengths) * (1.0 - bond_damage)
-            else:
-                F_mag_pre = stiffness_pre * (dist_bond_pre - rest_lengths)
-            F_bond_vec = bond_dir_pre * F_mag_pre[:, np.newaxis]
-            F_bond_vec = np.where(bond_intact[:, np.newaxis], F_bond_vec, 0.0)
-            both_active = elem_active[bond_i] & elem_active[bond_j]
-            both_frozen = ~elem_active[bond_i] & ~elem_active[bond_j]
-            bond_force_ok = both_active | both_frozen
-            F_bond_vec *= bond_force_ok[:, np.newaxis].astype(float)
-            np.add.at(forces, bond_i, F_bond_vec)
-            np.add.at(forces, bond_j, -F_bond_vec)
-            if np.any(elem_active):
-                bond_cross = 0.5 * (d_bond_pre[:, 0] * F_bond_vec[:, 1] - d_bond_pre[:, 1] * F_bond_vec[:, 0])
-                np.add.at(moments, bond_i, bond_cross)
-                np.add.at(moments, bond_j, -bond_cross)
+            # ── Force accumulation (bonds, ice-ice contact, drag) ──────────
+            RHO_WATER = IceProperties.WATER_DENSITY
+            A_drag = areas * (thicknesses / cfg.drag_ref_thickness)
 
-        d_vec = positions[pair_j] - positions[pair_i]
-        dist_ij = np.linalg.norm(d_vec, axis=1)
-        min_dist = radii[pair_i] + radii[pair_j]
-        overlap = np.where((dist_ij < min_dist) & (dist_ij > 1e-6), min_dist - dist_ij, 0.0)
-        olap_mask = overlap > 0
-        f_n_vec = np.zeros_like(d_vec)
-        f_t_vec = np.zeros_like(d_vec)
-        if np.any(olap_mask):
-            direction = np.zeros_like(d_vec)
-            direction[olap_mask] = d_vec[olap_mask] / dist_ij[olap_mask, np.newaxis]
-            f_n_mag = cfg.hertz_factor * overlap ** cfg.hertz_exponent
-            f_n_vec = direction * f_n_mag[:, np.newaxis]
-            np.add.at(forces, pair_i, -f_n_vec)
-            np.add.at(forces, pair_j, f_n_vec)
-            v_rel = velocities[pair_j] - velocities[pair_i]
-            v_t = v_rel - np.sum(v_rel * direction, axis=1, keepdims=True) * direction
-            v_t_mag = np.linalg.norm(v_t, axis=1)
-            friction_mask = olap_mask & (v_t_mag > 1e-6)
-            if np.any(friction_mask):
-                t_hat = np.zeros_like(v_t)
-                t_hat[friction_mask] = -v_t[friction_mask] / v_t_mag[friction_mask, np.newaxis]
-                f_t_mag = np.minimum(cfg.ice_ice_friction * f_n_mag, cfg.friction_cap)
-                f_t_vec = t_hat * f_t_mag[:, np.newaxis]
-                np.add.at(forces, pair_i, f_t_vec)
-                np.add.at(forces, pair_j, -f_t_vec)
-            if np.any(elem_active):
-                F_on_i = -f_n_vec - f_t_vec
-                cross_val = np.zeros(len(pair_i))
-                cross_val[olap_mask] = -(d_vec[olap_mask, 0] * F_on_i[olap_mask, 1] - d_vec[olap_mask, 1] * F_on_i[olap_mask, 0])
-                np.add.at(moments, pair_i, 0.5 * cross_val)
-                np.add.at(moments, pair_j, -0.5 * cross_val)
-
-        if ship_trajectory is None:
+            if use_bond_forces and len(bonds) > 0:
+                d_bond_pre = positions[bond_j] - positions[bond_i]
+                dist_bond_pre = np.linalg.norm(d_bond_pre, axis=1)
+                dist_bond_pre_safe = np.maximum(dist_bond_pre, 1e-10)
+                bond_dir_pre = d_bond_pre / dist_bond_pre_safe[:, np.newaxis]
+                avg_thickness_pre = (thicknesses[bond_i] + thicknesses[bond_j]) * 0.5
+                stiffness_pre = IceProperties.YOUNGS_MODULUS * avg_thickness_pre * cfg.bond_stiffness_factor
+                if use_dpdem_bonds:
+                    F_mag_pre = stiffness_pre * (dist_bond_pre - rest_lengths) * (1.0 - bond_damage)
+                else:
+                    F_mag_pre = stiffness_pre * (dist_bond_pre - rest_lengths)
+                F_bond_vec = bond_dir_pre * F_mag_pre[:, np.newaxis]
+                F_bond_vec = np.where(bond_intact[:, np.newaxis], F_bond_vec, 0.0)
+                both_active = elem_active[bond_i] & elem_active[bond_j]
+                both_frozen = ~elem_active[bond_i] & ~elem_active[bond_j]
+                bond_force_ok = both_active | both_frozen
+                F_bond_vec *= bond_force_ok[:, np.newaxis].astype(float)
+                np.add.at(forces, bond_i, F_bond_vec)
+                np.add.at(forces, bond_j, -F_bond_vec)
+                if np.any(elem_active):
+                    bond_cross = 0.5 * (d_bond_pre[:, 0] * F_bond_vec[:, 1] - d_bond_pre[:, 1] * F_bond_vec[:, 0])
+                    np.add.at(moments, bond_i, bond_cross)
+                    np.add.at(moments, bond_j, -bond_cross)
+    
+            d_vec = positions[pair_j] - positions[pair_i]
+            dist_ij = np.linalg.norm(d_vec, axis=1)
+            min_dist = radii[pair_i] + radii[pair_j]
+            overlap = np.where((dist_ij < min_dist) & (dist_ij > 1e-6), min_dist - dist_ij, 0.0)
+            olap_mask = overlap > 0
+            f_n_vec = np.zeros_like(d_vec)
+            f_t_vec = np.zeros_like(d_vec)
+            if np.any(olap_mask):
+                direction = np.zeros_like(d_vec)
+                direction[olap_mask] = d_vec[olap_mask] / dist_ij[olap_mask, np.newaxis]
+                f_n_mag = cfg.hertz_factor * overlap ** cfg.hertz_exponent
+                f_n_vec = direction * f_n_mag[:, np.newaxis]
+                np.add.at(forces, pair_i, -f_n_vec)
+                np.add.at(forces, pair_j, f_n_vec)
+                v_rel = velocities[pair_j] - velocities[pair_i]
+                v_t = v_rel - np.sum(v_rel * direction, axis=1, keepdims=True) * direction
+                v_t_mag = np.linalg.norm(v_t, axis=1)
+                friction_mask = olap_mask & (v_t_mag > 1e-6)
+                if np.any(friction_mask):
+                    t_hat = np.zeros_like(v_t)
+                    t_hat[friction_mask] = -v_t[friction_mask] / v_t_mag[friction_mask, np.newaxis]
+                    f_t_mag = np.minimum(cfg.ice_ice_friction * f_n_mag, cfg.friction_cap)
+                    f_t_vec = t_hat * f_t_mag[:, np.newaxis]
+                    np.add.at(forces, pair_i, f_t_vec)
+                    np.add.at(forces, pair_j, -f_t_vec)
+                if np.any(elem_active):
+                    F_on_i = -f_n_vec - f_t_vec
+                    cross_val = np.zeros(len(pair_i))
+                    cross_val[olap_mask] = -(d_vec[olap_mask, 0] * F_on_i[olap_mask, 1] - d_vec[olap_mask, 1] * F_on_i[olap_mask, 0])
+                    np.add.at(moments, pair_i, 0.5 * cross_val)
+                    np.add.at(moments, pair_j, -0.5 * cross_val)
+    
+            if ship_trajectory is None:
+                for comp in components:
+                    total_mass_c = sum(masses[ci] for ci in comp)
+                    drift_force = drift_vel * total_mass_c * cfg.drift_factor
+                    for ci in comp:
+                        forces[ci, 0] += drift_force * masses[ci] / total_mass_c
+    
+            # Eq. 9: Fd = 0.5·CFd·ρw·Σ Asub·(v_ice - v_water)·|v_ice - v_water|
+            v_water = ocean_current.sample_batch(positions)  # (n, 2)
+            v_rel = velocities - v_water
+            v_rel_mag = np.linalg.norm(v_rel, axis=1, keepdims=True)
+            v_rel_mag_safe = np.maximum(v_rel_mag, 1e-12)
+            v_rel_mag_1d = v_rel_mag_safe.ravel()
+            drag_force = np.where(
+                v_rel_mag > 1e-6,
+                (v_rel / v_rel_mag_safe) * (0.5 * RHO_WATER * cfg.c_d_drag * np.expand_dims(A_drag, axis=1) * (v_rel_mag_1d ** 2)[:, np.newaxis]),
+                0.5 * RHO_WATER * cfg.c_d_drag * np.expand_dims(A_drag, axis=1) * cfg.linear_drag_factor * v_rel,
+            )
+            forces -= drag_force
+    
+            A_sub_area = areas * np.minimum(submergence / np.maximum(thicknesses, 1e-10), 1.0)
+            CMd = getattr(cfg, "drag_coefficient_moment", 0.4)
+            Md = -0.5 * CMd * RHO_WATER * (radii ** 3) * angular_vels * np.abs(angular_vels) * A_sub_area
+            moments += Md
+    
+            # ── Rigid-body component integration (legacy) ─────────────────
+            # Each bonded component shares a single velocity (COM), maintaining
+            # relative positions.  This prevents internal "bouncing" while the
+            # DPDEM damage criterion still operates on end-of-frame bond stress.
+            new_velocities = velocities.copy()
+            new_positions = positions.copy()
             for comp in components:
-                total_mass_c = sum(masses[ci] for ci in comp)
-                drift_force = drift_vel * total_mass_c * cfg.drift_factor
-                for ci in comp:
-                    forces[ci, 0] += drift_force * masses[ci] / total_mass_c
-
-        v_mag = np.linalg.norm(velocities, axis=1, keepdims=True)
-        v_mag_safe = np.maximum(v_mag, 1e-12)
-        v_mag_1d = v_mag_safe.ravel()
-        drag_force = np.where(
-            v_mag > 1e-6,
-            (velocities / v_mag_safe) * (0.5 * RHO_WATER * cfg.c_d_drag * np.expand_dims(A_drag, axis=1) * (v_mag_1d ** 2)[:, np.newaxis]),
-            0.5 * RHO_WATER * cfg.c_d_drag * np.expand_dims(A_drag, axis=1) * cfg.linear_drag_factor * velocities,
-        )
-        forces -= drag_force
-
-        A_sub_area = areas * np.minimum(submergence / np.maximum(thicknesses, 1e-10), 1.0)
-        CMd = getattr(cfg, "drag_coefficient_moment", 0.4)
-        Md = -0.5 * CMd * RHO_WATER * (radii ** 3) * angular_vels * np.abs(angular_vels) * A_sub_area
-        moments += Md
-
-        # ── Rigid-body component integration (legacy) ─────────────────
-        # Each bonded component shares a single velocity (COM), maintaining
-        # relative positions.  This prevents internal "bouncing" while the
-        # DPDEM damage criterion still operates on end-of-frame bond stress.
-        new_velocities = velocities.copy()
-        new_positions = positions.copy()
-        for comp in components:
-            if not any(elem_active[ci] for ci in comp):
-                continue
-            if len(comp) == 1:
-                i = comp[0]
-                accel = forces[i] / masses[i]
-                new_velocities[i] += accel * dt_ice
-                new_velocities[i] = np.clip(new_velocities[i], cfg.velocity_clip[0], cfg.velocity_clip[1])
-                new_positions[i] += new_velocities[i] * dt_ice
-            else:
-                total_mass = sum(masses[ci] for ci in comp)
-                com = sum(masses[ci] * positions[ci] for ci in comp) / total_mass
-                total_force = sum(forces[ci] for ci in comp)
-                comp_vel = sum(masses[ci] * velocities[ci] for ci in comp) / total_mass
-                accel = total_force / total_mass
-                comp_vel += accel * dt_ice
-                comp_vel = np.clip(comp_vel, cfg.velocity_clip[0], cfg.velocity_clip[1])
-                new_com = com + comp_vel * dt_ice
-                for ci in comp:
-                    new_velocities[ci] = comp_vel
-                    new_positions[ci] = new_com + (positions[ci] - com)
-        velocities = new_velocities
-        positions = new_positions
-
-        # Sanitize after sub-stepping
-        if np.any(elem_active):
-            bad_vel = ~np.isfinite(velocities)
-            velocities = np.where(bad_vel, 0.0, velocities)
-            velocities = np.clip(velocities, cfg.velocity_clip[0], cfg.velocity_clip[1])
-            bad_pos = ~np.isfinite(positions)
-            if np.any(bad_pos):
-                positions = np.where(bad_pos, positions_history[-1], positions)
-                still_bad = ~np.isfinite(positions)
-                if np.any(still_bad):
-                    domain_cx = float(np.nanmean(positions[:, 0])) if np.any(np.isfinite(positions[:, 0])) else 0.0
-                    domain_cy = float(np.nanmean(positions[:, 1])) if np.any(np.isfinite(positions[:, 1])) else 0.0
-                    if not np.isfinite(domain_cx):
-                        domain_cx = 0.0
-                    if not np.isfinite(domain_cy):
-                        domain_cy = 0.0
-                    positions = np.where(still_bad, np.array([domain_cx, domain_cy]), positions)
-            position_domain = getattr(cfg, "position_clip_m", 1e4)
-            positions = np.clip(positions, -position_domain, position_domain)
-
-        element_stress = ship_collision_force.copy()
-        # Bond stress accumulation and breaking (vectorized).
-        intact = bond_intact
-        d_bond = positions[bond_j] - positions[bond_i]
-        dist_bond = np.linalg.norm(d_bond, axis=1)
-        dist_bond_safe = np.maximum(dist_bond, 1e-10)
-        bond_dir = d_bond / dist_bond_safe[:, np.newaxis]
-        stretch_bond = np.abs(dist_bond - rest_lengths)
-        avg_thickness_bond = (thicknesses[bond_i] + thicknesses[bond_j]) * 0.5
-        stiffness_bond = IceProperties.YOUNGS_MODULUS * avg_thickness_bond * cfg.bond_stiffness_factor
-        bond_force_mag = stiffness_bond * stretch_bond
-        np.add.at(element_stress, bond_i, np.where(intact, bond_force_mag, 0))
-        np.add.at(element_stress, bond_j, np.where(intact, bond_force_mag, 0))
-        for _ in range(cfg.stress_diffusion_steps):
-            new_stress = element_stress.copy()
-            transfer_i_to_j = intact & (element_stress[bond_i] > element_stress[bond_j])
-            transfer_j_to_i = intact & (element_stress[bond_j] >= element_stress[bond_i])
-            np.add.at(new_stress, bond_j, np.where(transfer_i_to_j, element_stress[bond_i] * cfg.stress_transfer, 0))
-            np.add.at(new_stress, bond_i, np.where(transfer_j_to_i, element_stress[bond_j] * cfg.stress_transfer, 0))
-            element_stress = new_stress
-
-        if use_dpdem_bonds and len(bonds) > 0:
-            both_ep_active = elem_active[bond_i] & elem_active[bond_j]
-            floe_ok = (
-                dpdem_floe_eligible[initial_floe_of[bond_i]]
-                & dpdem_floe_eligible[initial_floe_of[bond_j]]
-            )
-
-            # Spatial locality: DPDEM damage only on bonds at or near the crack front.
-            #  (a) at least one endpoint is directly colliding with the ship, OR
-            #  (b) at least one endpoint is shared with an already-broken bond (crack tip).
-            bond_near_ship = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
-            elem_at_crack = np.zeros(n, dtype=bool)
-            broken_mask = ~bond_intact
-            if np.any(broken_mask):
-                elem_at_crack[bond_i[broken_mask]] = True
-                elem_at_crack[bond_j[broken_mask]] = True
-            bond_at_crack = elem_at_crack[bond_i] | elem_at_crack[bond_j]
-            bond_dpdem_ok = both_ep_active & floe_ok & (bond_near_ship | bond_at_crack)
-
-            v_rel = velocities[bond_j] - velocities[bond_i]
-            v_n = np.sum(v_rel * bond_dir, axis=1)
-            v_t_vec = v_rel - v_n[:, np.newaxis] * bond_dir
-            ds_incr = np.linalg.norm(v_t_vec, axis=1) * dt_ice
-            bond_delta_s[:] = bond_delta_s + np.where(bond_dpdem_ok, ds_incr, 0.0)
-            if frame > 0 and np.any(bond_dpdem_ok):
-                delta_n = dist_bond - rest_lengths
-                delta_s = bond_delta_s
-                L0 = np.maximum(rest_lengths, 1e-10)
-                sigma_n_elastic = k_n * (delta_n / L0)
-                sigma_t_elastic = k_s * (delta_s / L0)
-                sigma_n = sigma_n_elastic * (1.0 - bond_damage)
-                sigma_t = sigma_t_elastic * (1.0 - bond_damage)
-                bond_damage[:], bond_delta_m_max[:], bond_delta_m_0[:], new_intact = update_bond_damage_state(
-                    delta_n, delta_s, sigma_n, sigma_t, sigma_bar_bond,
-                    cfg.bond_cohesion, cfg.bond_internal_friction,
-                    cfg.bond_G_c_I, cfg.bond_G_c_II, cfg.bond_eta_bk,
-                    bond_damage, bond_delta_m_max, bond_delta_m_0, intact,
+                if not any(elem_active[ci] for ci in comp) and not has_current:
+                    continue
+                if len(comp) == 1:
+                    i = comp[0]
+                    accel = forces[i] / masses[i]
+                    new_velocities[i] += accel * dt_ice
+                    new_velocities[i] = np.clip(new_velocities[i], cfg.velocity_clip[0], cfg.velocity_clip[1])
+                    new_positions[i] += new_velocities[i] * dt_ice
+                else:
+                    total_mass = sum(masses[ci] for ci in comp)
+                    com = sum(masses[ci] * positions[ci] for ci in comp) / total_mass
+                    total_force = sum(forces[ci] for ci in comp)
+                    comp_vel = sum(masses[ci] * velocities[ci] for ci in comp) / total_mass
+                    accel = total_force / total_mass
+                    comp_vel += accel * dt_ice
+                    comp_vel = np.clip(comp_vel, cfg.velocity_clip[0], cfg.velocity_clip[1])
+                    new_com = com + comp_vel * dt_ice
+                    for ci in comp:
+                        new_velocities[ci] = comp_vel
+                        new_positions[ci] = new_com + (positions[ci] - com)
+            velocities = new_velocities
+            positions = new_positions
+    
+            # Sanitize after sub-stepping
+            if np.any(elem_active):
+                bad_vel = ~np.isfinite(velocities)
+                velocities = np.where(bad_vel, 0.0, velocities)
+                velocities = np.clip(velocities, cfg.velocity_clip[0], cfg.velocity_clip[1])
+                bad_pos = ~np.isfinite(positions)
+                if np.any(bad_pos):
+                    positions = np.where(bad_pos, positions_history[-1], positions)
+                    still_bad = ~np.isfinite(positions)
+                    if np.any(still_bad):
+                        domain_cx = float(np.nanmean(positions[:, 0])) if np.any(np.isfinite(positions[:, 0])) else 0.0
+                        domain_cy = float(np.nanmean(positions[:, 1])) if np.any(np.isfinite(positions[:, 1])) else 0.0
+                        if not np.isfinite(domain_cx):
+                            domain_cx = 0.0
+                        if not np.isfinite(domain_cy):
+                            domain_cy = 0.0
+                        positions = np.where(still_bad, np.array([domain_cx, domain_cy]), positions)
+                position_domain = getattr(cfg, "position_clip_m", 1e4)
+                positions = np.clip(positions, -position_domain, position_domain)
+    
+            element_stress = ship_collision_force.copy()
+            # Bond stress accumulation and breaking (vectorized).
+            intact = bond_intact
+            d_bond = positions[bond_j] - positions[bond_i]
+            dist_bond = np.linalg.norm(d_bond, axis=1)
+            dist_bond_safe = np.maximum(dist_bond, 1e-10)
+            bond_dir = d_bond / dist_bond_safe[:, np.newaxis]
+            stretch_bond = np.abs(dist_bond - rest_lengths)
+            avg_thickness_bond = (thicknesses[bond_i] + thicknesses[bond_j]) * 0.5
+            stiffness_bond = IceProperties.YOUNGS_MODULUS * avg_thickness_bond * cfg.bond_stiffness_factor
+            bond_force_mag = stiffness_bond * stretch_bond
+            np.add.at(element_stress, bond_i, np.where(intact, bond_force_mag, 0))
+            np.add.at(element_stress, bond_j, np.where(intact, bond_force_mag, 0))
+            for _ in range(cfg.stress_diffusion_steps):
+                new_stress = element_stress.copy()
+                transfer_i_to_j = intact & (element_stress[bond_i] > element_stress[bond_j])
+                transfer_j_to_i = intact & (element_stress[bond_j] >= element_stress[bond_i])
+                np.add.at(new_stress, bond_j, np.where(transfer_i_to_j, element_stress[bond_i] * cfg.stress_transfer, 0))
+                np.add.at(new_stress, bond_i, np.where(transfer_j_to_i, element_stress[bond_j] * cfg.stress_transfer, 0))
+                element_stress = new_stress
+    
+            if use_dpdem_bonds and len(bonds) > 0:
+                both_ep_active = elem_active[bond_i] & elem_active[bond_j]
+                floe_ok = (
+                    dpdem_floe_eligible[initial_floe_of[bond_i]]
+                    & dpdem_floe_eligible[initial_floe_of[bond_j]]
                 )
-                bond_intact[:] = new_intact
-            # Ship collision can still break bonds (only when there is actual contact)
-            collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
-            collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
-            effective_strength = bond_strengths * cfg.effective_strength_collision
-            break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
-            bond_intact[break_collision] = False
-        else:
-            # Legacy breaking: force vs effective strength
-            bond_force = stiffness_bond * stretch_bond + np.maximum(element_stress[bond_i], element_stress[bond_j]) * cfg.propagated_stress_factor
-            propagated_stress_bond = np.maximum(element_stress[bond_i], element_stress[bond_j])
-            collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
-            collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
-            effective_strength = np.where(
-                collision_on_bond,
-                bond_strengths * cfg.effective_strength_collision,
-                np.where(
-                    propagated_stress_bond > bond_strengths * cfg.effective_strength_stress_threshold,
-                    bond_strengths * cfg.effective_strength_stress,
-                    bond_strengths,
-                ),
-            )
-            break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
-            break_force = intact & (bond_force > effective_strength)
-            bond_intact[break_collision | break_force] = False
-
-        # Eq. 8: I·dω/dt = Mc + Mb + Mh; only update active elements
-        if np.any(elem_active):
-            alpha = moments / inertia
-            angular_vels[elem_active] += alpha[elem_active] * dt_ice
-            angular_vels[elem_active] += np.random.randn(int(elem_active.sum())) * cfg.angular_noise
-            angular_vels[elem_active] *= cfg.angular_damping
-            angular_vels = np.clip(angular_vels, cfg.angular_cap[0], cfg.angular_cap[1])
-        rotations += angular_vels * dt_ice
-
+    
+                # Spatial locality: DPDEM damage only on bonds at or near the crack front.
+                #  (a) at least one endpoint is directly colliding with the ship, OR
+                #  (b) at least one endpoint is shared with an already-broken bond (crack tip).
+                bond_near_ship = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+                elem_at_crack = np.zeros(n, dtype=bool)
+                broken_mask = ~bond_intact
+                if np.any(broken_mask):
+                    elem_at_crack[bond_i[broken_mask]] = True
+                    elem_at_crack[bond_j[broken_mask]] = True
+                bond_at_crack = elem_at_crack[bond_i] | elem_at_crack[bond_j]
+                bond_dpdem_ok = both_ep_active & floe_ok & (bond_near_ship | bond_at_crack)
+    
+                v_rel = velocities[bond_j] - velocities[bond_i]
+                v_n = np.sum(v_rel * bond_dir, axis=1)
+                v_t_vec = v_rel - v_n[:, np.newaxis] * bond_dir
+                ds_incr = np.linalg.norm(v_t_vec, axis=1) * dt_ice
+                bond_delta_s[:] = bond_delta_s + np.where(bond_dpdem_ok, ds_incr, 0.0)
+                if frame > 0 and np.any(bond_dpdem_ok):
+                    delta_n = dist_bond - rest_lengths
+                    delta_s = bond_delta_s
+                    L0 = np.maximum(rest_lengths, 1e-10)
+                    sigma_n_elastic = k_n * (delta_n / L0)
+                    sigma_t_elastic = k_s * (delta_s / L0)
+                    sigma_n = sigma_n_elastic * (1.0 - bond_damage)
+                    sigma_t = sigma_t_elastic * (1.0 - bond_damage)
+                    bond_damage[:], bond_delta_m_max[:], bond_delta_m_0[:], new_intact = update_bond_damage_state(
+                        delta_n, delta_s, sigma_n, sigma_t, sigma_bar_bond,
+                        cfg.bond_cohesion, cfg.bond_internal_friction,
+                        cfg.bond_G_c_I, cfg.bond_G_c_II, cfg.bond_eta_bk,
+                        bond_damage, bond_delta_m_max, bond_delta_m_0, intact,
+                    )
+                    bond_intact[:] = new_intact
+                # Ship collision can still break bonds (only when there is actual contact)
+                collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+                collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
+                effective_strength = bond_strengths * cfg.effective_strength_collision
+                break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
+                bond_intact[break_collision] = False
+            else:
+                # Legacy breaking: force vs effective strength
+                bond_force = stiffness_bond * stretch_bond + np.maximum(element_stress[bond_i], element_stress[bond_j]) * cfg.propagated_stress_factor
+                propagated_stress_bond = np.maximum(element_stress[bond_i], element_stress[bond_j])
+                collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+                collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
+                effective_strength = np.where(
+                    collision_on_bond,
+                    bond_strengths * cfg.effective_strength_collision,
+                    np.where(
+                        propagated_stress_bond > bond_strengths * cfg.effective_strength_stress_threshold,
+                        bond_strengths * cfg.effective_strength_stress,
+                        bond_strengths,
+                    ),
+                )
+                break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
+                break_force = intact & (bond_force > effective_strength)
+                bond_intact[break_collision | break_force] = False
+    
+            # Eq. 8: I·dω/dt = Mc + Mb + Mh; only update active elements
+            if np.any(elem_active):
+                alpha = moments / inertia
+                angular_vels[elem_active] += alpha[elem_active] * dt_ice
+                angular_vels[elem_active] += np.random.randn(int(elem_active.sum())) * cfg.angular_noise
+                angular_vels[elem_active] *= cfg.angular_damping
+                angular_vels = np.clip(angular_vels, cfg.angular_cap[0], cfg.angular_cap[1])
+            rotations += angular_vels * dt_ice
+    
         if use_ship_dynamics:
             psi = ship_heading_dyn
             nu = np.array([ship_u, ship_v, ship_r])
@@ -688,6 +712,8 @@ def simulate_ice_ship_interaction(
                 Kp_xy * e_xy_body[1] + Kd_ship * (nu_des[1] - nu[1]),
                 Kp_psi * e_psi - Kd_ship * nu[2],
             ])
+            if ship_drift_only:
+                tau_control = np.zeros(3)
             if getattr(cfg, "use_mss_style_dynamics", False):
                 C = coriolis_3dof(M3, nu)
             else:
@@ -695,7 +721,14 @@ def simulate_ice_ship_interaction(
                 C[0, 2] = -m * nu[1]
                 C[1, 2] = m * nu[0]
                 C[2, 0], C[2, 1] = -C[0, 2], -C[1, 2]
-            nu_dot = M3inv @ (tau_control + tau_ice - D3 @ nu - C @ nu)
+            # Current effect on ship: damping uses relative velocity (Fossen body-frame)
+            if has_current:
+                v_c_world = ocean_current.sample(ship_pos_dyn[0], ship_pos_dyn[1])
+                v_c_body = R_xy(psi).T @ v_c_world
+                nu_r_ship = nu - np.array([v_c_body[0], v_c_body[1], 0.0])
+            else:
+                nu_r_ship = nu
+            nu_dot = M3inv @ (tau_control + tau_ice - D3 @ nu_r_ship - C @ nu)
             nu = nu + nu_dot * dt
             vc = cfg.ship_velocity_clip
             nu[0] = np.clip(nu[0], -vc[0], vc[0])
@@ -724,6 +757,8 @@ def simulate_ice_ship_interaction(
             if ship_trajectory is not None and frame < len(ship_trajectory):
                 commanded_trajectory.append((np.array(ship_trajectory[frame][0]), float(ship_trajectory[frame][1])))
             ship_history.append((ship_pos_frame, ship_heading))
+
+        ocean_current.step()
 
         positions_history.append(positions.copy())
         rotations_history.append(rotations.copy())

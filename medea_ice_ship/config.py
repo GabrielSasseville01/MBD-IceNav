@@ -125,6 +125,24 @@ class SimulationConfig:
     # Scale factor for ice drift velocity when ship is not moving (e.g. wind/current proxy).
     drift_factor: float = 8.0
 
+    # --- Ocean currents ---
+    # Current mode: "none" (default), "uniform", "learned".
+    ocean_current_mode: str = "none"
+    # Current speed [m/s] (uniform mode, or peak of synthetic initial field for learned mode).
+    ocean_current_speed: float = 0.3
+    # Current direction [radians] for uniform mode (0 = +x, pi/2 = +y).
+    ocean_current_direction: float = 0.0
+    # Path to initial current field (.npy / .pkl / .pth) for learned mode. If None a synthetic divergence-free field is generated.
+    ocean_current_field_path: Optional[str] = None
+    # Path to trained SeaCurrentRNN weights (learned mode only). Train with: python scripts/train_seanet.py --synthetic
+    ocean_current_seanet_weights: Optional[str] = None
+    # Spatial grid resolution when generating synthetic initial field.
+    ocean_current_grid_resolution: int = 64
+    # Evolve the learned field every N simulation frames.
+    ocean_current_update_every: int = 1000
+    # Multiplicative scale applied to the learned field velocities.
+    ocean_current_noise_strength: float = 0.5
+
     # --- Water drag on ice ---
     # Quadratic drag coefficient (F_drag ∝ c_d × area × v² at reference thickness).
     c_d_drag: float = 0.4

@@ -411,6 +411,17 @@ def _draw_2d_frame_to_array(data, frame_idx):
     ax.set_ylim(data["y_min"], data["y_max"])
     ax.set_aspect("equal")
     ax.set_facecolor(data["water_color"])
+    cviz = data.get("current_viz")
+    if cviz is not None:
+        cX, cY, cU, cV = cviz
+        cMag = np.sqrt(cU**2 + cV**2)
+        max_mag = float(np.max(cMag)) if cMag.size > 0 else 1e-6
+        x_r, y_r = data["x_max"] - data["x_min"], data["y_max"] - data["y_min"]
+        arrow_scale = (0.25 * min(x_r, y_r)) / (max_mag + 1e-12)
+        cU_plot, cV_plot = cU * arrow_scale, cV * arrow_scale
+        ax.quiver(cX, cY, cU_plot, cV_plot, cMag, cmap='cool', alpha=0.45,
+                  angles='xy', scale_units='xy', scale=1,
+                  zorder=0, width=0.003)
     for i in range(n_elements):
         c, s = np.cos(rotations[i]), np.sin(rotations[i])
         rotated = local_polys[i] @ np.array([[c, -s], [s, c]]).T
@@ -910,9 +921,11 @@ def animate_ice_ship_2d(
     output_file='medea_ship_fracture.gif', fps=20, frame_skip=1, n_workers=1,
     figsize=(16, 12),
     view_bounds=None,
+    ocean_current=None,
 ):
     """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame.
-    view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice."""
+    view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice.
+    ocean_current: OceanCurrentModel or None; when set, draws a quiver plot of the current field behind the ice."""
     n_frames = len(positions_history)
     frames_to_render = list(range(0, n_frames, frame_skip))
     if frames_to_render[-1] != n_frames - 1:
@@ -956,6 +969,10 @@ def animate_ice_ship_2d(
     writer, out_path = _animation_writer(output_file, fps)
     use_mp4 = str(output_file).lower().endswith(".mp4") and out_path.lower().endswith(".mp4")
 
+    _current_viz_data = None
+    if ocean_current is not None and getattr(ocean_current, 'is_active', False):
+        _current_viz_data = ocean_current.get_field_for_viz(x_min, x_max, y_min, y_max, nx=18, ny=18)
+
     if n_workers > 1 and use_mp4 and n_render > 0:
         print(f"Creating 2D animation with {n_render} frames (parallel, n_workers={n_workers})...", flush=True)
         data = {
@@ -976,6 +993,7 @@ def animate_ice_ship_2d(
             "ship_color": ship_color,
             "figsize": figsize,
             "dpi": _RENDER_DPI,
+            "current_viz": _current_viz_data,
         }
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
@@ -1014,6 +1032,10 @@ def animate_ice_ship_2d(
 
     print(f"Creating 2D animation with {n_render} frames (frame_skip={frame_skip})...", flush=True)
 
+    current_viz = None
+    if ocean_current is not None and getattr(ocean_current, 'is_active', False):
+        current_viz = ocean_current.get_field_for_viz(x_min, x_max, y_min, y_max, nx=18, ny=18)
+
     def update(frame_idx):
         frame = frames_to_render[frame_idx]
         ax.clear()
@@ -1021,6 +1043,16 @@ def animate_ice_ship_2d(
         ax.set_ylim(y_min, y_max)
         ax.set_aspect('equal')
         ax.set_facecolor(water_color)
+        if current_viz is not None:
+            cX, cY, cU, cV = current_viz
+            cMag = np.sqrt(cU**2 + cV**2)
+            max_mag = float(np.max(cMag)) if cMag.size > 0 else 1e-6
+            arrow_scale = (0.25 * min(x_max - x_min, y_max - y_min)) / (max_mag + 1e-12)
+            cU_plot, cV_plot = cU * arrow_scale, cV * arrow_scale
+            ax.quiver(cX, cY, cU_plot, cV_plot, cMag,
+                      cmap='cool', alpha=0.45,
+                      angles='xy', scale_units='xy', scale=1,
+                      zorder=0, width=0.003)
         positions = positions_history[frame]
         rotations = rotations_history[frame]
         intact = bonds_history[frame]

@@ -26,3 +26,10 @@ shapely>=2.0.0
 
 # Optional: path refinement NLP (planning_use_path_optimizer / --optimize-path)
 # pip install casadi
+
+# Optional: SeaCurrentRNN learned ocean current model (--current learned)
+# torch is only needed for the "learned" current mode and seanet training.
+# pip install torch
+
+# Optional: ECCO4 preprocessing (scripts/preprocess_ecco4.py)
+# pip install xarray requests netcdf4

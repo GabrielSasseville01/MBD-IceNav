@@ -19,6 +19,7 @@ from medea_ice_ship.simulation import point_to_ship_collision, simulate_ice_ship
 from medea_ice_ship.visualization import animate_ice_ship_2d, animate_ice_ship_3d, animate_costmap_movie, make_live_2d_callback, plot_hull_impact_vectors, animate_lattice_search
 from medea_ice_ship.state_io import save_simulation_state, load_simulation_state
 from medea_ice_ship.costmap_build import build_costmap_from_ice_state
+from medea_ice_ship.ocean_current import create_ocean_current_model
 from medea_ice_ship.planning import (
     create_medea_lattice_planner,
     create_medea_diffusion_mpc_planner,
@@ -66,4 +67,5 @@ __all__ = [
     'optimize_with_sqp',
     'optimize_with_gradcem',
     'path_to_ship_trajectory',
+    'create_ocean_current_model',
 ]

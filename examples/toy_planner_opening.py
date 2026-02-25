@@ -69,6 +69,7 @@ from medea_ice_ship import (
     make_live_2d_callback,
     plot_hull_impact_vectors,
     animate_lattice_search,
+    create_ocean_current_model,
 )
 from medea_ice_ship.config import get_default_run_config, get_default_simulation_config
 
@@ -144,6 +145,11 @@ def main():
                         help="Disable receding-horizon replanning (use single initial path for whole run)")
     parser.add_argument("--no-dpdem-bonds", action="store_true",
                         help="Use legacy bond model (force vs strength) instead of default DPDEM-style")
+    parser.add_argument("--current", type=str, default="none", choices=["none", "uniform", "learned"],
+                        help="Ocean current mode (default: none)")
+    parser.add_argument("--current-speed", type=float, default=0.4, help="Current speed [m/s] (uniform)")
+    parser.add_argument("--current-direction", type=float, default=90.0,
+                        help="Current direction [degrees, 0=+x] (uniform)")
     args = parser.parse_args()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +365,15 @@ def main():
     if args.no_dpdem_bonds:
         sim_cfg = replace(sim_cfg, use_dpdem_style_bonds=False)
         print("  Bond model: legacy (force vs strength)", flush=True)
+    domain = (x_min, costmap_x_max, y_min, y_max)
+    ocean_current = create_ocean_current_model(
+        mode=args.current,
+        domain=domain,
+        speed=args.current_speed,
+        direction_rad=np.radians(args.current_direction),
+    )
+    if args.current != "none":
+        print(f"  Ocean current: {args.current}, speed={args.current_speed:.2f} m/s, dir={args.current_direction:.0f}°", flush=True)
     sim_result = simulate_ice_ship_interaction(
         polygons=polygons,
         centroids=centroids.copy(),
@@ -377,6 +392,7 @@ def main():
         replan_callback=replan_callback,
         frame_callback=frame_callback,
         parent_ids=parent_floe_ids,
+        ocean_current=ocean_current,
     )
     positions_history = sim_result[0]
     rotations_history = sim_result[1]
@@ -429,6 +445,7 @@ def main():
         frame_skip=2,
         n_workers=run_cfg.n_workers,
         view_bounds=view_bounds,
+        ocean_current=ocean_current,
     )
     print(f"Saved: {out_mp4.resolve()}")
 
