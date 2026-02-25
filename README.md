@@ -22,7 +22,7 @@ Each ice element is driven by four force categories:
 
 - **Fc** — contact forces from ship collision (penetration-based, with thrust cap) and ice-ice interaction (Hertz-like repulsion with Coulomb friction).
 - **Fb** — bond forces between bonded neighbours. Spring stiffness scales with ice thickness and Young's modulus; for DPDEM bonds the force is softened by the damage variable: `F = k · Δ · (1 − D)`.
-- **Fh** — hydrodynamic forces: buoyancy (`Ff = ρ_w · g · A · z_sub`) when pushed underwater by the ship, and quadratic drag (`Fd = 0.5 · C_Fd · ρ_w · A · v · |v|`, Eq. 9).
+- **Fh** — hydrodynamic forces: buoyancy (`Ff = ρ_w · g · A · z_sub`) when pushed underwater by the ship, and quadratic drag (`Fd = 0.5 · C_Fd · ρ_w · A · (v_ice − v_water) · |v_ice − v_water|`, Eq. 9). When ocean currents are enabled, drag uses the *relative* velocity between ice and local water so ice can drift with the current.
 - **G** — gravity, handled implicitly (2D horizontal plane; vertical buoyancy restores ice to the surface).
 
 Integration uses the Verlet algorithm (leapfrog/symplectic Euler form: `v += a·dt`, `x += v·dt`). Bonded components share a single centre-of-mass velocity (rigid-body component integration) for stability, while solo elements integrate independently.
@@ -220,6 +220,12 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--no-3d` | Skip 3D animation. |
 | `--no-lattice-search-movie` | With `--plan --planner lattice`: skip A* search movie. |
 | `--output-dir DIR` | Write outputs to `DIR` (default `outputs/default`). |
+| `--current none\|uniform\|learned` | Ocean current mode (default `none`). See [Ocean currents](#ocean-currents). |
+| `--current-speed S` | Current speed [m/s] for uniform mode (default from config). |
+| `--current-direction D` | Current direction [degrees, 0=+x] for uniform mode. |
+| `--seanet-weights PATH` | Path to trained `seanet.pth` for learned mode. |
+| `--current-field PATH` | Initial current field (e.g. `ecco4_x0.pth` or `seanet_x0.npy`) for learned mode. |
+| `--current-only` | With `--simple`: ship stays put; ice drifts under current only (for testing). |
 | `--seed N` | Random seed for reproducibility. |
 | `--gif` | Output GIF instead of MP4. |
 | `--live` | Real-time 2D window during simulation. |
@@ -227,6 +233,37 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--load-state FILE` | Replay: load state and generate animations only. |
 
 Optional tuning: `--thrust-cap N`, `--no-thrust-cap`, `--no-mss-dynamics`, `--no-dpdem-bonds` (legacy bonds), `--optimize-path` (NLP path refinement; requires CasADi).
+
+---
+
+## Ocean currents
+
+Three modes control the water velocity field used in drag (Eq. 9) and ship damping:
+
+| Mode | Description |
+|------|-------------|
+| **none** (default) | Zero current; drag uses ice/ship velocity as before. |
+| **uniform** | Constant speed and direction everywhere. Ice and ship experience relative-velocity drag; ice can drift with the current. |
+| **learned** | Spatially varying field evolved by **SeaCurrentRNN** (physics-informed shallow-water RNN). Requires PyTorch and trained weights. |
+
+**CLI (run_medea_ship_fracture.py):** `--current uniform`, `--current-speed 0.4`, `--current-direction 90` (degrees; 90 = +y). For learned: `--current learned`, `--seanet-weights data/seanet.pth`, `--current-field data/ecco4_x0.pth` (or `data/seanet_x0.npy` from synthetic training).
+
+**Learned model setup (no external data):**
+
+```bash
+# Train on synthetic divergence-free fields (no download)
+uv run python scripts/train_seanet.py --synthetic
+
+# Run simulation with learned currents
+uv run python run_medea_ship_fracture.py --simple --current learned \
+    --seanet-weights data/seanet.pth --current-field data/seanet_x0.npy
+```
+
+**Learned model with ECCO4 data:** Run `scripts/preprocess_ecco4.py` (requires NASA ECCO WebDAV credentials and `xarray`, `netcdf4`), then `scripts/train_seanet.py --data data/ECCO4.pkl`. Saves `data/seanet.pth` and `data/ecco4_x0.pth`.
+
+**Toy examples** (`toy_planner_opening.py`, `toy_planner_thin_corridor.py`) support `--current uniform`, `--current-speed`, `--current-direction`; default is no current.
+
+**Visualization:** When a current is active, the 2D animation draws a quiver plot of the current field behind the ice and ship.
 
 ---
 
