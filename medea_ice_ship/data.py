@@ -70,3 +70,80 @@ def create_simple_ice_field(seed=42):
         sat_centroids.append(np.array([cx, cy]))
     sat_centroids = np.array(sat_centroids)
     return sat_polygons, sat_centroids
+
+
+def create_sparse_toy_ice_field(
+    seed=42,
+    domain_x=(-120.0, 120.0),
+    domain_y=(-35.0, 35.0),
+    n_floes=12,
+    n_icebergs=3,
+    iceberg_thickness=10.0,
+    moderate_thickness_range=(0.5, 2.0),
+    floe_size_range=(8.0, 35.0),
+    min_gap=25.0,
+):
+    """
+    Create a sparse toy ice field with varying thickness: a few thick "icebergs"
+    (~10 m) and several moderate floes (0.5–2 m). For testing costmap/planning
+    and fracture behaviour.
+
+    Returns:
+        sat_polygons: list of 2D polygon arrays [m]
+        sat_centroids: (n_floes, 2) array [m]
+        sat_thicknesses: (n_floes,) array [m] — use these instead of assign_thickness_by_area
+    """
+    np.random.seed(seed)
+    x_min, x_max = domain_x
+    y_min, y_max = domain_y
+    sat_polygons = []
+    sat_centroids = []
+    sat_thicknesses = []
+
+    # Decide which floes are icebergs (thick) vs moderate
+    indices = np.arange(n_floes)
+    np.random.shuffle(indices)
+    iceberg_indices = set(indices[:n_icebergs])
+
+    positions = []
+    for _ in range(n_floes * 20):  # allow many attempts to place
+        w = np.random.uniform(*floe_size_range)
+        h = np.random.uniform(w * 0.4, w * 0.8)
+        cx = np.random.uniform(x_min + w, x_max - w)
+        cy = np.random.uniform(y_min + h, y_max - h)
+        ok = True
+        for (ox, oy, ow, oh) in positions:
+            if abs(cx - ox) < (w + ow) / 2 + min_gap and abs(cy - oy) < (h + oh) / 2 + min_gap:
+                ok = False
+                break
+        if ok:
+            positions.append((cx, cy, w, h))
+            if len(positions) >= n_floes:
+                break
+    if len(positions) < n_floes:
+        # fallback: allow smaller gaps
+        while len(positions) < n_floes:
+            w = np.random.uniform(*floe_size_range)
+            h = np.random.uniform(w * 0.4, w * 0.8)
+            cx = np.random.uniform(x_min + w, x_max - w)
+            cy = np.random.uniform(y_min + h, y_max - h)
+            positions.append((cx, cy, w, h))
+
+    for i, (cx, cy, w, h) in enumerate(positions[:n_floes]):
+        poly = np.array([
+            [cx - w, cy - h],
+            [cx + w, cy - h],
+            [cx + w, cy + h],
+            [cx - w, cy + h],
+        ])
+        sat_polygons.append(poly)
+        sat_centroids.append(np.array([cx, cy]))
+        if i in iceberg_indices:
+            t = iceberg_thickness
+        else:
+            t = np.random.uniform(*moderate_thickness_range)
+        sat_thicknesses.append(t)
+
+    sat_centroids = np.array(sat_centroids)
+    sat_thicknesses = np.array(sat_thicknesses, dtype=float)
+    return sat_polygons, sat_centroids, sat_thicknesses

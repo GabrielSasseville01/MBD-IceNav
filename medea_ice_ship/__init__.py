@@ -5,7 +5,7 @@ Submodules: properties, data, geometry, bonds, tessellation, simulation, visuali
 """
 
 from medea_ice_ship.properties import IceProperties, ShipProperties, R_xy, ssa
-from medea_ice_ship.data import load_medea_floes, scale_floes_to_world, create_simple_ice_field
+from medea_ice_ship.data import load_medea_floes, scale_floes_to_world, create_simple_ice_field, create_sparse_toy_ice_field
 from medea_ice_ship.geometry import (
     polygon_area,
     polygon_centroid,
@@ -39,6 +39,7 @@ __all__ = [
     'load_medea_floes',
     'scale_floes_to_world',
     'create_simple_ice_field',
+    'create_sparse_toy_ice_field',
     'polygon_area',
     'polygon_centroid',
     'create_ship_hull_at_position_heading',

@@ -390,6 +390,34 @@ def _get_ffmpeg_path():
     return shutil.which("ffmpeg")
 
 
+def _remaining_planned_path_from_snapshots(ship_pos, path_snapshots, frame_idx):
+    """
+    Return the planned path from the ship onward for a given frame (for 2D/3D movies).
+    path_snapshots: list of (frame_idx, path Nx3). Uses latest path with snapshot frame <= frame_idx.
+    Returns (Nx2) array [ship_pos, ...waypoints to goal] or None if no path.
+    """
+    if not path_snapshots or frame_idx is None:
+        return None
+    sorted_snapshots = sorted(path_snapshots, key=lambda t: t[0])
+    path = None
+    for (fidx, p) in sorted_snapshots:
+        if fidx <= frame_idx:
+            path = p
+    if path is None and sorted_snapshots:
+        path = sorted_snapshots[0][1]
+    if path is None or len(path) < 2:
+        return None
+    path_xy = np.asarray(path)[:, :2]
+    ship_pos = np.asarray(ship_pos).ravel()[:2]
+    # Trim to segment from ship onward: closest waypoint index, then from there to end
+    dists = np.linalg.norm(path_xy - ship_pos, axis=1)
+    trim_idx = int(np.argmin(dists))
+    remaining = np.vstack([ship_pos.reshape(1, 2), path_xy[trim_idx:]])
+    if len(remaining) < 2:
+        return None
+    return remaining
+
+
 def _draw_2d_frame_to_array(data, frame_idx):
     """Draw a single 2D frame; return RGB array (H, W, 3) uint8. Used by parallel workers."""
     frame = data["frames_to_render"][frame_idx]
@@ -436,6 +464,12 @@ def _draw_2d_frame_to_array(data, frame_idx):
         ship_outline = create_ship_hull_at_position_heading(data["ship_length"], data["ship_beam"], ship_pos_frame, ship_heading)
         ship_patch = MplPolygon(ship_outline, closed=True, facecolor=data["ship_color"], edgecolor="#202020", linewidth=2, alpha=0.95)
         ax.add_patch(ship_patch)
+        # Planned path from ship onward (updates at replan; only show remaining segment)
+        path_snapshots = data.get("path_snapshots")
+        if path_snapshots is not None:
+            remaining = _remaining_planned_path_from_snapshots(ship_pos_frame, path_snapshots, frame)
+            if remaining is not None and len(remaining) >= 2:
+                ax.plot(remaining[:, 0], remaining[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path (remaining)", zorder=4)
     n_broken = np.sum(~intact)
     ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nFrame {frame}/{data['n_frames']-1} | Bonds: {n_broken}/{len(bonds)} broken", fontsize=14)
     ax.set_xlabel("X [m]")
@@ -570,6 +604,12 @@ def _draw_3d_frame_to_array(data, frame_idx):
         ax.add_collection3d(Poly3DCollection([port_bot], facecolor=hull_below, edgecolor="#5C0000", linewidth=0.3, alpha=0.95))
         starboard_bot = np.array([hull_verts_world[base+3], hull_verts_world[next_base+3], hull_verts_world[next_base+4], hull_verts_world[base+4]])
         ax.add_collection3d(Poly3DCollection([starboard_bot], facecolor=hull_below, edgecolor="#5C0000", linewidth=0.3, alpha=0.95))
+    path_snapshots = data.get("path_snapshots")
+    if path_snapshots is not None:
+        remaining = _remaining_planned_path_from_snapshots(np.array([ship_x, ship_y]), path_snapshots, frame)
+        if remaining is not None and len(remaining) >= 2:
+            z_path = np.zeros(len(remaining))
+            ax.plot(remaining[:, 0], remaining[:, 1], z_path, "r-", linewidth=1.5, alpha=0.9)
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     ax.set_zlabel("Z [m]")
@@ -674,9 +714,20 @@ def _draw_costmap_frame_to_array(data, frame_idx):
         for poly in static_polygons:
             closed = np.vstack([poly, poly[0:1]])
             ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
-    # AUTO-IceNav colors: planned path = red, actual path = blue
-    if path is not None and len(path) > 0:
-        ax.plot(path[:, 0], path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
+    # Planned path: use path_snapshots at replan times, else single path
+    draw_path = data.get("path")
+    path_snapshots = data.get("path_snapshots")
+    if path_snapshots:
+        path_snapshots_sorted = sorted(path_snapshots, key=lambda t: t[0])
+        draw_path = None
+        for (fidx, p) in path_snapshots_sorted:
+            if fidx <= k:
+                draw_path = p
+        if draw_path is None and path_snapshots_sorted:
+            draw_path = path_snapshots_sorted[0][1]
+    if draw_path is not None and len(draw_path) > 0:
+        draw_path = np.asarray(draw_path)
+        ax.plot(draw_path[:, 0], draw_path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
     trail_end = min(k + 1, len(ship_history))
     if trail_end >= 2:
         trail_x = [ship_history[i][0][0] for i in range(trail_end)]
@@ -691,8 +742,14 @@ def _draw_costmap_frame_to_array(data, frame_idx):
     if len(ship_history) > 0:
         start_pos = ship_history[0][0]
         ax.plot(start_pos[0], start_pos[1], "go", markersize=10, label="Start", zorder=7)
-    if path is not None and len(path) > 0:
-        ax.plot(path[-1, 0], path[-1, 1], "gs", markersize=10, label="Goal", zorder=7)
+    goal_xy = data.get("goal")
+    if goal_xy is None and draw_path is not None and len(draw_path) > 0:
+        goal_xy = np.asarray(draw_path[-1])[:2]
+    elif goal_xy is None and path is not None and len(path) > 0:
+        goal_xy = np.asarray(path[-1])[:2]
+    if goal_xy is not None:
+        g = np.asarray(goal_xy).ravel()[:2]
+        ax.plot(g[0], g[1], "gs", markersize=10, label="Goal", zorder=7)
     ax.set_xlim(x_min_ax, x_max_ax)
     ax.set_ylim(y_min_ax, y_max_ax)
     ax.set_xlabel("x [m]")
@@ -722,6 +779,8 @@ def animate_costmap_movie(
     bounds,
     ship_history,
     path=None,
+    path_snapshots=None,
+    goal=None,
     polygons=None,
     positions_history=None,
     rotations_history=None,
@@ -738,12 +797,17 @@ def animate_costmap_movie(
     """
     Generate a costmap movie (AUTO-IceNav style): costmap as background, moving ice,
     planned path (red), actual path (blue), ship and start/goal. The costmap can be
-    updated every X frames (e.g. at replan times) via costmap_snapshots.
+    updated every X frames (e.g. at replan times) via costmap_snapshots. The planned
+    path can also update at replan times via path_snapshots.
 
     cost_map: default costmap (used for all frames if costmap_snapshots is None)
     bounds: dict with x_min, x_max, y_min, y_max, x_origin, y_origin, etc.
     ship_history: list of (position_2d, heading) per frame
-    path: Nx3 planned path [x,y,heading] or None
+    path: Nx3 planned path [x,y,heading] or None (used when path_snapshots is None)
+    path_snapshots: optional list of (frame_idx, path) so the red planned path updates
+        at replan times; for each frame the latest path with frame_idx <= current_frame is drawn.
+    goal: fixed (x, y) for the goal marker (green square). When provided, the goal stays fixed
+        across replans; when None, the marker is taken from path[-1] (may jump when path updates).
     polygons: list of polygon arrays for static ice outline, or None (ignored if moving ice provided)
     positions_history, rotations_history, local_polygons: per-frame ice state for moving ice
     costmap_snapshots: optional list of (frame_idx, cost_map) so the costmap is updated only at
@@ -764,22 +828,29 @@ def animate_costmap_movie(
     cols = getattr(cost_map, "cols", cost_map.cost_map.shape[1])
     rows = getattr(cost_map, "rows", cost_map.cost_map.shape[0])
     ship_positions = np.array([h[0] for h in ship_history])
-    x_min_ax = float(ship_positions[:, 0].min() - ship_length - 20)
-    x_max_ax = float(ship_positions[:, 0].max() + ship_length + 20)
-    y_min_ax = float(ship_positions[:, 1].min() - ship_beam - 20)
-    y_max_ax = float(ship_positions[:, 1].max() + ship_beam + 20)
+    margin = 25
+    x_min_ax = float(ship_positions[:, 0].min() - ship_length - margin)
+    x_max_ax = float(ship_positions[:, 0].max() + ship_length + margin)
+    y_min_ax = float(ship_positions[:, 1].min() - ship_beam - margin)
+    y_max_ax = float(ship_positions[:, 1].max() + ship_beam + margin)
     if path is not None and len(path) > 0:
-        x_min_ax = min(x_min_ax, float(path[:, 0].min()) - 20)
-        x_max_ax = max(x_max_ax, float(path[:, 0].max()) + 20)
-        y_min_ax = min(y_min_ax, float(path[:, 1].min()) - 20)
-        y_max_ax = max(y_max_ax, float(path[:, 1].max()) + 20)
+        x_min_ax = min(x_min_ax, float(path[:, 0].min()) - margin)
+        x_max_ax = max(x_max_ax, float(path[:, 0].max()) + margin)
+        y_min_ax = min(y_min_ax, float(path[:, 1].min()) - margin)
+        y_max_ax = max(y_max_ax, float(path[:, 1].max()) + margin)
+    if goal is not None:
+        g = np.asarray(goal).ravel()[:2]
+        x_min_ax = min(x_min_ax, float(g[0]) - margin)
+        x_max_ax = max(x_max_ax, float(g[0]) + margin)
+        y_min_ax = min(y_min_ax, float(g[1]) - margin)
+        y_max_ax = max(y_max_ax, float(g[1]) + margin)
     # Same view extent as 2D simulation when ice history is provided
     if positions_history is not None and len(positions_history) > 0:
         all_pos = np.concatenate(positions_history)
-        x_min_ax = min(x_min_ax, float(all_pos[:, 0].min()) - 20)
-        x_max_ax = max(x_max_ax, float(all_pos[:, 0].max()) + 20)
-        y_min_ax = min(y_min_ax, float(all_pos[:, 1].min()) - 20)
-        y_max_ax = max(y_max_ax, float(all_pos[:, 1].max()) + 20)
+        x_min_ax = min(x_min_ax, float(all_pos[:, 0].min()) - margin)
+        x_max_ax = max(x_max_ax, float(all_pos[:, 0].max()) + margin)
+        y_min_ax = min(y_min_ax, float(all_pos[:, 1].min()) - margin)
+        y_max_ax = max(y_max_ax, float(all_pos[:, 1].max()) + margin)
 
     data = {
         "cost_grid": cost_map.cost_map,
@@ -790,6 +861,8 @@ def animate_costmap_movie(
         "rows": rows,
         "ship_history": ship_history,
         "path": np.asarray(path) if path is not None else None,
+        "path_snapshots": list(path_snapshots) if path_snapshots else None,
+        "goal": np.asarray(goal, dtype=float).ravel()[:2] if goal is not None else None,
         "polygons": list(polygons) if polygons is not None else [],
         "positions_history": positions_history,
         "rotations_history": rotations_history,
@@ -882,8 +955,19 @@ def animate_costmap_movie(
             for poly in (polygons or []):
                 closed = np.vstack([poly, poly[0:1]])
                 ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
-        if path is not None and len(path) > 0:
-            ax.plot(path[:, 0], path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
+        # Planned path: use path_snapshots at replan times, else single path
+        draw_path = path
+        if path_snapshots:
+            path_snapshots_sorted = sorted(path_snapshots, key=lambda t: t[0])
+            draw_path = None
+            for (fidx, p) in path_snapshots_sorted:
+                if fidx <= k:
+                    draw_path = p
+            if draw_path is None and path_snapshots_sorted:
+                draw_path = path_snapshots_sorted[0][1]
+        if draw_path is not None and len(draw_path) > 0:
+            draw_path = np.asarray(draw_path)
+            ax.plot(draw_path[:, 0], draw_path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
         trail_end = min(k + 1, len(ship_history))
         if trail_end >= 2:
             trail_x = [ship_history[i][0][0] for i in range(trail_end)]
@@ -896,8 +980,12 @@ def animate_costmap_movie(
             ax.add_patch(MplPolygon(hull, closed=True, facecolor="#404040", edgecolor="black", linewidth=1.5, alpha=0.9, zorder=6))
         if len(ship_history) > 0:
             ax.plot(ship_history[0][0][0], ship_history[0][0][1], "go", markersize=10, label="Start", zorder=7)
-        if path is not None and len(path) > 0:
-            ax.plot(path[-1, 0], path[-1, 1], "gs", markersize=10, label="Goal", zorder=7)
+        goal_xy = goal
+        if goal_xy is None and path is not None and len(path) > 0:
+            goal_xy = np.asarray(path[-1])[:2]
+        if goal_xy is not None:
+            g = np.asarray(goal_xy).ravel()[:2]
+            ax.plot(g[0], g[1], "gs", markersize=10, label="Goal", zorder=7)
         ax.set_xlim(x_min_ax, x_max_ax)
         ax.set_ylim(y_min_ax, y_max_ax)
         ax.set_xlabel("x [m]")
@@ -922,10 +1010,12 @@ def animate_ice_ship_2d(
     figsize=(16, 12),
     view_bounds=None,
     ocean_current=None,
+    path_snapshots=None,
 ):
     """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame.
     view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice.
-    ocean_current: OceanCurrentModel or None; when set, draws a quiver plot of the current field behind the ice."""
+    ocean_current: OceanCurrentModel or None; when set, draws a quiver plot of the current field behind the ice.
+    path_snapshots: optional list of (frame_idx, path Nx3); when set, draws the remaining planned path from the ship (updates at replan)."""
     n_frames = len(positions_history)
     frames_to_render = list(range(0, n_frames, frame_skip))
     if frames_to_render[-1] != n_frames - 1:
@@ -994,6 +1084,7 @@ def animate_ice_ship_2d(
             "figsize": figsize,
             "dpi": _RENDER_DPI,
             "current_viz": _current_viz_data,
+            "path_snapshots": list(path_snapshots) if path_snapshots else None,
         }
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
@@ -1078,6 +1169,10 @@ def animate_ice_ship_2d(
             ship_patch = MplPolygon(ship_outline, closed=True, facecolor=ship_color,
                                    edgecolor='#202020', linewidth=2, alpha=0.95)
             ax.add_patch(ship_patch)
+            if path_snapshots is not None:
+                remaining = _remaining_planned_path_from_snapshots(ship_pos_frame, path_snapshots, frame)
+                if remaining is not None and len(remaining) >= 2:
+                    ax.plot(remaining[:, 0], remaining[:, 1], "r-", linewidth=1.5, alpha=0.9, zorder=4)
         n_broken = np.sum(~intact)
         ax.set_title(f'DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\n'
                      f'Frame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken', fontsize=14)
@@ -1172,8 +1267,10 @@ def animate_ice_ship_3d(
     viz_config=None,
     figsize=(12, 8.96),  # 1200×896 px at 100 DPI; divisible by 16 for FFmpeg macro_block_size
     n_workers=1,
+    path_snapshots=None,
 ):
-    """3D animation with z from submergence. n_workers>1 uses parallel rendering (faster)."""
+    """3D animation with z from submergence. n_workers>1 uses parallel rendering (faster).
+    path_snapshots: optional list of (frame_idx, path Nx3); when set, draws remaining planned path at z=0."""
     vc = viz_config or get_default_visualization_config()
     n_frames = len(positions_history)
     n_elements = len(polygons)
@@ -1246,6 +1343,7 @@ def animate_ice_ship_3d(
             "view_azim_per_frame": vc.view_azim_per_frame,
             "figsize": figsize,
             "dpi": _RENDER_DPI,
+            "path_snapshots": list(path_snapshots) if path_snapshots else None,
         }
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
@@ -1372,6 +1470,11 @@ def animate_ice_ship_3d(
             ax.add_collection3d(Poly3DCollection([port_bot], facecolor=hull_below, edgecolor='#5C0000', linewidth=0.3, alpha=0.95))
             starboard_bot = [hull_verts_world[base+3], hull_verts_world[next_base+3], hull_verts_world[next_base+4], hull_verts_world[base+4]]
             ax.add_collection3d(Poly3DCollection([starboard_bot], facecolor=hull_below, edgecolor='#5C0000', linewidth=0.3, alpha=0.95))
+        if path_snapshots is not None:
+            remaining = _remaining_planned_path_from_snapshots(np.array([ship_x, ship_y]), path_snapshots, frame)
+            if remaining is not None and len(remaining) >= 2:
+                z_path = np.zeros(len(remaining))
+                ax.plot(remaining[:, 0], remaining[:, 1], z_path, 'r-', linewidth=1.5, alpha=0.9)
         n_broken = np.sum(~intact)
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')

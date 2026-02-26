@@ -33,6 +33,8 @@ def build_costmap_from_ice_state(
     ice_density: float = 920.0,
     wall_bounds: Optional[Tuple[float, float, float, float]] = None,
     ice_cost_exp_scale: float = 3.0,
+    ship_length: Optional[float] = None,
+    ship_beam: Optional[float] = None,
 ) -> Tuple[CostMap, dict]:
     """
     Build a CostMap from MEDEA ice field state (polygons, centroids, thicknesses).
@@ -44,6 +46,10 @@ def build_costmap_from_ice_state(
         cost = collision_cost * exp(ice_cost_exp_scale * thickness / thickness_ref)
     This gives thin ice a moderate cost and thick ice an exponentially high
     cost while keeping it technically traversable. Open water = base_cost.
+
+    When ship_length and ship_beam are provided, ice obstacles are dilated by the ship's
+    half-diagonal so that planned paths keep the ship center at least that far from ice,
+    ensuring the full ship footprint clears ice (avoids planning paths that clip floes).
 
     Args:
         polygons: List of N polygon vertex arrays in world coordinates (each Nx2).
@@ -64,6 +70,8 @@ def build_costmap_from_ice_state(
             world-coordinate bounds are filled with impassable cost.
         ice_cost_exp_scale: Exponential growth rate for thickness-based cost.
             At thickness_ref, cost = collision_cost * exp(ice_cost_exp_scale).
+        ship_length: Ship length [m]. If provided with ship_beam, dilate ice by ship half-diagonal.
+        ship_beam: Ship beam (width) [m]. If provided with ship_length, dilate ice by ship half-diagonal.
 
     Returns:
         cost_map: DPDEM CostMap.
@@ -106,6 +114,14 @@ def build_costmap_from_ice_state(
         angles=None,
         thicknesses=thicknesses,
     )
+
+    if ship_length is not None and ship_beam is not None and ship_length > 0 and ship_beam > 0:
+        # Inflate ice by half the ship beam so the planner keeps the ship center at least that far
+        # from ice. Using half-diagonal would close narrow gaps and force bad paths; half-beam
+        # adds a modest clearance without over-dilating. The lattice planner still checks ship
+        # corners when scoring path cost.
+        inflation_radius = 0.5 * ship_beam
+        cost_map.dilate(inflation_radius)
 
     if wall_bounds is not None:
         wx_min, wx_max, wy_min, wy_max = wall_bounds
