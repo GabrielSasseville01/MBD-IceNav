@@ -388,6 +388,125 @@ def run_mbd(
     return Ybar_final, float(cost_mean_val), float(cost_min_val)
 
 
+def run_mbd_with_diagnostics(
+    cost_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    Ybar_init: Optional[jnp.ndarray] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+) -> dict:
+    """
+    Run MBD reverse diffusion and capture per-step diagnostics for visualisation.
+
+    Unlike ``run_mbd`` (which uses ``jax.lax.scan`` for speed), this version
+    runs the diffusion steps in Python so we can snapshot trajectories and
+    samples at every iteration.
+
+    Returns dict with:
+        mean_trajectories : list of (H+1, 3) arrays — Ybar rolled out at each step
+        sample_trajectories : list of (n_top_samples, H+1, 3) — top samples at each step
+        sample_costs : list of (Nsample,) — all sample costs at each step
+        cost_means : list of floats
+        cost_mins  : list of floats
+        weights    : list of (Nsample,) — importance weights at each step
+    """
+    if Ybar_init is not None:
+        Ybar_c = jnp.array(Ybar_init, dtype=jnp.float32)
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+    else:
+        Ybar_c = jnp.zeros((H, 3))
+        Ybar_c = Ybar_c.at[:, 0].set(init_surge_bias)
+
+    rng = jax.random.PRNGKey(seed)
+    betas = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas = jnp.sqrt(1.0 - alphas_bar)
+
+    cost_batch = jax.jit(jax.vmap(cost_fn))
+    rollout_batch = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single = jax.jit(rollout_fn)
+
+    diag = {
+        "mean_trajectories": [],
+        "sample_trajectories": [],
+        "sample_costs": [],
+        "cost_means": [],
+        "cost_mins": [],
+        "weights": [],
+    }
+
+    def _rollout_actions(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    # Snapshot initial
+    traj0 = np.array(_rollout_actions(Ybar_c))
+    diag["mean_trajectories"].append(traj0)
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i = i_rev
+        Yi = Ybar_c * jnp.sqrt(alphas_bar[i])
+
+        rng, rng_s = jax.random.split(rng)
+        eps = jax.random.normal(rng_s, (Nsample, H, 3))
+        Y0s = eps * sigmas[i] + Ybar_c
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
+
+        costs = cost_batch(Y0s)
+        rews = -costs
+        rew_mean = rews.mean()
+        rew_std = jnp.maximum(rews.std(), 1e-6)
+        logp0 = (rews - rew_mean) / rew_std / temperature
+        w = jax.nn.softmax(logp0)
+
+        Ybar_new = jnp.einsum("n,nij->ij", w, Y0s)
+
+        score = (
+            1.0 / (1.0 - alphas_bar[i])
+            * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar_new)
+        )
+        Yim1 = (
+            1.0 / jnp.sqrt(alphas[i])
+            * (Yi + (1.0 - alphas_bar[i]) * score)
+        )
+        i_prev = max(i - 1, 0)
+        Ybar_c = Yim1 / jnp.sqrt(alphas_bar[i_prev])
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+
+        costs_np = np.array(costs)
+        w_np = np.array(w)
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["weights"].append(w_np)
+
+        # Roll out mean trajectory
+        mean_traj = np.array(_rollout_actions(Ybar_c))
+        diag["mean_trajectories"].append(mean_traj)
+
+        # Roll out top-K sample trajectories (by cost)
+        top_k = min(n_top_samples, Nsample)
+        top_idx = np.argsort(costs_np)[:top_k]
+        top_actions = Y0s[top_idx]
+        top_phys = top_actions * action_scale[None, :] + action_center[None, :]
+        top_trajs = np.array(rollout_batch(eta0, nu0, top_phys))
+        diag["sample_trajectories"].append(top_trajs)
+
+    return diag
+
+
 # ── High-level entry point ────────────────────────────────────────────────
 
 def _jax_backend_info() -> str:

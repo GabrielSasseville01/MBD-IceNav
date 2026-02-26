@@ -80,6 +80,10 @@ def main():
                         help='Show the ice map in a matplotlib window and exit (no simulation or planning)')
     parser.add_argument('--plan-only', action='store_true',
                         help='Plan path and show it on the costmap, then exit (no simulation). Implies --plan')
+    parser.add_argument('--replan-every', type=int, metavar='N', default=None,
+                        help='With --plan: replan every N simulation frames (override config; larger = fewer replans, faster run)')
+    parser.add_argument('--no-replan', action='store_true',
+                        help='With --plan: use single initial plan for whole run (no receding-horizon replanning)')
     parser.add_argument('--output-dir', type=str, default='outputs/default',
                         help='Output directory for movies and plots (default: outputs/default)')
     parser.add_argument('--current', type=str, default='none',
@@ -646,9 +650,18 @@ def main():
             path_snapshots.append((frame, path_f.copy()))  # for costmap movie: show this plan from this frame on
             return path_to_ship_trajectory(path_f, n_remaining)
 
-        replan_callback = _replan_callback
-        replan_every_n_frames = run_cfg.planning_replan_every_n_frames
-        print(f"  Receding horizon: replan every {replan_every_n_frames} frames", flush=True)
+        if args.no_replan:
+            replan_callback = None
+            replan_every_n_frames = None
+            print("  Receding horizon: disabled (single initial plan)", flush=True)
+        else:
+            replan_callback = _replan_callback
+            replan_every_n_frames = (
+                args.replan_every
+                if args.replan_every is not None
+                else run_cfg.planning_replan_every_n_frames
+            )
+            print(f"  Receding horizon: replan every {replan_every_n_frames} frames", flush=True)
 
     sim_cfg = get_default_simulation_config()
     if args.no_mss_dynamics:

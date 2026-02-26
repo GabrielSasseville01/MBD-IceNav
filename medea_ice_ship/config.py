@@ -48,7 +48,7 @@ class SimulationConfig:
     """All tunable simulation parameters."""
     # --- Time ---
     # s — fixed time step for integration.
-    dt: float = 0.05
+    dt: float = 1.0 #0.1
     # If True, cap dt at Rayleigh-based stability limit (Eq. 11). Otherwise dt is unchanged (advisory only).
     use_rayleigh_dt_cap: bool = False
     # Safety factor b in Eq. 11 (e.g. 0.1 = 10% of theoretical max).
@@ -222,11 +222,11 @@ class RunConfig:
     # kg — ship mass (e.g. 23 kt); used for dynamics when not inferred from hull.
     ship_displacement: float = 23000e3
     # s — time step passed to simulation (should match SimulationConfig.dt if changed).
-    dt: float = 0.05
+    dt: float = 0.1
     # Number of simulation frames in simple (synthetic) ice field mode.
-    n_frames_simple: int = 600
+    n_frames_simple: int = 300
     # Number of simulation frames in MEDEA (satellite) ice field mode.
-    n_frames_medea: int = 600
+    n_frames_medea: int = 300
     # Target Voronoi cells per 100 m² in simple mode (controls floe tessellation density).
     cells_per_100m2_simple: float = 0.25
     # Target Voronoi cells per 100 m² in MEDEA mode (denser for larger floes).
@@ -299,7 +299,7 @@ class RunConfig:
     # Diffusion MPC only: random seed (None = no fixed seed).
     planning_diffusion_seed: Optional[int] = None
     # Model-based diffusion (AUTO-IceNav): controller horizon (time steps); trajectory length = horizon+1.
-    planning_diffusion_controller_horizon: int = 80
+    planning_diffusion_controller_horizon: int = 300
     # Model-based diffusion: number of reverse diffusion steps.
     planning_diffusion_num_diffusion_steps: int = 30
     # Model-based diffusion: softmax temperature for reward weighting.
@@ -309,13 +309,15 @@ class RunConfig:
     planning_diffusion_betaT: float = 1e-2
     # --- JAX Model-Based Diffusion (used when --planner diffusion-mpc) ---
     # Planning horizon (number of action steps; trajectory length = horizon+1).
-    planning_jax_mbd_horizon: int = 80
+    # With dt_action = dt_substep × n_substeps, total trajectory covers H × dt_action × speed.
+    # At 4 m/s with dt_action=1s, H=300 covers ~1200 m (enough for a 1400 m map).
+    planning_jax_mbd_horizon: int = 300
     # Monte Carlo samples per diffusion step (higher = better coverage of action space).
-    planning_jax_mbd_nsample: int = 512
+    planning_jax_mbd_nsample: int = 2048
     # Number of reverse diffusion steps.
-    planning_jax_mbd_ndiffuse: int = 100
+    planning_jax_mbd_ndiffuse: int = 50
     # Softmax temperature for importance weighting (lower = greedier).
-    planning_jax_mbd_temperature: float = 0.1
+    planning_jax_mbd_temperature: float = 0.5
     # Noise schedule endpoints.
     planning_jax_mbd_beta0: float = 1e-4
     planning_jax_mbd_betaT: float = 0.05
@@ -337,14 +339,15 @@ class RunConfig:
     # Euler sub-step size [s] for dynamics integration within each action step.
     planning_jax_mbd_dt_substep: float = 1.0
     # Number of Euler sub-steps per action step (dt_action = dt_substep × n_substeps).
-    planning_jax_mbd_n_substeps: int = 5
+    # Lower values give finer trajectory resolution comparable to lattice planner.
+    planning_jax_mbd_n_substeps: int = 1
     # Initial normalised surge bias (0.7 ≈ strong forward thrust at start of optimisation).
     planning_jax_mbd_init_surge_bias: float = 0.7
     # Warm-start MBD from the lattice A* path (seeds initial actions from path headings).
     # When False, MBD starts from a constant forward-surge bias (pure diffusion, no A* prior).
     planning_jax_mbd_warm_start: bool = True
     # --- JAX MPPI (used when --planner mppi) ---
-    planning_mppi_horizon: int = 80
+    planning_mppi_horizon: int = 300
     # More samples than MBD because MPPI relies on breadth per iteration.
     planning_mppi_nsample: int = 2048
     # More iterations so the nominal sequence converges (noise shrinks effectively
@@ -354,7 +357,7 @@ class RunConfig:
     planning_mppi_noise_sigma: float = 0.3
     planning_mppi_warm_start: bool = True
     # --- JAX SQP multiple shooting (used when --planner sqp) ---
-    planning_sqp_horizon: int = 40
+    planning_sqp_horizon: int = 150
     planning_sqp_max_iters: int = 20
     planning_sqp_reg: float = 1e-3
     planning_sqp_armijo_c: float = 1e-4
@@ -366,7 +369,7 @@ class RunConfig:
     planning_sqp_dt_substep: float = 1.0
     planning_sqp_n_substeps: int = 5
     # --- JAX GradCEM (used when --planner gradcem) ---
-    planning_gradcem_horizon: int = 80
+    planning_gradcem_horizon: int = 300
     planning_gradcem_nsample: int = 512
     planning_gradcem_top_samples: int = 64
     planning_gradcem_opt_iters: int = 10

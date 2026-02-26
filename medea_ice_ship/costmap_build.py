@@ -24,7 +24,7 @@ def build_costmap_from_ice_state(
     resolution: float = 2.0,
     margin: float = 20.0,
     ship_mass: float = 23e6,
-    base_cost: float = 1.0,
+    base_cost: float = 0.1,
     collision_cost: float = 5.0,
     mass_cost_scale: float = 1e-5,
     damage_cost_scale: float = 0.0,

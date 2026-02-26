@@ -184,6 +184,63 @@ uv run python examples/toy_planner_thin_corridor.py --planner mppi
 - **Generated:** `toy_thin_corridor_lattice_search.mp4`, `toy_thin_corridor.mp4`, `toy_thin_corridor_3d.mp4`, `toy_thin_corridor_costmap.mp4`, `toy_thin_corridor_hull_impact.png`.
 - Options: `--planner diffusion-mpc` or `--planner mppi` (sampling-based refinement), `--live`, `--no-damage-cost` (baseline: no thickness preference), `--damage-cost-scale SCALE`, `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
 
+### 9. Planner benchmark (random ice fields, all planners)
+
+The benchmark script generates **random ice fields** at several concentrations (AUTO-IceNav style), runs every selected planner on each field, and saves planned-path and result (planned + actual path) images with a **planner name suffix**, plus a CSV of metrics (path length, costmap cost, impulse, fuel proxy).
+
+```bash
+# Full benchmark: all planners, all concentrations, plan + simulate (will take long - instead try one planner at a time)
+uv run python examples/benchmark_planners.py
+
+# Plan-only (no physics simulation) — fastest, for comparing planned paths (good for vis)
+uv run python examples/benchmark_planners.py --no-sim
+
+# Specific planners and concentrations
+uv run python examples/benchmark_planners.py --planners lattice diffusion-mpc --concentrations 0.2 0.4
+
+# Cold start for sampling planners (no A* warm-start)
+uv run python examples/benchmark_planners.py --no-warm-start --planners diffusion-mpc mppi gradcem
+
+# Full simulation with live 2D window (watch ship move)
+uv run python examples/benchmark_planners.py --live --planners lattice
+
+# Kinematic execution (ship follows plan exactly; no dynamics, faster)
+uv run python examples/benchmark_planners.py --kinematic
+
+# Fewer frames / less replanning for quicker runs
+uv run python examples/benchmark_planners.py --n-frames 200 --replan-every 150
+```
+
+**Output directory:** `outputs/benchmark/` (or `--output-dir DIR`).
+
+**Generated files (per concentration, per planner):**
+
+| File | Description |
+|------|-------------|
+| `conc20_ice_field.png` | Ice field and start/goal. |
+| `conc20_planned_<planner>.png` | Planned path on costmap (e.g. `conc20_planned_lattice.png`, `conc20_planned_diffusion-mpc.png`). |
+| `conc20_result_<planner>.png` | Planned (dashed) + actual ship path on costmap (only when not `--no-sim`). |
+| `benchmark_results.csv` | Table of metrics: concentration, planner, plan time, planned/actual length, costmap cost, impulse [MN·s], fuel proxy. |
+
+**Benchmark arguments:**
+
+| Flag | Default | Description |
+|------|--------|-------------|
+| `--no-sim` | off | Plan only; no simulation. Saves planned-path images only, no result images or metrics. |
+| `--planners` | all | Planners to run: `lattice`, `diffusion-mpc`, `mppi`, `sqp`, `gradcem` (space-separated). |
+| `--no-warm-start` | off | For diffusion-mpc/mppi/sqp/gradcem: do not warm-start from A* (cold start). |
+| `--concentrations` | 0.2 0.3 0.4 0.5 | Ice concentrations to test. |
+| `--kinematic` | off | Place ship on planned path each frame (no dynamics); faster, for path-vs-reference comparison. |
+| `--live` | off | Open a real-time 2D window during each simulation; close to continue. |
+| `--replan-every` | 120 | Replan every N simulation frames (0 = no replanning). |
+| `--n-frames` | 300 | Number of simulation frames per run. |
+| `--map-size` | 1400 | Square map side length [m]. |
+| `--seed` | 42 | Random seed for ice field generation. |
+| `--greedy` | off | Use greedy best-first search for lattice (faster, suboptimal). |
+| `--output-dir` | outputs/benchmark | Output directory. |
+
+**Metrics (when not `--no-sim`):** planned/actual path length [m], costmap integral (ice/thickness cost), cumulative impulse [MN·s], bonds broken, and a **fuel proxy** (path length + ice cost + impulse) for comparing planners on fuel consumption.
+
 ---
 
 ## Generated visualizations
@@ -296,6 +353,8 @@ Example scripts:
 ```bash
 uv run python examples/visualize_costmap.py      # Costmap from simple ice
 uv run python examples/visualize_planned_path.py # Plan and plot path on costmap
+uv run python examples/benchmark_planners.py     # Benchmark all planners on random ice (see §9)
+uv run python examples/visualize_diffusion.py   # MBD diffusion iteration evolution
 ```
 
 ---
