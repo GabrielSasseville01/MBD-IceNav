@@ -10,7 +10,7 @@ from typing import List, Tuple, Optional, Dict, Set, Union
 from dataclasses import dataclass, field
 
 from .primitives import Primitives, Primitive
-from .cost_map import CostMap
+from .cost_map import CostMap, MAX_COST
 
 
 @dataclass(order=True)
@@ -170,8 +170,8 @@ class LatticePlanner:
                 # Compute traversal cost
                 traversal_cost = self._compute_path_cost(path, primitive)
                 
-                # Skip if path goes through high-cost area (collision)
-                if traversal_cost > 1e6:
+                # Skip if path goes through impassable area (MAX_COST / inf)
+                if traversal_cost >= MAX_COST or not np.isfinite(traversal_cost):
                     continue
                 
                 # New g-cost

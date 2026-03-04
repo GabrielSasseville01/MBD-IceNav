@@ -12,7 +12,7 @@ if os.environ.get('DPDEM_LIVE_VIEW') != '1':
     matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
-from matplotlib.collections import LineCollection
+from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib import colors as mpl_colors
 from matplotlib.colors import LogNorm
@@ -656,7 +656,7 @@ def _animation_writer(output_file, fps):
 
 
 def _draw_costmap_frame_to_array(data, frame_idx):
-    """Draw one frame of the costmap movie (AUTO-IceNav style): costmap + ice + planned path (red) + actual path (blue) + ship. Used by parallel workers."""
+    """Draw one frame of the costmap movie (plan-only style): costmap + ice + planned path (red) + actual path (blue) + ship."""
     k = data["frames_to_render"][frame_idx]
     ship_history = data["ship_history"]
     path = data.get("path")
@@ -664,8 +664,10 @@ def _draw_costmap_frame_to_array(data, frame_idx):
     ship_beam = data["ship_beam"]
     x_min_ax, x_max_ax = data["x_min_ax"], data["x_max_ax"]
     y_min_ax, y_max_ax = data["y_min_ax"], data["y_max_ax"]
+    thicknesses = data.get("thicknesses")
+    goal_y_line = data.get("goal_y_line")
 
-    # Costmap: use snapshot for frame k if provided (AUTO-IceNav: costmap updated every replan, not every frame)
+    # Costmap: use snapshot for frame k if provided
     snapshots = data.get("costmap_snapshots")
     if snapshots:
         cm = None
@@ -677,44 +679,70 @@ def _draw_costmap_frame_to_array(data, frame_idx):
         cost_grid = np.asarray(cm.cost_map)
         x_origin = getattr(cm, "x_origin", 0)
         y_origin = getattr(cm, "y_origin", 0)
-        resolution = getattr(cm, "resolution", 2.0)
-        cols, rows = cost_grid.shape[1], cost_grid.shape[0]
+        extent = [x_origin, x_origin + cm.width, y_origin, y_origin + cm.height]
     else:
         cost_grid = data["cost_grid"]
         x_origin = data["x_origin"]
         y_origin = data["y_origin"]
-        resolution = data["resolution"]
-        cols, rows = data["cols"], data["rows"]
+        res = data.get("resolution", 2.0)
+        ccols, rrows = cost_grid.shape[1], cost_grid.shape[0]
+        extent = [x_origin, x_origin + ccols * res, y_origin, y_origin + rrows * res]
 
-    # Ice: either moving (per-frame positions/rotations) or static polygons
+    cost = np.asarray(cost_grid)
+    vmax = np.percentile(cost[cost > 0], 95) if np.any(cost > 0) else 1.0
+
+    fig, ax = plt.subplots(figsize=data["figsize"], dpi=data["dpi"])
+    ax.imshow(cost, origin="lower", extent=extent, cmap="YlOrRd", alpha=0.5,
+              vmin=0, vmax=float(vmax))
+
+    # Ice: either moving (per-frame) or static; use PatchCollection with thickness when available
     positions_history = data.get("positions_history")
     rotations_history = data.get("rotations_history")
     local_polygons = data.get("local_polygons")
     static_polygons = data.get("polygons") or []
 
-    X = x_origin + np.arange(cols + 1) * resolution
-    Y = y_origin + np.arange(rows + 1) * resolution
-    cost = np.asarray(cost_grid)
-    norm = mpl_colors.LogNorm(vmin=max(0.5, float(cost.min())), vmax=float(cost.max()))
-
-    fig, ax = plt.subplots(figsize=data["figsize"], dpi=data["dpi"])
-    ax.pcolormesh(X, Y, cost, norm=norm, cmap="viridis", shading="flat")
-
-    if positions_history is not None and rotations_history is not None and local_polygons is not None and k < len(positions_history):
-        # Draw ice in current frame (moved/rotated by simulation)
-        pos = positions_history[k]
-        rot = rotations_history[k]
-        for i, local_poly in enumerate(local_polygons):
-            c, s = np.cos(rot[i]), np.sin(rot[i])
-            R = np.array([[c, -s], [s, c]])
-            world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
-            closed = np.vstack([world_poly, world_poly[0:1]])
-            ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+    if thicknesses is not None and len(thicknesses) > 0:
+        patches = []
+        colors_th = []
+        if positions_history is not None and rotations_history is not None and local_polygons is not None and k < len(positions_history):
+            pos = positions_history[k]
+            rot = rotations_history[k]
+            for i, local_poly in enumerate(local_polygons):
+                if i >= len(thicknesses):
+                    break
+                c, s = np.cos(rot[i]), np.sin(rot[i])
+                R = np.array([[c, -s], [s, c]])
+                world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
+                patches.append(MplPolygon(world_poly, closed=True))
+                colors_th.append(thicknesses[i])
+        else:
+            for i, poly in enumerate(static_polygons):
+                if i >= len(thicknesses):
+                    break
+                patches.append(MplPolygon(poly, closed=True))
+                colors_th.append(thicknesses[i])
+        if patches:
+            pc = PatchCollection(patches, cmap="Blues", edgecolor="#555555", linewidth=0.3, alpha=0.6)
+            pc.set_array(np.array(colors_th))
+            pc.set_clim(np.min(thicknesses), np.max(thicknesses))
+            ax.add_collection(pc)
+            fig.colorbar(pc, ax=ax, shrink=0.5, label="Thickness [m]", location="left")
     else:
-        for poly in static_polygons:
-            closed = np.vstack([poly, poly[0:1]])
-            ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
-    # Planned path: use path_snapshots at replan times, else single path
+        if positions_history is not None and rotations_history is not None and local_polygons is not None and k < len(positions_history):
+            pos = positions_history[k]
+            rot = rotations_history[k]
+            for i, local_poly in enumerate(local_polygons):
+                c, s = np.cos(rot[i]), np.sin(rot[i])
+                R = np.array([[c, -s], [s, c]])
+                world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
+                closed = np.vstack([world_poly, world_poly[0:1]])
+                ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+        else:
+            for poly in static_polygons:
+                closed = np.vstack([poly, poly[0:1]])
+                ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+
+    # Planned path
     draw_path = data.get("path")
     path_snapshots = data.get("path_snapshots")
     if path_snapshots:
@@ -727,37 +755,42 @@ def _draw_costmap_frame_to_array(data, frame_idx):
             draw_path = path_snapshots_sorted[0][1]
     if draw_path is not None and len(draw_path) > 0:
         draw_path = np.asarray(draw_path)
-        ax.plot(draw_path[:, 0], draw_path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
+        ax.plot(draw_path[:, 0], draw_path[:, 1], "r-", lw=2.5, label="Planned path", zorder=5)
+        ax.plot(draw_path[0, 0], draw_path[0, 1], "go", ms=12, zorder=6, label="Start")
+        ax.plot(draw_path[-1, 0], draw_path[-1, 1], "r*", ms=16, zorder=6, label="End")
+
+    # Goal line (plan-only style)
+    if goal_y_line is not None:
+        ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
+
     trail_end = min(k + 1, len(ship_history))
     if trail_end >= 2:
         trail_x = [ship_history[i][0][0] for i in range(trail_end)]
         trail_y = [ship_history[i][0][1] for i in range(trail_end)]
-        ax.plot(trail_x, trail_y, "b-", linewidth=2, label="Actual path", zorder=5)
+        ax.plot(trail_x, trail_y, "b-", lw=2, label="Actual path", zorder=5)
     if k < len(ship_history):
         ship_pos, ship_heading = ship_history[k][0], ship_history[k][1]
         ax.plot(ship_pos[0], ship_pos[1], "ko", markersize=6, zorder=6)
         hull = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_heading)
-        patch = MplPolygon(hull, closed=True, facecolor="#404040", edgecolor="black", linewidth=1.5, alpha=0.9, zorder=6)
-        ax.add_patch(patch)
-    if len(ship_history) > 0:
-        start_pos = ship_history[0][0]
-        ax.plot(start_pos[0], start_pos[1], "go", markersize=10, label="Start", zorder=7)
-    goal_xy = data.get("goal")
-    if goal_xy is None and draw_path is not None and len(draw_path) > 0:
-        goal_xy = np.asarray(draw_path[-1])[:2]
-    elif goal_xy is None and path is not None and len(path) > 0:
-        goal_xy = np.asarray(path[-1])[:2]
-    if goal_xy is not None:
-        g = np.asarray(goal_xy).ravel()[:2]
-        ax.plot(g[0], g[1], "gs", markersize=10, label="Goal", zorder=7)
+        ax.add_patch(MplPolygon(hull, closed=True, fc="orange", ec="black", lw=1.5, alpha=0.8, zorder=6))
+    if len(ship_history) > 0 and (draw_path is None or len(draw_path) == 0):
+        ax.plot(ship_history[0][0][0], ship_history[0][0][1], "go", ms=12, label="Start", zorder=7)
+    if goal_y_line is None:
+        goal_xy = data.get("goal")
+        if goal_xy is None and draw_path is not None and len(draw_path) > 0:
+            goal_xy = np.asarray(draw_path[-1])[:2]
+        elif goal_xy is None and path is not None and len(path) > 0:
+            goal_xy = np.asarray(path[-1])[:2]
+        if goal_xy is not None:
+            g = np.asarray(goal_xy).ravel()[:2]
+            ax.plot(g[0], g[1], "mx", ms=14, mew=3, zorder=6, label="Goal")
     ax.set_xlim(x_min_ax, x_max_ax)
     ax.set_ylim(y_min_ax, y_max_ax)
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
+    ax.set_xlabel("X [m]")
+    ax.set_ylabel("Y [m]")
     ax.set_aspect("equal")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.set_title(f"Costmap + ship trajectory (AUTO-IceNav style)\nFrame {k}/{data['n_frames']-1}")
-    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.set_title(f"Costmap + ship trajectory\nFrame {k}/{data['n_frames']-1}")
     fig.canvas.draw()
     buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
     plt.close(fig)
@@ -781,7 +814,9 @@ def animate_costmap_movie(
     path=None,
     path_snapshots=None,
     goal=None,
+    goal_y_line=None,
     polygons=None,
+    thicknesses=None,
     positions_history=None,
     rotations_history=None,
     local_polygons=None,
@@ -792,27 +827,24 @@ def animate_costmap_movie(
     fps=20,
     frame_skip=1,
     n_workers=1,
-    figsize=(10.08, 6.08),
+    figsize=(12, 12),
 ):
     """
-    Generate a costmap movie (AUTO-IceNav style): costmap as background, moving ice,
-    planned path (red), actual path (blue), ship and start/goal. The costmap can be
-    updated every X frames (e.g. at replan times) via costmap_snapshots. The planned
-    path can also update at replan times via path_snapshots.
+    Generate a costmap movie (plan-only style): costmap (YlOrRd) as background, ice polygons
+    with thickness colorbar (Blues), planned path (red), actual path (blue), ship (orange),
+    start (green circle), end (red star), goal line (lime dashed) when goal_y_line is set.
 
     cost_map: default costmap (used for all frames if costmap_snapshots is None)
     bounds: dict with x_min, x_max, y_min, y_max, x_origin, y_origin, etc.
     ship_history: list of (position_2d, heading) per frame
     path: Nx3 planned path [x,y,heading] or None (used when path_snapshots is None)
-    path_snapshots: optional list of (frame_idx, path) so the red planned path updates
-        at replan times; for each frame the latest path with frame_idx <= current_frame is drawn.
-    goal: fixed (x, y) for the goal marker (green square). When provided, the goal stays fixed
-        across replans; when None, the marker is taken from path[-1] (may jump when path updates).
-    polygons: list of polygon arrays for static ice outline, or None (ignored if moving ice provided)
-    positions_history, rotations_history, local_polygons: per-frame ice state for moving ice
-    costmap_snapshots: optional list of (frame_idx, cost_map) so the costmap is updated only at
-        those frames (e.g. at replan times), not every frame. Each cost_map must have .cost_map,
-        .x_origin, .y_origin, .resolution, .cols, .rows. Like AUTO-IceNav planner_plots.
+    path_snapshots: optional list of (frame_idx, path) so the red planned path updates at replan times.
+    goal: fixed (x, y) for point goals; when goal_y_line is set, path end is shown as red star.
+    goal_y_line: when set (e.g. y=700), draw horizontal goal line and show path end as red star.
+    polygons: list of polygon arrays for static ice (or base for moving ice with local_polygons).
+    thicknesses: per-polygon thickness [m] for ice colorbar (Blues); enables thickness shading.
+    positions_history, rotations_history, local_polygons: per-frame ice state for moving ice.
+    costmap_snapshots: optional list of (frame_idx, cost_map) for costmap updates at replan times.
     """
     n_frames = len(ship_history)
     if n_frames == 0:
@@ -863,7 +895,9 @@ def animate_costmap_movie(
         "path": np.asarray(path) if path is not None else None,
         "path_snapshots": list(path_snapshots) if path_snapshots else None,
         "goal": np.asarray(goal, dtype=float).ravel()[:2] if goal is not None else None,
+        "goal_y_line": goal_y_line,
         "polygons": list(polygons) if polygons is not None else [],
+        "thicknesses": np.asarray(thicknesses) if thicknesses is not None else None,
         "positions_history": positions_history,
         "rotations_history": rotations_history,
         "local_polygons": list(local_polygons) if local_polygons is not None else None,
@@ -919,6 +953,15 @@ def animate_costmap_movie(
     local_polys = list(local_polygons) if local_polygons is not None else None
     snapshots = list(costmap_snapshots) if costmap_snapshots else None
 
+    thicknesses_h = np.asarray(thicknesses) if thicknesses is not None else None
+    goal_y_line_h = goal_y_line
+    if thicknesses_h is not None and len(thicknesses_h) > 0:
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+        sm = ScalarMappable(cmap=plt.cm.Blues, norm=Normalize(vmin=float(thicknesses_h.min()), vmax=float(thicknesses_h.max())))
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, shrink=0.5, label="Thickness [m]", location="left")
+
     def update(frame_idx):
         k = frames_to_render[frame_idx]
         ax.clear()
@@ -932,30 +975,53 @@ def animate_costmap_movie(
             cost = np.asarray(cm.cost_map)
             x_orig = getattr(cm, "x_origin", 0)
             y_orig = getattr(cm, "y_origin", 0)
-            res = getattr(cm, "resolution", 2.0)
-            ccols, crows = cost.shape[1], cost.shape[0]
+            extent = [x_orig, x_orig + cm.width, y_orig, y_orig + cm.height]
         else:
             cost = np.asarray(cost_map.cost_map)
             x_orig, y_orig, res = x_origin, y_origin, resolution
             ccols, crows = cols, rows
-        X = x_orig + np.arange(ccols + 1) * res
-        Y = y_orig + np.arange(crows + 1) * res
-        norm = mpl_colors.LogNorm(vmin=max(0.5, float(cost.min())), vmax=float(cost.max()))
-        ax.pcolormesh(X, Y, cost, norm=norm, cmap="viridis", shading="flat")
-        if positions_h is not None and rotations_h is not None and local_polys is not None and k < len(positions_h):
-            pos = positions_h[k]
-            rot = rotations_h[k]
-            for i, local_poly in enumerate(local_polys):
-                c, s = np.cos(rot[i]), np.sin(rot[i])
-                R = np.array([[c, -s], [s, c]])
-                world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
-                closed = np.vstack([world_poly, world_poly[0:1]])
-                ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+            extent = [x_orig, x_orig + ccols * res, y_orig, y_orig + crows * res]
+        vmax = np.percentile(cost[cost > 0], 95) if np.any(cost > 0) else 1.0
+        ax.imshow(cost, origin="lower", extent=extent, cmap="YlOrRd", alpha=0.5, vmin=0, vmax=float(vmax))
+        if thicknesses_h is not None and len(thicknesses_h) > 0:
+            patches = []
+            colors_th = []
+            if positions_h is not None and rotations_h is not None and local_polys is not None and k < len(positions_h):
+                pos = positions_h[k]
+                rot = rotations_h[k]
+                for i, local_poly in enumerate(local_polys):
+                    if i >= len(thicknesses_h):
+                        break
+                    c, s = np.cos(rot[i]), np.sin(rot[i])
+                    R = np.array([[c, -s], [s, c]])
+                    world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
+                    patches.append(MplPolygon(world_poly, closed=True))
+                    colors_th.append(thicknesses_h[i])
+            else:
+                for i, poly in enumerate(polygons or []):
+                    if i >= len(thicknesses_h):
+                        break
+                    patches.append(MplPolygon(poly, closed=True))
+                    colors_th.append(thicknesses_h[i])
+            if patches:
+                pc = PatchCollection(patches, cmap="Blues", edgecolor="#555555", linewidth=0.3, alpha=0.6)
+                pc.set_array(np.array(colors_th))
+                pc.set_clim(np.min(thicknesses_h), np.max(thicknesses_h))
+                ax.add_collection(pc)
         else:
-            for poly in (polygons or []):
-                closed = np.vstack([poly, poly[0:1]])
-                ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
-        # Planned path: use path_snapshots at replan times, else single path
+            if positions_h is not None and rotations_h is not None and local_polys is not None and k < len(positions_h):
+                pos = positions_h[k]
+                rot = rotations_h[k]
+                for i, local_poly in enumerate(local_polys):
+                    c, s = np.cos(rot[i]), np.sin(rot[i])
+                    R = np.array([[c, -s], [s, c]])
+                    world_poly = np.asarray(local_poly, dtype=float) @ R.T + np.asarray(pos[i], dtype=float)
+                    closed = np.vstack([world_poly, world_poly[0:1]])
+                    ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
+            else:
+                for poly in (polygons or []):
+                    closed = np.vstack([poly, poly[0:1]])
+                    ax.plot(closed[:, 0], closed[:, 1], "k-", linewidth=0.4, alpha=0.9)
         draw_path = path
         if path_snapshots:
             path_snapshots_sorted = sorted(path_snapshots, key=lambda t: t[0])
@@ -967,33 +1033,37 @@ def animate_costmap_movie(
                 draw_path = path_snapshots_sorted[0][1]
         if draw_path is not None and len(draw_path) > 0:
             draw_path = np.asarray(draw_path)
-            ax.plot(draw_path[:, 0], draw_path[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path")
+            ax.plot(draw_path[:, 0], draw_path[:, 1], "r-", lw=2.5, label="Planned path", zorder=5)
+            ax.plot(draw_path[0, 0], draw_path[0, 1], "go", ms=12, zorder=6, label="Start")
+            ax.plot(draw_path[-1, 0], draw_path[-1, 1], "r*", ms=16, zorder=6, label="End")
+        if goal_y_line_h is not None:
+            ax.axhline(goal_y_line_h, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line_h:.0f}", zorder=4)
         trail_end = min(k + 1, len(ship_history))
         if trail_end >= 2:
             trail_x = [ship_history[i][0][0] for i in range(trail_end)]
             trail_y = [ship_history[i][0][1] for i in range(trail_end)]
-            ax.plot(trail_x, trail_y, "b-", linewidth=2, label="Actual path", zorder=5)
+            ax.plot(trail_x, trail_y, "b-", lw=2, label="Actual path", zorder=5)
         if k < len(ship_history):
             ship_pos, ship_heading = ship_history[k][0], ship_history[k][1]
             ax.plot(ship_pos[0], ship_pos[1], "ko", markersize=6, zorder=6)
             hull = create_ship_hull_at_position_heading(ship_length, ship_beam, ship_pos, ship_heading)
-            ax.add_patch(MplPolygon(hull, closed=True, facecolor="#404040", edgecolor="black", linewidth=1.5, alpha=0.9, zorder=6))
-        if len(ship_history) > 0:
-            ax.plot(ship_history[0][0][0], ship_history[0][0][1], "go", markersize=10, label="Start", zorder=7)
-        goal_xy = goal
-        if goal_xy is None and path is not None and len(path) > 0:
-            goal_xy = np.asarray(path[-1])[:2]
-        if goal_xy is not None:
-            g = np.asarray(goal_xy).ravel()[:2]
-            ax.plot(g[0], g[1], "gs", markersize=10, label="Goal", zorder=7)
+            ax.add_patch(MplPolygon(hull, closed=True, fc="orange", ec="black", lw=1.5, alpha=0.8, zorder=6))
+        if len(ship_history) > 0 and (draw_path is None or len(draw_path) == 0):
+            ax.plot(ship_history[0][0][0], ship_history[0][0][1], "go", ms=12, label="Start", zorder=7)
+        if goal_y_line_h is None:
+            goal_xy = goal
+            if goal_xy is None and path is not None and len(path) > 0:
+                goal_xy = np.asarray(path[-1])[:2]
+            if goal_xy is not None:
+                g = np.asarray(goal_xy).ravel()[:2]
+                ax.plot(g[0], g[1], "mx", ms=14, mew=3, zorder=6, label="Goal")
         ax.set_xlim(x_min_ax, x_max_ax)
         ax.set_ylim(y_min_ax, y_max_ax)
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
         ax.set_aspect("equal")
-        ax.legend(loc="upper right", fontsize=8)
-        ax.set_title(f"Costmap + ship trajectory (AUTO-IceNav style)\nFrame {k}/{n_frames-1}")
-        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=9)
+        ax.set_title(f"Costmap + ship trajectory\nFrame {k}/{n_frames-1}")
         return []
 
     anim = FuncAnimation(fig, update, frames=n_render, blit=False)

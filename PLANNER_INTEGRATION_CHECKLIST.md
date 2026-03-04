@@ -110,7 +110,8 @@ Ensure the same flow works for non-simple scenarios (no code changes that tie lo
 
 ## 7. Optional improvements (later)
 
-- [ ] **7.1** Ridging / SIC cost: add an optional ridge costmap or sea-ice concentration layer to the costmap (as in AUTO-IceNav); align with MEDEA domain and feed into the same `CostMap` or an extended cost function.
+- [x] **7.1** Ridging / SIC cost: add an optional ridge costmap or sea-ice concentration layer to the costmap (as in AUTO-IceNav); align with MEDEA domain and feed into the same `CostMap` or an extended cost function.
+   **Done:** `CostMap.apply_ridge_cost()`, `build_costmap_from_ice_state(ridge_costmap_file=..., ridge_cost_weight=...)`, `--ridge-costmap` / `--ridge-weight` CLI, `planning_ridge_costmap_file` / `planning_ridge_cost_weight` in `RunConfig`.
 - [x] **7.2** Receding horizon: periodically update the costmap from current ice state and replan during simulation (more invasive; requires coupling simulator with planner at multiple time steps).
   **Done:** `simulate_ice_ship_interaction` accepts `replan_every_n_frames` and `replan_callback`. When triggered, the callback receives current ice state (world polygons, centroids, thicknesses) and ship state; it rebuilds the costmap, plans from current pose to goal, and returns a new trajectory segment. Run script passes a callback when `--plan`; config `planning_replan_every_n_frames` (default 60) controls replan interval (AUTO-IceNav style).
 - [ ] **7.3** AUTO-IceNav-style cost: optional kinetic-energy collision cost (ship_speed, ship_mass, mass_ice) and/or swath-based edge cost and Dubins + obstacles-only heuristic for closer parity and potentially better paths.

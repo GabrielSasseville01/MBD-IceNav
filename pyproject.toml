@@ -16,6 +16,8 @@ dependencies = [
     "imageio>=2.31.0",
     "opencv-python>=4.5.0",
     "shapely>=2.0.0",
+    "scikit-image>=0.21.0",
+    "gdown>=5.2.1",
 ]
 
 [project.optional-dependencies]

@@ -290,6 +290,21 @@ class RunConfig:
     planning_ice_cost_exp_scale: float = 3.0
     # Base cost multiplier for ice cells (coefficient in front of the exponential).
     planning_ice_collision_cost: float = 5.0
+    # Ridge costmap (AUTO-IceNav): path to pickle from generate_ridge_costmap.py; None = disabled.
+    planning_ridge_costmap_file: Optional[str] = None
+    # Ridge cost weight (additive; 0 = disabled). Higher = planner avoids ridges more.
+    planning_ridge_cost_weight: float = 0.0
+    # Cost model: True = AUTO-IceNav KE-based (speed, mass, radial, SIC); False = thickness-based.
+    planning_use_ke_cost: bool = True
+    # Ship speed [m/s] for KE cost (when planning_use_ke_cost).
+    planning_ship_speed: float = 4.0
+    # Scale factor for KE cost (raw J -> planning units). With per-cell mass, 1e-9 yields
+    # costs 0.1–0.6 (all appear purple). 1e-6 yields ~0.1–100 so ice is clearly visible.
+    planning_ke_cost_scale: float = 1e-6
+    # Polygon swell factor for collision cost (AUTO-IceNav: 0.1).
+    planning_obs_cost_buffer_factor: float = 0.1
+    # SIC exponent: cost *= SIC^weight (0 = no SIC; AUTO-IceNav: 1).
+    planning_ice_resistance_weight: float = 1.0
     # Diffusion MPC only (sampling-based): number of primitive steps per rollout.
     planning_diffusion_horizon_steps: int = 12
     # Diffusion MPC only: number of candidate rollouts to score (sampling) or samples per diffusion step (model-based).

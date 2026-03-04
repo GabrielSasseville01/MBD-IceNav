@@ -3,13 +3,32 @@ Build a planning costmap from MEDEA ice state (Section 1 of PLANNER_INTEGRATION_
 
 Takes polygons, centroids, thicknesses and domain bounds; computes cell masses from
 area × thickness × ice_density; builds a DPDEM CostMap with configurable origin and margin.
+Supports optional ridge density cost (AUTO-IceNav style) from precomputed ridge costmap.
 """
 
+from pathlib import Path
 from typing import List, Tuple, Optional
+import pickle
+
 import numpy as np
 
 from dpdem.planning.cost_map import CostMap
 from medea_ice_ship.geometry import polygon_area
+
+
+def _load_ridge_costmap(ridge_costmap_file: str) -> Optional[Tuple[np.ndarray, float]]:
+    """Load ridge costmap from pickle. Returns (ridge_costmap, scale) or None."""
+    path = Path(ridge_costmap_file)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        ridge = np.asarray(data["ridge_costmap"])
+        scale = float(data["scale"])
+        return (ridge, scale)
+    except Exception:
+        return None
 
 
 def build_costmap_from_ice_state(
@@ -35,6 +54,14 @@ def build_costmap_from_ice_state(
     ice_cost_exp_scale: float = 3.0,
     ship_length: Optional[float] = None,
     ship_beam: Optional[float] = None,
+    ridge_costmap_file: Optional[str] = None,
+    ridge_cost_weight: float = 0.0,
+    use_ke_cost: bool = True,
+    ship_speed: float = 4.0,
+    ke_cost_scale: float = 1e-6,
+    obs_cost_buffer_factor: float = 0.1,
+    ice_resistance_weight: float = 1.0,
+    sic_kernel: Optional[Tuple[int, int]] = None,
 ) -> Tuple[CostMap, dict]:
     """
     Build a CostMap from MEDEA ice field state (polygons, centroids, thicknesses).
@@ -72,6 +99,14 @@ def build_costmap_from_ice_state(
             At thickness_ref, cost = collision_cost * exp(ice_cost_exp_scale).
         ship_length: Ship length [m]. If provided with ship_beam, dilate ice by ship half-diagonal.
         ship_beam: Ship beam (width) [m]. If provided with ship_length, dilate ice by ship half-diagonal.
+        ridge_costmap_file: Optional path to ridge costmap pickle (from generate_ridge_costmap.py).
+        ridge_cost_weight: Weight for ridge density cost (additive; 0 = disabled).
+        use_ke_cost: If True, use AUTO-IceNav KE-based cost (default True).
+        ship_speed: Ship speed [m/s] for KE cost.
+        ke_cost_scale: Scale KE [J] to planning units (1e-6 gives ~0.1–100 for cell-level mass).
+        obs_cost_buffer_factor: Polygon swell for collision cost (AUTO-IceNav: 0.1).
+        ice_resistance_weight: SIC exponent; cost *= SIC^weight (AUTO-IceNav: 1).
+        sic_kernel: (kh, kw) for SIC; odd. Default (31, 31) when ice_resistance_weight > 0.
 
     Returns:
         cost_map: DPDEM CostMap.
@@ -92,6 +127,12 @@ def build_costmap_from_ice_state(
     x_origin = x_min - margin
     y_origin = y_min - margin
 
+    # SIC kernel: odd, default (31, 31) when ice_resistance_weight > 0
+    if sic_kernel is None and ice_resistance_weight > 0 and use_ke_cost:
+        kh = min(31, int(np.ceil(height / resolution)) | 1)
+        kw = min(31, int(np.ceil(width / resolution)) | 1)
+        sic_kernel = (kh, kw)
+
     cost_map = CostMap(
         width=width,
         height=height,
@@ -106,6 +147,12 @@ def build_costmap_from_ice_state(
         damage_thickness_exponent=damage_thickness_exponent,
         thickness_ref=thickness_ref,
         ice_cost_exp_scale=ice_cost_exp_scale,
+        use_ke_cost=use_ke_cost,
+        ship_speed=ship_speed,
+        ke_cost_scale=ke_cost_scale,
+        obs_cost_buffer_factor=obs_cost_buffer_factor,
+        ice_resistance_weight=ice_resistance_weight,
+        sic_kernel=sic_kernel,
     )
     cost_map.update_from_ice_field(
         positions=centroids,
@@ -114,6 +161,18 @@ def build_costmap_from_ice_state(
         angles=None,
         thicknesses=thicknesses,
     )
+
+    # Ridge cost (AUTO-IceNav style): add ridge density cost to ice cells only
+    if ridge_costmap_file and ridge_cost_weight > 0:
+        ridge_data = _load_ridge_costmap(ridge_costmap_file)
+        if ridge_data is not None:
+            ridge_costmap, ridge_scale = ridge_data
+            cost_map.apply_ridge_cost(
+                ridge_costmap=ridge_costmap,
+                ridge_scale=ridge_scale,
+                polygon_vertices=polygons,
+                ridge_weight=ridge_cost_weight,
+            )
 
     if ship_length is not None and ship_beam is not None and ship_length > 0 and ship_beam > 0:
         # Inflate ice by half the ship beam so the planner keeps the ship center at least that far

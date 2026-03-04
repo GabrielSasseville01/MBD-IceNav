@@ -361,7 +361,16 @@ uv run python examples/visualize_diffusion.py   # MBD diffusion iteration evolut
 
 ## Data and dependencies
 
-- **MEDEA runs** (`--full-map` or default non-simple): require `data/ice_floes_MEDEA_fram_20100629.pkl` (see `data/` or AUTO-IceNav MEDEA dataset).
+- **MEDEA runs** (`--full-map` or default non-simple): require `data/ice_floes_MEDEA_fram_20100629.pkl`. Download MEDEA data from the [UK Polar Data Centre](https://ramadda.data.bas.ac.uk/repository/entry/show?entryid=7dc6e19d-79fa-41f1-99a7-da408592382f) (Hwang et al. 2022):
+
+  ```bash
+  # Segmented ice image (for polygon extraction and ridge costmap)
+  curl -L -o data/MEDEA_fram_20100629.png \
+    "https://ramadda.data.bas.ac.uk/repository/entry/get/MEDEA_fram_20100629.png?entryid=synth%3A7dc6e19d-79fa-41f1-99a7-da408592382f%3AL0ZyYWN0dXJpbmcvZnNkL01FREVBX2ZyYW1fMjAxMDA2MjkucG5n"
+  ```
+
+  The polygon map (`ice_floes_MEDEA_fram_20100629.pkl`) can be obtained from the [AUTO-IceNav](https://github.com/GabrielSasseville01/AUTO-IceNav) MEDEA dataset or generated from this PNG using `dpdem.geometry.image_floes.process_image_to_polygons`.
+- **Ridge costmap (optional):** For ridge-aware planning, see [docs/RIDGE_COSTMAP.md](docs/RIDGE_COSTMAP.md). Requires the PNG above and the satellite TIF (`uv run gdown 1jV6xLCtFoe4qCWu_pOy-OnXI583lJ3Q3 --output data/`).
 - **Simple / toy planner:** No MEDEA file needed.
 - Parallel rendering uses multiple workers (config `n_workers`; default 4). GIF output does not use parallel workers.
 
