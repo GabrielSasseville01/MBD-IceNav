@@ -156,6 +156,25 @@ uv run python run_medea_ship_fracture.py --full-map --plan --planner mppi
 
 Output filenames use `medea_` instead of `simple_` (e.g. `medea_ship_fracture.mp4`, `costmap_medea_ship_fracture.mp4`).
 
+### 6b. Plan-only (costmap + path, no simulation)
+
+Plan the trajectory and save the costmap with planned path to a PNG, then exit without running the simulation. Useful for debugging costmaps and planning parameters.
+
+```bash
+# Interactive: show plot, save to outputs/default/plan_only_medea.png
+uv run python run_medea_ship_fracture.py --full-map --plan-only
+
+# Headless: save only, no window (e.g. for CI or batch runs)
+uv run python run_medea_ship_fracture.py --full-map --plan-only --no-show
+
+# With ridge costmap
+uv run python run_medea_ship_fracture.py --full-map --plan-only --no-show \
+  --ridge-costmap data/ridge_costmap_MEDEA_fram_20100629_scale05_fixed.pkl --ridge-weight 2.0
+```
+
+- **Output:** `plan_only_medea.png` (or `plan_only_simple` / `plan_only_toy_sparse` for other modes).
+- **Options:** `--no-lattice-search-movie` to skip A* search movie when running with `--plan` (plan-only implies `--plan`).
+
 ### 7. Toy planner: wall with opening
 
 Standalone example: a wall of ice with one gap; the planner finds a path through the gap. Different scenario from the simple 3-floe field.
@@ -251,6 +270,7 @@ uv run python examples/benchmark_planners.py --n-frames 200 --replan-every 150
 | **3D animation** | Always unless `--no-3d` | Same run with z/tilt and submergence; 3D hull. `simple_ship_fracture_3d.mp4` or `medea_ship_fracture_3d.mp4`. |
 | **Costmap movie** | When `--plan` | Costmap as background, ice outline, **red** = initial planned path, **blue** = actual ship path. `costmap_simple_ship_fracture.mp4` or `costmap_medea_ship_fracture.mp4`. |
 | **Lattice search movie** | When `--plan --planner lattice` (only for pure lattice; not for diffusion-mpc/mppi) and not `--no-lattice-search-movie` | A* search expansion and chosen path on the costmap. `lattice_search_simple.mp4` or `lattice_search_medea.mp4`. |
+| **Plan-only PNG** | When `--plan-only` | Costmap + planned path + ice thickness; saved to `plan_only_medea.png` (or `plan_only_simple` / `plan_only_toy_sparse`). No simulation. |
 | **Hull impact plot** | When ship has collisions (and not `--quick`) | Impulse vectors on the hull (AUTO-IceNav style). `hull_impact_simple.png` or `hull_impact_medea.png`. |
 
 File format: **MP4** by default; use `--gif` for GIF (slower, larger, no parallel workers). All paths are under the directory given by `--output-dir` (default `outputs/default`).
@@ -264,6 +284,8 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--simple` | Synthetic 3-floe ice field (no MEDEA data). |
 | `--full-map` | Full MEDEA map; ship diagonal. |
 | `--plan` | Plan path (costmap + planner); only with `--simple` or `--full-map`. |
+| `--plan-only` | Plan and save costmap+path to PNG, then exit (no simulation). Implies `--plan`. |
+| `--no-show` | With `--plan-only`: save to file only, do not open window (headless). |
 | `--planner lattice` | Use lattice A* (default). |
 | `--planner diffusion-mpc` | Use lattice A* then model-based diffusion. |
 | `--planner mppi` | Use lattice A* then MPPI (importance-weighted sampling). |
@@ -361,16 +383,48 @@ uv run python examples/visualize_diffusion.py   # MBD diffusion iteration evolut
 
 ## Data and dependencies
 
-- **MEDEA runs** (`--full-map` or default non-simple): require `data/ice_floes_MEDEA_fram_20100629.pkl`. Download MEDEA data from the [UK Polar Data Centre](https://ramadda.data.bas.ac.uk/repository/entry/show?entryid=7dc6e19d-79fa-41f1-99a7-da408592382f) (Hwang et al. 2022):
+### MEDEA data generation pipeline
 
-  ```bash
-  # Segmented ice image (for polygon extraction and ridge costmap)
-  curl -L -o data/MEDEA_fram_20100629.png \
-    "https://ramadda.data.bas.ac.uk/repository/entry/get/MEDEA_fram_20100629.png?entryid=synth%3A7dc6e19d-79fa-41f1-99a7-da408592382f%3AL0ZyYWN0dXJpbmcvZnNkL01FREVBX2ZyYW1fMjAxMDA2MjkucG5n"
-  ```
+Full MEDEA runs (`--full-map`) and ridge-aware planning require several generated files. Follow this pipeline:
 
-  The polygon map (`ice_floes_MEDEA_fram_20100629.pkl`) can be obtained from the [AUTO-IceNav](https://github.com/GabrielSasseville01/AUTO-IceNav) MEDEA dataset or generated from this PNG using `dpdem.geometry.image_floes.process_image_to_polygons`.
-- **Ridge costmap (optional):** For ridge-aware planning, see [docs/RIDGE_COSTMAP.md](docs/RIDGE_COSTMAP.md). Requires the PNG above and the satellite TIF (`uv run gdown 1jV6xLCtFoe4qCWu_pOy-OnXI583lJ3Q3 --output data/`).
+**1. Segmented PNG** (required for ridge costmap; also used to extract polygons):
+
+```bash
+curl -L -o data/MEDEA_fram_20100629.png \
+  "https://ramadda.data.bas.ac.uk/repository/entry/get/MEDEA_fram_20100629.png?entryid=synth%3A7dc6e19d-79fa-41f1-99a7-da408592382f%3AL0ZyYWN0dXJpbmcvZnNkL01FREVBX2ZyYW1fMjAxMDA2MjkucG5n"
+```
+
+**2. Ice floe polygons (pkl)** — required for simulation:
+
+- From [AUTO-IceNav](https://github.com/GabrielSasseville01/AUTO-IceNav) MEDEA dataset, or
+- Generated from the PNG: `dpdem.geometry.image_floes.process_image_to_polygons("data/MEDEA_fram_20100629.png", meters_per_pixel=2.5)` (save to `data/ice_floes_MEDEA_fram_20100629.pkl`).
+
+**3. Ridge costmap (pkl)** — optional, for ridge-aware planning:
+
+```bash
+# Download satellite TIF (optional; improves ridge detection)
+uv add gdown
+uv run gdown 1jV6xLCtFoe4qCWu_pOy-OnXI583lJ3Q3 --output data/
+# Rename to MEDEA_fram_20100629_satellite.tif if needed
+
+# Generate ridge costmap + visualization PNG
+uv run python scripts/generate_ridge_costmap.py \
+  --input data/MEDEA_fram_20100629.png \
+  --satellite data/MEDEA_fram_20100629_satellite.tif \
+  --output data/ridge_costmap_MEDEA_fram_20100629_scale05_fixed.pkl \
+  --crop_size 600 --costmap_scale 0.5 --method combined --window_size 25 --visualize
+```
+
+- **Output:** `ridge_costmap_MEDEA_fram_20100629_scale05_fixed.pkl` (planning) and `*_visualization.png` (with `--visualize`).
+- See [docs/RIDGE_COSTMAP.md](docs/RIDGE_COSTMAP.md) for details and `--synthetic` for testing without real data.
+
+**4. Use in planning:**
+
+```bash
+uv run python run_medea_ship_fracture.py --full-map --plan \
+  --ridge-costmap data/ridge_costmap_MEDEA_fram_20100629_scale05_fixed.pkl --ridge-weight 2.0
+```
+
 - **Simple / toy planner:** No MEDEA file needed.
 - Parallel rendering uses multiple workers (config `n_workers`; default 4). GIF output does not use parallel workers.
 
