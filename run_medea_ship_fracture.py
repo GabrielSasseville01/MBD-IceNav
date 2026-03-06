@@ -113,6 +113,12 @@ def main():
                         help='With --simple: ship stays far left (no collision). Use to verify ice drifts from current alone.')
     parser.add_argument('--frames', type=int, default=None, metavar='N',
                         help='Number of simulation frames (overrides config). Simulated time = N × dt (e.g. 1200 × 0.05 s = 60 s).')
+    parser.add_argument('--target-speed', type=float, default=None, metavar='M/S',
+                        help='Target ship speed [m/s] when --plan. Derives n_frames so path is traversed at this speed. Also used in KE collision cost. Default 4.0 (realistic icebreaker).')
+    parser.add_argument('--no-target-speed', action='store_true',
+                        help='Disable target-speed mode: use fixed n_frames from config (legacy, ship may be unrealistically fast).')
+    parser.add_argument('--optimize-speed', action='store_true',
+                        help='Optimize speed per path segment: slower in thick ice, faster in open water. Balances impact (KE ∝ v²) vs time.')
     args = parser.parse_args()
 
     if args.plan_only:
@@ -158,6 +164,7 @@ def main():
         optimize_with_mppi,
         optimize_with_sqp,
         optimize_with_gradcem,
+        optimize_speed_profile,
         path_to_ship_trajectory,
         create_ocean_current_model,
     )
@@ -405,6 +412,29 @@ def main():
         if args.plan:
             print("  --plan is ignored when not using --simple, --toy-sparse, or --full-map (ship stationary, ice drifts).", flush=True)
 
+    # Target-speed mode: derive n_frames so ship travels at realistic speed (path_length / (n_frames*dt) = target_speed)
+    use_target_speed = (
+        args.plan and (synthetic_mode or args.full_map)
+        and not getattr(args, 'no_target_speed', False)
+        and getattr(run_cfg, 'planning_use_target_speed', True)
+    )
+    if use_target_speed:
+        target_speed = getattr(args, 'target_speed', None) or getattr(run_cfg, 'planning_target_speed', 4.0)
+        dt_sim = run_cfg.dt
+        # Estimate path length (straight-line; actual path will be longer due to ice avoidance)
+        if goal_y_line is not None:
+            goal_pt = np.array([ship_start[0], goal_y_line])
+        else:
+            goal_pt = np.array(ship_end[:2])
+        est_len = float(np.hypot(goal_pt[0] - ship_start[0], goal_pt[1] - ship_start[1]))
+        n_frames = max(10, int(np.ceil(est_len / (target_speed * dt_sim))))
+        print(f"  Target speed: {target_speed:.1f} m/s → n_frames={n_frames} (est. path {est_len:.0f} m, sim time {n_frames*dt_sim:.2f} s)", flush=True)
+        # Rebuild ship_trajectory with new n_frames for fixed trajectory (will be replaced by planned path)
+        if synthetic_mode:
+            ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), ship_heading) for frame in range(n_frames + 1)]
+        elif args.full_map:
+            ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
+
     planned_path = None
     planned_cost_map = None
     planned_bounds = None
@@ -464,6 +494,7 @@ def main():
             plan_x_min, plan_x_max = x_min, x_max
             plan_y_min, plan_y_max = y_min, y_max
         t0 = time.time()
+        _ship_speed = target_speed if use_target_speed else getattr(plan_cfg, "planning_ship_speed", 4.0)
         cost_map, bounds = build_costmap_from_ice_state(
             polygons, centroids, thicknesses,
             plan_x_min, plan_x_max, plan_y_min, plan_y_max,
@@ -480,7 +511,7 @@ def main():
             ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
             ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
             use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
-            ship_speed=getattr(plan_cfg, "planning_ship_speed", 4.0),
+            ship_speed=_ship_speed,
             ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
             obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
             ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 1.0),
@@ -580,7 +611,21 @@ def main():
                     path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
                 )
             diag["sampling_mpc"] = time.time() - t0
-        ship_trajectory = path_to_ship_trajectory(path, n_frames)
+        use_speed_opt = getattr(args, 'optimize_speed', False) or getattr(plan_cfg, 'planning_optimize_speed', False)
+        speed_profile = None
+        if use_speed_opt:
+            v_ref = _ship_speed
+            v_min = getattr(plan_cfg, 'planning_speed_optimize_v_min', 1.0)
+            v_max = getattr(plan_cfg, 'planning_speed_optimize_v_max', 8.0)
+            tw = getattr(plan_cfg, 'planning_speed_optimize_time_weight', 1.0)
+            speed_profile, total_time = optimize_speed_profile(
+                path, cost_map, v_ref=v_ref, v_min=v_min, v_max=v_max,
+                time_weight=tw, ship_length=ship_length, ship_beam=ship_beam,
+            )
+            n_frames = max(10, int(np.ceil(total_time / run_cfg.dt)))
+            avg_v = float(np.sum(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)) / total_time) if total_time > 0 else v_ref
+            print(f"  Speed optimization: {len(speed_profile)} segments, total time {total_time:.1f}s, n_frames={n_frames}, avg speed {avg_v:.2f} m/s (range {speed_profile.min():.2f}-{speed_profile.max():.2f})", flush=True)
+        ship_trajectory = path_to_ship_trajectory(path, n_frames, speed_profile=speed_profile)
         ship_pos = ship_trajectory[0][0]
         planned_path = path
         planned_cost_map = cost_map
@@ -689,7 +734,7 @@ def main():
                 ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
                 ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
                 use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
-                ship_speed=getattr(plan_cfg, "planning_ship_speed", 4.0),
+                ship_speed=_ship_speed,
                 ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
                 obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
                 ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 1.0),
@@ -735,7 +780,20 @@ def main():
                 if 1e-6 < dist <= tol:
                     path_f = np.vstack([path_f, [goal[0], goal[1], path_f[-1, 2]]])
             path_snapshots.append((frame, path_f.copy()))  # for costmap movie: show this plan from this frame on
-            return path_to_ship_trajectory(path_f, n_remaining)
+            sp_f = None
+            if use_speed_opt and path_f is not None and len(path_f) >= 2:
+                sp_f, T_raw = optimize_speed_profile(
+                    path_f, cost_map_f, v_ref=_ship_speed,
+                    v_min=getattr(plan_cfg, 'planning_speed_optimize_v_min', 1.0),
+                    v_max=getattr(plan_cfg, 'planning_speed_optimize_v_max', 8.0),
+                    time_weight=getattr(plan_cfg, 'planning_speed_optimize_time_weight', 1.0),
+                    ship_length=ship_length, ship_beam=ship_beam,
+                )
+                T_target = n_remaining * run_cfg.dt
+                if T_raw > 1e-9:
+                    alpha = T_raw / T_target
+                    sp_f = np.maximum(sp_f * alpha, 1e-6)
+            return path_to_ship_trajectory(path_f, n_remaining, speed_profile=sp_f)
 
         if args.no_replan:
             replan_callback = None

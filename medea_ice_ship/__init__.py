@@ -32,6 +32,7 @@ from medea_ice_ship.planning import (
     optimize_with_mppi,
     optimize_with_sqp,
     optimize_with_gradcem,
+    optimize_speed_profile,
     path_to_ship_trajectory,
 )
 
@@ -73,6 +74,7 @@ __all__ = [
     'optimize_with_mppi',
     'optimize_with_sqp',
     'optimize_with_gradcem',
+    'optimize_speed_profile',
     'path_to_ship_trajectory',
     'create_ocean_current_model',
 ]

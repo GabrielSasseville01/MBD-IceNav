@@ -298,6 +298,19 @@ class RunConfig:
     planning_use_ke_cost: bool = True
     # Ship speed [m/s] for KE cost (when planning_use_ke_cost).
     planning_ship_speed: float = 4.0
+    # Target ship speed [m/s] when planning. If planning_use_target_speed, n_frames is derived so
+    # path is traversed at this speed (realistic icebreaker ~4 m/s). Also used in KE collision cost.
+    planning_target_speed: float = 4.0
+    # If True and --plan, derive n_frames from path length / target_speed so ship travels at target speed.
+    planning_use_target_speed: bool = True
+    # If True and --plan, optimize speed per segment: slower in thick ice, faster in open water.
+    # Balances impact cost (KE ∝ v²) vs time. Overrides fixed target speed when enabled.
+    planning_optimize_speed: bool = False
+    # Speed optimization: weight for time in objective (higher = prefer faster).
+    planning_speed_optimize_time_weight: float = 1.0
+    # Speed optimization: min/max speed [m/s].
+    planning_speed_optimize_v_min: float = 1.0
+    planning_speed_optimize_v_max: float = 8.0
     # Scale factor for KE cost (raw J -> planning units). With per-cell mass, 1e-9 yields
     # costs 0.1–0.6 (all appear purple). 1e-6 yields ~0.1–100 so ice is clearly visible.
     planning_ke_cost_scale: float = 1e-6

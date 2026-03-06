@@ -403,21 +403,96 @@ def optimize_with_gradcem(
     return optimized_traj
 
 
+def optimize_speed_profile(
+    path: np.ndarray,
+    cost_map: CostMap,
+    v_ref: float = 4.0,
+    v_min: float = 1.0,
+    v_max: float = 8.0,
+    time_weight: float = 1.0,
+    ship_length: float = 158.0,
+    ship_beam: float = 28.0,
+) -> Tuple[np.ndarray, float]:
+    """
+    Optimize speed along path segments to balance impact cost (KE ∝ v²) vs time.
+
+    In thick ice (high costmap cost): optimal speed is lower (reduce impact).
+    In open water (low cost): optimal speed is higher (save time).
+
+    Cost model: cost through segment i = c_i * (v_i/v_ref)² * L_i (KE scales with v²).
+    Time through segment i = L_i / v_i.
+    Objective: minimize sum_i [ c_i*(v_i/v_ref)²*L_i + time_weight * L_i/v_i ].
+    Per-segment optimum: v_i = (time_weight * v_ref² / (2*c_i))^(1/3), clamped to [v_min, v_max].
+
+    Args:
+        path: N×3 array [x, y, heading].
+        cost_map: CostMap for sampling cost along path.
+        v_ref: Reference speed [m/s] used when building costmap.
+        v_min, v_max: Speed bounds [m/s].
+        time_weight: Weight for time in objective (higher = prefer faster).
+        ship_length, ship_beam: For sampling ship corners along path.
+
+    Returns:
+        speeds: (N-1) array of optimal speed per segment [m/s].
+        total_time: Total traversal time [s].
+    """
+    path = np.asarray(path, dtype=float)
+    n_pts = path.shape[0]
+    if n_pts < 2:
+        return np.array([v_ref]), 0.0
+
+    seg_lens = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
+    n_seg = len(seg_lens)
+    v_ref = max(v_ref, 1e-6)
+
+    def _sample_cost(p: np.ndarray, heading: float) -> float:
+        cost = cost_map.get_cost_world(p[0], p[1])
+        cos_h, sin_h = np.cos(heading), np.sin(heading)
+        half_l, half_w = ship_length / 2, ship_beam / 2
+        for dx, dy in [(half_l, half_w), (half_l, -half_w), (-half_l, half_w), (-half_l, -half_w)]:
+            cx = p[0] + cos_h * dx - sin_h * dy
+            cy = p[1] + sin_h * dx + cos_h * dy
+            cost = max(cost, cost_map.get_cost_world(cx, cy))
+        return cost
+
+    costs = np.zeros(n_seg)
+    for i in range(n_seg):
+        n_samp = max(3, int(seg_lens[i] / cost_map.resolution) + 1)
+        for t in np.linspace(0, 1, n_samp):
+            p = (1 - t) * path[i, :2] + t * path[i + 1, :2]
+            h = (1 - t) * path[i, 2] + t * path[i + 1, 2]
+            costs[i] += _sample_cost(p, h)
+        costs[i] /= n_samp
+        costs[i] = max(costs[i], cost_map.base_cost * 0.5)  # avoid div by zero
+
+    # Optimal v_i = (λ * v_ref² / (2*c_i))^(1/3)
+    lam = time_weight
+    v_opt = np.power(lam * v_ref * v_ref / (2.0 * costs), 1.0 / 3.0)
+    v_opt = np.clip(v_opt, v_min, v_max)
+
+    total_time = np.sum(seg_lens / v_opt)
+    return v_opt, float(total_time)
+
+
 def path_to_ship_trajectory(
     path: np.ndarray,
     n_frames: int,
+    speed_profile: Optional[np.ndarray] = None,
 ) -> List[Tuple[np.ndarray, float]]:
     """
     Convert a planned path (N×3) to ship_trajectory for simulate_ice_ship_interaction (Section 4).
 
     Produces a list of (position_2d, heading) of length n_frames + 1. First entry is path
-    start; last entry is path goal. Intermediate points are interpolated along the path by
-    arc length so the ship progresses evenly over the frames. Heading is interpolated
-    between waypoints (linear in angle, with wrap).
+    start; last entry is path goal. Intermediate points are interpolated along the path.
+    By default uses uniform arc-length (constant speed). If speed_profile is provided,
+    uses variable speed: more time in high-cost (ice) segments, less in open water.
+    Heading is interpolated between waypoints (linear in angle, with wrap).
 
     Args:
         path: N×3 array [x, y, heading] in world coordinates.
         n_frames: Number of simulation frames (trajectory will have n_frames + 1 entries).
+        speed_profile: Optional (N-1) array of speed per segment [m/s]. When provided,
+            trajectory is time-parametrized so ship spends more time in low-speed segments.
 
     Returns:
         List of (np.array([x, y]), heading), length n_frames + 1. trajectory[0] matches
@@ -449,6 +524,17 @@ def path_to_ship_trajectory(
         out = a0 + frac * da
         return (out + np.pi) % (2 * np.pi) - np.pi
 
+    # Time parametrization: uniform arc-length (default) or variable speed
+    if speed_profile is not None and len(speed_profile) == len(seg_lens):
+        v = np.maximum(speed_profile, 1e-6)
+        seg_times = seg_lens / v
+        T_total = np.sum(seg_times)
+        T_cum = np.zeros(n_pts)
+        T_cum[1:] = np.cumsum(seg_times)
+    else:
+        T_total = 1.0
+        T_cum = s / S if S > 0 else np.linspace(0, 1, n_pts)
+
     trajectory = []
     for k in range(n_frames + 1):
         if k == 0:
@@ -458,15 +544,25 @@ def path_to_ship_trajectory(
             trajectory.append((path[-1, :2].copy(), float(path[-1, 2])))
             continue
         t = k / n_frames
-        target_s = t * S
-        # Segment i such that s[i] <= target_s < s[i+1]
-        i = np.searchsorted(s, target_s, side="right") - 1
-        i = max(0, min(i, n_pts - 2))
-        if seg_lens[i] > 0:
-            frac = (target_s - s[i]) / seg_lens[i]
+        if speed_profile is not None and len(speed_profile) == len(seg_lens):
+            target_t = t * T_total
+            i = np.searchsorted(T_cum, target_t, side="right") - 1
+            i = max(0, min(i, n_pts - 2))
+            if seg_times[i] > 0:
+                frac = (target_t - T_cum[i]) / seg_times[i]
+            else:
+                frac = 1.0
+            frac = np.clip(frac, 0.0, 1.0)
+            target_s = s[i] + frac * seg_lens[i]
         else:
-            frac = 1.0
-        frac = np.clip(frac, 0.0, 1.0)
+            target_s = t * S
+            i = np.searchsorted(s, target_s, side="right") - 1
+            i = max(0, min(i, n_pts - 2))
+            if seg_lens[i] > 0:
+                frac = (target_s - s[i]) / seg_lens[i]
+            else:
+                frac = 1.0
+            frac = np.clip(frac, 0.0, 1.0)
         x = (1 - frac) * path[i, 0] + frac * path[i + 1, 0]
         y = (1 - frac) * path[i, 1] + frac * path[i + 1, 1]
         heading = interpolate_angle(path[i, 2], path[i + 1, 2], frac)
