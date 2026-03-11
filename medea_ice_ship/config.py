@@ -47,8 +47,8 @@ class IceMaterialConfig:
 class SimulationConfig:
     """All tunable simulation parameters."""
     # --- Time ---
-    # s — fixed time step for integration.
-    dt: float = 1.0 #0.1
+    # s — fixed time step for integration (run script passes RunConfig.dt; this is fallback).
+    dt: float = 0.05
     # If True, cap dt at Rayleigh-based stability limit (Eq. 11). Otherwise dt is unchanged (advisory only).
     use_rayleigh_dt_cap: bool = False
     # Safety factor b in Eq. 11 (e.g. 0.1 = 10% of theoretical max).
@@ -221,8 +221,8 @@ class RunConfig:
     ship_draft: float = 10.5
     # kg — ship mass (e.g. 23 kt); used for dynamics when not inferred from hull.
     ship_displacement: float = 23000e3
-    # s — time step passed to simulation (should match SimulationConfig.dt if changed).
-    dt: float = 0.1
+    # s — time step passed to simulation. Finer (e.g. 0.05) gives smoother, more realistic ship dynamics.
+    dt: float = 0.05
     # Number of simulation frames in simple (synthetic) ice field mode.
     n_frames_simple: int = 300
     # Number of simulation frames in MEDEA (satellite) ice field mode.
@@ -301,6 +301,8 @@ class RunConfig:
     # Target ship speed [m/s] when planning. If planning_use_target_speed, n_frames is derived so
     # path is traversed at this speed (realistic icebreaker ~4 m/s). Also used in KE collision cost.
     planning_target_speed: float = 4.0
+    # Extra clearance [m] added to costmap dilation so planned path stays farther from ice (avoids collision when tracking at 4 m/s).
+    planning_clearance_margin: float = 15.0
     # If True and --plan, derive n_frames from path length / target_speed so ship travels at target speed.
     planning_use_target_speed: bool = True
     # If True and --plan, optimize speed per segment: slower in thick ice, faster in open water.

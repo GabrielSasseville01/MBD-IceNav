@@ -54,6 +54,7 @@ def build_costmap_from_ice_state(
     ice_cost_exp_scale: float = 3.0,
     ship_length: Optional[float] = None,
     ship_beam: Optional[float] = None,
+    planning_clearance_margin: float = 0.0,
     ridge_costmap_file: Optional[str] = None,
     ridge_cost_weight: float = 0.0,
     use_ke_cost: bool = True,
@@ -175,11 +176,9 @@ def build_costmap_from_ice_state(
             )
 
     if ship_length is not None and ship_beam is not None and ship_length > 0 and ship_beam > 0:
-        # Inflate ice by half the ship beam so the planner keeps the ship center at least that far
-        # from ice. Using half-diagonal would close narrow gaps and force bad paths; half-beam
-        # adds a modest clearance without over-dilating. The lattice planner still checks ship
-        # corners when scoring path cost.
-        inflation_radius = 0.5 * ship_beam
+        # Inflate ice so the planner keeps the path away from ice. Half-beam gives baseline clearance;
+        # planning_clearance_margin adds extra room (avoids collision when ship tracks at 4 m/s over many frames).
+        inflation_radius = 0.5 * ship_beam + planning_clearance_margin
         cost_map.dilate(inflation_radius)
 
     if wall_bounds is not None:

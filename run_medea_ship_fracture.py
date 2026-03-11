@@ -46,6 +46,8 @@ def main():
                         help='Use minimal synthetic ice field (3 floes) for fast testing (no MEDEA data)')
     parser.add_argument('--toy-sparse', action='store_true',
                         help='Use sparse toy ice field: varying thickness (e.g. a few ~10 m icebergs, rest 0.5–2 m)')
+    parser.add_argument('--ice-tank-toy', action='store_true',
+                        help='Use NRC ice-tank-style toy field: 75 m × 32 m basin with floes, best with --ice-tank-psv')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility (default from config)')
     parser.add_argument('--save-state', type=str, metavar='FILE', default=None,
@@ -58,6 +60,8 @@ def main():
                         help='Cap ice-on-ship force to N Newtons (e.g. 25e6 for 25 MN)')
     parser.add_argument('--no-thrust-cap', action='store_true',
                         help='Disable thrust cap (unlimited ship thrust)')
+    parser.add_argument('--ice-tank-psv', action='store_true',
+                        help='Use AUTO-IceNav ice-tank PSV-scale vessel (L≈83 m, B≈17 m, displacement≈8 kt) instead of default 158 m icebreaker')
     parser.add_argument('--gif', action='store_true',
                         help='Output GIF instead of MP4 (slower, larger files)')
     parser.add_argument('--plan', action='store_true',
@@ -112,7 +116,7 @@ def main():
     parser.add_argument('--current-only', action='store_true',
                         help='With --simple: ship stays far left (no collision). Use to verify ice drifts from current alone.')
     parser.add_argument('--frames', type=int, default=None, metavar='N',
-                        help='Number of simulation frames (overrides config). Simulated time = N × dt (e.g. 1200 × 0.05 s = 60 s).')
+                        help='Run only the first N simulation frames (for testing). Trajectory is still built at realistic speed; execution is truncated. Simulated time = N × dt.')
     parser.add_argument('--target-speed', type=float, default=None, metavar='M/S',
                         help='Target ship speed [m/s] when --plan. Derives n_frames so path is traversed at this speed. Also used in KE collision cost. Default 4.0 (realistic icebreaker).')
     parser.add_argument('--no-target-speed', action='store_true',
@@ -174,6 +178,17 @@ def main():
         import matplotlib.pyplot as plt
 
     run_cfg = get_default_run_config()
+    # Optional: override ship parameters to match AUTO-IceNav ice-tank PSV-scale vessel
+    if getattr(args, 'ice_tank_psv', False):
+        # 1:45 scale model is 1.84 m × 0.38 m, 90 kg → full-scale ≈ 83 m × 17 m, ~8,200 t
+        run_cfg = replace_config(
+            run_cfg,
+            ship_length=83.0,
+            ship_beam=17.0,
+            ship_draft=7.0,
+            ship_displacement=8_200e3,
+        )
+        print("  [Vessel] Using AUTO-IceNav ice-tank PSV-scale ship (L=83 m, B=17 m, mass≈8.2 kt)", flush=True)
     if args.seed is None:
         args.seed = run_cfg.default_seed
     video_ext = '.gif' if args.gif else '.mp4'
@@ -214,7 +229,7 @@ def main():
     t_setup_start = time.time()
     print("=" * 70)
     print("DPDEM: MEDEA Satellite Ice + Ship Fracture Simulation")
-    synthetic_mode = args.simple or args.toy_sparse
+    synthetic_mode = args.simple or args.toy_sparse or args.ice_tank_toy
     if args.simple:
         print("  [SIMPLE MODE - synthetic ice field for quick testing]")
     if args.toy_sparse:
@@ -234,7 +249,30 @@ def main():
     ship_displacement = run_cfg.ship_displacement
 
     sat_thicknesses_override = None  # when set, use instead of assign_thickness_by_area
-    if args.toy_sparse:
+    if args.ice_tank_toy:
+        t0 = time.time()
+        print("Creating NRC ice-tank-style toy ice field (75 m × 32 m basin)...", flush=True)
+        # Basin: 75 m (x) × 32 m (y). Use sparse floes with a few thick 'icebergs'.
+        sat_polygons, sat_centroids, sat_thicknesses_override = create_sparse_toy_ice_field(
+            seed=args.seed,
+            domain_x=(0.0, 75.0),
+            domain_y=(-16.0, 16.0),
+            n_floes=12,
+            n_icebergs=3,
+            iceberg_thickness=10.0,
+            moderate_thickness_range=(0.5, 2.0),
+            floe_size_range=(4.0, 15.0),
+            min_gap=5.0,
+        )
+        print(f"  Created {len(sat_polygons)} floes ({time.time()-t0:.1f}s)", flush=True)
+        all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
+            sat_polygons, sat_centroids, cells_per_100m2=run_cfg.cells_per_100m2_simple, seed=args.seed
+        )
+        polygons = all_cells
+        centroids = all_cell_centroids
+        parent_floe_ids = all_parent_ids
+        print(f"  Tessellated to {len(polygons)} cells", flush=True)
+    elif args.toy_sparse:
         t0 = time.time()
         print("Creating sparse toy ice field (varying thickness: icebergs ~10 m, moderate 0.5–2 m)...", flush=True)
         sat_polygons, sat_centroids, sat_thicknesses_override = create_sparse_toy_ice_field(seed=args.seed)
@@ -372,8 +410,6 @@ def main():
     goal_y_line = None
     if synthetic_mode:
         n_frames = run_cfg.n_frames_simple
-        if getattr(args, 'frames', None) is not None:
-            n_frames = args.frames
         ship_start = np.array([x_min - ship_length / 2 - run_cfg.path_margin, (y_min + y_max) / 2])
         ship_end = np.array([x_max + ship_length / 2 + run_cfg.path_margin, (y_min + y_max) / 2])
         if getattr(args, 'current_only', False):
@@ -388,12 +424,11 @@ def main():
     elif args.full_map:
         inset = ship_length / 2 + run_cfg.path_margin
         ship_start = np.array([-545.0, -600.0])
-        ship_end   = np.array([(x_min + x_max) / 2.0, y_max - inset])
-        goal_y_line = float(y_max)
-        diagonal_heading = np.arctan2(ship_end[1] - ship_start[1], ship_end[0] - ship_start[0])
+        # TEMP TEST: goal only 50 m above start to verify sim stops when goal reached
+        ship_end   = np.array([-350.0, -550.0])   # end 50 m above start y
+        goal_y_line = -550.0                      # goal line 50 m above start y (-600 + 50)
+        diagonal_heading = np.pi / 4.0            # 45° purely diagonal (bow toward +x and +y)
         n_frames = run_cfg.n_frames_medea
-        if getattr(args, 'frames', None) is not None:
-            n_frames = args.frames
         ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
         ship_pos = ship_trajectory[0][0]
         drift_vel = 0.0
@@ -508,6 +543,7 @@ def main():
             ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
             ship_length=ship_length,
             ship_beam=ship_beam,
+            planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
             ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
             ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
             use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
@@ -731,6 +767,7 @@ def main():
                 ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
                 ship_length=ship_length,
                 ship_beam=ship_beam,
+                planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
                 ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
                 ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
                 use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
@@ -823,13 +860,19 @@ def main():
     if args.no_dpdem_bonds:
         sim_cfg = replace_config(sim_cfg, use_dpdem_style_bonds=False)
         print("  Bond model: legacy (force vs strength)", flush=True)
+    # --frames: run only the first N frames (trajectory stays at realistic speed; we just truncate execution)
+    _n_frames_arg = getattr(args, 'frames', None)
+    run_n_frames = min(n_frames, _n_frames_arg) if _n_frames_arg is not None else n_frames
+    if ship_trajectory is not None and run_n_frames < n_frames:
+        ship_trajectory = ship_trajectory[: run_n_frames + 1]
+        print(f"  Running first {run_n_frames} of {n_frames} frames (--frames {_n_frames_arg}); ship speed unchanged.", flush=True)
     frame_callback = None
     if args.live:
         local_polys_live = [np.asarray(p) - polygon_centroid(p) for p in polygons]
         margin = 50.0
         extent_live = (float(x_min) - margin, float(x_max) + margin, float(y_min) - margin, float(y_max) + margin)
         _fig_live, _ax_live, frame_callback = make_live_2d_callback(
-            bonds, local_polys_live, ship_length, ship_beam, thicknesses, extent_live, n_frames,
+            bonds, local_polys_live, ship_length, ship_beam, thicknesses, extent_live, run_n_frames,
         )
         print("  Live 2D view: window will update each frame", flush=True)
     # ── Ocean current model ──
@@ -851,11 +894,15 @@ def main():
         print(f"  Ocean current: mode={args.current}, speed={_oc_speed:.2f} m/s", flush=True)
 
     t0 = time.time()
-    print(f"\nRunning fracture simulation ({n_frames} frames)...", flush=True)
+    print(f"\nRunning fracture simulation ({run_n_frames} frames)...", flush=True)
+    _goal_point = None
+    if goal_y_line is None and ship_trajectory is not None and len(ship_trajectory) > 0:
+        _goal_point = tuple(ship_trajectory[-1][0])
+    _goal_tol = 15.0  # metres for early-stop (goal reached) check
     sim_result = simulate_ice_ship_interaction(
         polygons=polygons, centroids=centroids.copy(), bonds=bonds,
         ship_pos=ship_pos, ship_length=ship_length, ship_beam=ship_beam,
-        n_frames=n_frames, dt=run_cfg.dt, drift_vel=drift_vel, thicknesses=thicknesses,
+        n_frames=run_n_frames, dt=run_cfg.dt, drift_vel=drift_vel, thicknesses=thicknesses,
         ship_props=ship_props, ship_trajectory=ship_trajectory,
         config=sim_cfg,
         replan_every_n_frames=replan_every_n_frames,
@@ -865,6 +912,9 @@ def main():
         parent_ids=parent_floe_ids,
         ocean_current=ocean_current_model,
         ship_drift_only=getattr(args, 'current_only', False),
+        goal_point=_goal_point,
+        goal_y_line=goal_y_line,
+        goal_tolerance=_goal_tol,
     )
     positions_history = sim_result[0]
     rotations_history = sim_result[1]
@@ -874,6 +924,7 @@ def main():
     damage_summary = sim_result[5] if len(sim_result) > 5 and isinstance(sim_result[5], dict) else None
     sim_time = time.time() - t0
     diag["simulation"] = sim_time
+    run_n_frames = len(positions_history)  # actual frames (may be less if goal reached early)
 
     n_initial = len(bonds)
     n_intact = bonds_history[-1].sum() if n_initial > 0 else 0
@@ -910,7 +961,7 @@ def main():
         save_simulation_state(
             polygons, centroids, bonds, thicknesses,
             positions_history, rotations_history, bonds_history, ship_history, submergence_history,
-            ship_length, ship_beam, ship_draft, n_frames, dt=run_cfg.dt,
+            ship_length, ship_beam, ship_draft, run_n_frames, dt=run_cfg.dt,
             output_2d=('simple_ship_fracture' if synthetic_mode else 'medea_ship_fracture') + video_ext,
             output_3d=('simple_ship_fracture_3d' if synthetic_mode else 'medea_ship_fracture_3d') + video_ext,
             simple_mode=synthetic_mode, filepath=args.save_state,
@@ -945,6 +996,7 @@ def main():
         n_workers=run_cfg.n_workers,
         ocean_current=ocean_current_model,
         path_snapshots=path_snapshots if (args.plan and planned_path is not None) else None,
+        goal_y_line=goal_y_line,
     )
     diag["anim_2d"] = time.time() - t0
     print(f"  2D animation time: {diag['anim_2d']:.1f}s", flush=True)

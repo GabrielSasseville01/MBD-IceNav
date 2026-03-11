@@ -470,6 +470,9 @@ def _draw_2d_frame_to_array(data, frame_idx):
             remaining = _remaining_planned_path_from_snapshots(ship_pos_frame, path_snapshots, frame)
             if remaining is not None and len(remaining) >= 2:
                 ax.plot(remaining[:, 0], remaining[:, 1], "r-", linewidth=1.5, alpha=0.9, label="Planned path (remaining)", zorder=4)
+    goal_y_line = data.get("goal_y_line")
+    if goal_y_line is not None:
+        ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
     n_broken = np.sum(~intact)
     ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nFrame {frame}/{data['n_frames']-1} | Bonds: {n_broken}/{len(bonds)} broken", fontsize=14)
     ax.set_xlabel("X [m]")
@@ -1081,11 +1084,13 @@ def animate_ice_ship_2d(
     view_bounds=None,
     ocean_current=None,
     path_snapshots=None,
+    goal_y_line=None,
 ):
     """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame.
     view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice.
     ocean_current: OceanCurrentModel or None; when set, draws a quiver plot of the current field behind the ice.
-    path_snapshots: optional list of (frame_idx, path Nx3); when set, draws the remaining planned path from the ship (updates at replan)."""
+    path_snapshots: optional list of (frame_idx, path Nx3); when set, draws the remaining planned path from the ship (updates at replan).
+    goal_y_line: optional y [m]; when set, draws a horizontal goal line (lime dashed) like in the costmap movie."""
     n_frames = len(positions_history)
     frames_to_render = list(range(0, n_frames, frame_skip))
     if frames_to_render[-1] != n_frames - 1:
@@ -1155,6 +1160,7 @@ def animate_ice_ship_2d(
             "dpi": _RENDER_DPI,
             "current_viz": _current_viz_data,
             "path_snapshots": list(path_snapshots) if path_snapshots else None,
+            "goal_y_line": goal_y_line,
         }
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
@@ -1243,6 +1249,8 @@ def animate_ice_ship_2d(
                 remaining = _remaining_planned_path_from_snapshots(ship_pos_frame, path_snapshots, frame)
                 if remaining is not None and len(remaining) >= 2:
                     ax.plot(remaining[:, 0], remaining[:, 1], "r-", linewidth=1.5, alpha=0.9, zorder=4)
+        if goal_y_line is not None:
+            ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
         n_broken = np.sum(~intact)
         ax.set_title(f'DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\n'
                      f'Frame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken', fontsize=14)

@@ -81,6 +81,9 @@ def simulate_ice_ship_interaction(
     parent_ids=None,
     ocean_current=None,
     ship_drift_only=False,
+    goal_point=None,
+    goal_y_line=None,
+    goal_tolerance=15.0,
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
@@ -98,6 +101,10 @@ def simulate_ice_ship_interaction(
         damping uses relative velocity in the body frame.
     ship_drift_only: If True and using ship dynamics, do not apply PD control
         (tau_control = 0) so the ship drifts with currents/ice forces only.
+    goal_point: Optional (x, y) [m]. If set, simulation stops when ship is within goal_tolerance of this point.
+    goal_y_line: Optional y [m] (e.g. top edge). If set, simulation stops when ship_pos[1] >= goal_y_line - goal_tolerance.
+        Takes precedence over goal_point when both are set (line goal for full-map).
+    goal_tolerance: Distance [m] for goal reached check. Default 15.0.
 
     Returns (positions_history, rotations_history, bonds_history, ship_history, submergence_history[, ship_diagnostics or damage_summary]).
     When ship_trajectory is not None and return_ship_diagnostics is False, the 6th element is damage_summary
@@ -774,6 +781,27 @@ def simulate_ice_ship_interaction(
                 ship_pos_frame.copy(),
                 ship_heading,
             )
+
+        # Debug: print ship position frequently when goal is set (every 10 frames)
+        if (goal_y_line is not None or goal_point is not None) and frame % 10 == 0:
+            sx, sy = float(ship_pos_frame[0]), float(ship_pos_frame[1])
+            if goal_y_line is not None:
+                thresh = goal_y_line - goal_tolerance
+                past = "yes" if sy >= thresh else "no"
+                print(f"  [goal debug] frame {frame + 1}  ship (x,y)=({sx:.1f}, {sy:.1f})  goal_y_line={goal_y_line:.0f}  threshold={thresh:.0f}  past? {past}", flush=True)
+            else:
+                print(f"  [goal debug] frame {frame + 1}  ship (x,y)=({sx:.1f}, {sy:.1f})  goal_point=({goal_point[0]:.1f}, {goal_point[1]:.1f})", flush=True)
+
+        # Early stop when goal is reached (optional)
+        if goal_y_line is not None:
+            if ship_pos_frame[1] >= goal_y_line - goal_tolerance:
+                print(f"  Goal reached at frame {frame + 1} (y >= {goal_y_line - goal_tolerance:.0f} m).", flush=True)
+                break
+        elif goal_point is not None:
+            dist = np.hypot(ship_pos_frame[0] - goal_point[0], ship_pos_frame[1] - goal_point[1])
+            if dist <= goal_tolerance:
+                print(f"  Goal reached at frame {frame + 1} (distance {dist:.0f} m <= {goal_tolerance:.0f} m).", flush=True)
+                break
 
     # Optional diagnostic: verify first frames have intact bonds (set DPDEM_BOND_DIAG=1 to enable)
     if os.environ.get("DPDEM_BOND_DIAG") == "1" and len(bonds) > 0 and len(bonds_history) >= 2:
