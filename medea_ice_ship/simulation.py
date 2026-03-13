@@ -84,6 +84,7 @@ def simulate_ice_ship_interaction(
     goal_point=None,
     goal_y_line=None,
     goal_tolerance=15.0,
+    use_auto_icenav_ship: bool = False,
 ):
     """
     Simulate ice-ship interaction with fracture mechanics.
@@ -265,6 +266,28 @@ def simulate_ice_ship_interaction(
         Kp_psi = cfg.Kp_psi
         Kd_ship = cfg.Kd_ship
 
+    auto_icenav_adapter = None
+    if use_ship_dynamics and use_auto_icenav_ship:
+        from medea_ice_ship.auto_icenav_ship import AutoIceNavShip
+        eta0 = [float(ship_pos_dyn[0]), float(ship_pos_dyn[1]), float(ship_heading_dyn)]
+        nu0 = [0.0, 0.0, 0.0]
+        dt_sim = dt
+        target_speed = getattr(cfg, "planning_target_speed", 4.0)
+        max_accel = getattr(cfg, "planning_max_accel", 0.5)
+        auto_icenav_adapter = AutoIceNavShip(
+            eta0=eta0,
+            nu0=nu0,
+            dt=dt_sim,
+            target_speed=target_speed,
+            max_accel=max_accel,
+        )
+        path_xyh = np.array(
+            [[p[0][0], p[0][1], p[1]] for p in ship_trajectory],
+            dtype=float,
+        )
+        auto_icenav_adapter.init_trajectory_tracking(path_xyh)
+        print("  AUTO-IceNav ship dynamics enabled (Fossen 3-DOF + DP + trajectory setpoints).", flush=True)
+
     for frame in range(n_frames):
         # Receding-horizon replan (AUTO-IceNav style): update trajectory from current ice state
         if (
@@ -299,7 +322,15 @@ def simulate_ice_ship_interaction(
             ship_pos_frame = ship_pos
             ship_heading = 0.0
 
-        components = find_connected_components(n, bonds, bond_intact)
+        # Thick-ice mode: decide at frame start so we never fragment components or carry over broken bonds.
+        max_fracture_thickness = getattr(cfg, "max_fracture_thickness", 15.0)
+        all_ice_thick = len(thicknesses) > 0 and np.all(thicknesses > max_fracture_thickness)
+        if all_ice_thick and len(bonds) > 0:
+            bond_intact[:] = True
+            components = find_connected_components(n, bonds, np.ones(len(bonds), dtype=bool))
+        else:
+            components = find_connected_components(n, bonds, bond_intact)
+
         forces = np.zeros_like(positions)
         moments = np.zeros(n)
         ship_collision_force = np.zeros(n)
@@ -434,13 +465,38 @@ def simulate_ice_ship_interaction(
                         ship_collision_force[i] *= scale
                 F_ice_ship_collision *= scale
                 M_ice_ship_collision *= scale
+
+        # Dissipation cap (inelastic collision): limit collision impulse so the ship loses KE (stops) but does not bounce.
+        # Apply to collision force/moment only, using collision direction (not total F_ice_ship), so we don't reverse approach velocity.
+        if (
+            use_ship_dynamics
+            and getattr(cfg, "collision_impulse_dissipation_cap", True)
+            and np.linalg.norm(F_ice_ship_collision) > 1e-6
+        ):
+            v_ship_world = R_xy(ship_heading_dyn) @ np.array([ship_u, ship_v])
+            F_coll_mag = float(np.linalg.norm(F_ice_ship_collision))
+            F_coll_dir = F_ice_ship_collision / F_coll_mag
+            # v_approach = ship speed toward ice (along -F_collision direction); positive when approaching
+            v_approach = max(0.0, float(-np.dot(v_ship_world, F_coll_dir)))
+            J_coll_mag = F_coll_mag * dt
+            J_max = ship_props.mass * v_approach * getattr(cfg, "collision_impulse_cap_factor", 1.0)
+            if J_coll_mag > J_max and J_max > 0:
+                scale = J_max / J_coll_mag
+                F_ice_ship_collision = F_ice_ship_collision * scale
+                M_ice_ship_collision = M_ice_ship_collision * scale
+
         F_ice_ship += F_ice_ship_collision
         M_ice_ship += M_ice_ship_collision
+
+        # For zero-restitution clamp: remember collision direction in world frame (ship must not move away from ice)
+        collision_dir_world = None
+        if np.linalg.norm(F_ice_ship_collision) > 1e-6:
+            collision_dir_world = F_ice_ship_collision / np.linalg.norm(F_ice_ship_collision)
 
         # After thrust cap: check if the (capped) collision force is large enough to
         # plausibly initiate fracture for each active floe.  Once eligible, stays eligible.
         for i in range(n):
-            if ship_collision_force[i] > min_collision_threshold:
+            if ship_collision_force[i] > min_collision_threshold and thicknesses[i] <= max_fracture_thickness:
                 dpdem_floe_eligible[initial_floe_of[i]] = True
 
         no_collision = ship_collision_force <= 0
@@ -631,7 +687,9 @@ def simulate_ice_ship_interaction(
                     dpdem_floe_eligible[initial_floe_of[bond_i]]
                     & dpdem_floe_eligible[initial_floe_of[bond_j]]
                 )
-    
+                # Ice thicker than max_fracture_thickness cannot fracture (unbreakable / land-like).
+                bond_breakable_thickness = (thicknesses[bond_i] <= max_fracture_thickness) & (thicknesses[bond_j] <= max_fracture_thickness)
+
                 # Spatial locality: DPDEM damage only on bonds at or near the crack front.
                 #  (a) at least one endpoint is directly colliding with the ship, OR
                 #  (b) at least one endpoint is shared with an already-broken bond (crack tip).
@@ -642,7 +700,7 @@ def simulate_ice_ship_interaction(
                     elem_at_crack[bond_i[broken_mask]] = True
                     elem_at_crack[bond_j[broken_mask]] = True
                 bond_at_crack = elem_at_crack[bond_i] | elem_at_crack[bond_j]
-                bond_dpdem_ok = both_ep_active & floe_ok & (bond_near_ship | bond_at_crack)
+                bond_dpdem_ok = both_ep_active & floe_ok & (bond_near_ship | bond_at_crack) & bond_breakable_thickness
     
                 v_rel = velocities[bond_j] - velocities[bond_i]
                 v_n = np.sum(v_rel * bond_dir, axis=1)
@@ -663,15 +721,19 @@ def simulate_ice_ship_interaction(
                         cfg.bond_G_c_I, cfg.bond_G_c_II, cfg.bond_eta_bk,
                         bond_damage, bond_delta_m_max, bond_delta_m_0, intact,
                     )
-                    bond_intact[:] = new_intact
+                    # Only apply damage-model result to bonds that are breakable by thickness (thick ice stays intact)
+                    if not all_ice_thick:
+                        bond_intact[:] = np.where(bond_breakable_thickness, new_intact, bond_intact)
                 # Ship collision can still break bonds (only when there is actual contact)
-                collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
-                collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
-                effective_strength = bond_strengths * cfg.effective_strength_collision
-                break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
-                bond_intact[break_collision] = False
+                if not all_ice_thick:
+                    collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
+                    collision_force_on_bond = np.maximum(ship_collision_force[bond_i], ship_collision_force[bond_j])
+                    effective_strength = bond_strengths * cfg.effective_strength_collision
+                    break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength) & bond_breakable_thickness
+                    bond_intact[break_collision] = False
             else:
                 # Legacy breaking: force vs effective strength
+                bond_breakable_thickness = (thicknesses[bond_i] <= max_fracture_thickness) & (thicknesses[bond_j] <= max_fracture_thickness)
                 bond_force = stiffness_bond * stretch_bond + np.maximum(element_stress[bond_i], element_stress[bond_j]) * cfg.propagated_stress_factor
                 propagated_stress_bond = np.maximum(element_stress[bond_i], element_stress[bond_j])
                 collision_on_bond = (ship_collision_force[bond_i] > 0) | (ship_collision_force[bond_j] > 0)
@@ -685,9 +747,10 @@ def simulate_ice_ship_interaction(
                         bond_strengths,
                     ),
                 )
-                break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength)
-                break_force = intact & (bond_force > effective_strength)
-                bond_intact[break_collision | break_force] = False
+                break_collision = intact & collision_on_bond & (collision_force_on_bond > effective_strength) & bond_breakable_thickness
+                break_force = intact & (bond_force > effective_strength) & bond_breakable_thickness
+                if not all_ice_thick:
+                    bond_intact[break_collision | break_force] = False
     
             # Eq. 8: I·dω/dt = Mc + Mb + Mh; only update active elements
             if np.any(elem_active):
@@ -703,63 +766,104 @@ def simulate_ice_ship_interaction(
             nu = np.array([ship_u, ship_v, ship_r])
             F_ice_body = R_xy(psi).T @ F_ice_ship
             tau_ice = np.array([F_ice_body[0], F_ice_body[1], M_ice_ship])
-            tr = ship_trajectory
-            idx = min(frame, len(tr) - 1)
-            idx_next = min(frame + 1, len(tr) - 1)
-            desired_pos = np.array(tr[idx][0])
-            desired_heading = tr[idx][1]
-            e_xy_world = desired_pos - ship_pos_dyn
-            e_xy_body = R_xy(psi).T @ e_xy_world
-            e_psi = ssa(desired_heading - psi)
-            desired_vel_world = (np.array(tr[idx_next][0]) - desired_pos) / dt if idx_next > idx else np.zeros(2)
-            nu_des_xy = R_xy(psi).T @ desired_vel_world
-            nu_des = np.array([nu_des_xy[0], nu_des_xy[1], 0.0])
-            tau_control = np.array([
-                Kp_xy * e_xy_body[0] + Kd_ship * (nu_des[0] - nu[0]),
-                Kp_xy * e_xy_body[1] + Kd_ship * (nu_des[1] - nu[1]),
-                Kp_psi * e_psi - Kd_ship * nu[2],
-            ])
-            if ship_drift_only:
-                tau_control = np.zeros(3)
-            if getattr(cfg, "use_mss_style_dynamics", False):
-                C = coriolis_3dof(M3, nu)
+            if auto_icenav_adapter is not None:
+                auto_icenav_adapter.set_env_load_body(tau_ice)
+                eta, nu_out = auto_icenav_adapter.step()
+                ship_pos_dyn[0] = float(eta[0])
+                ship_pos_dyn[1] = float(eta[1])
+                ship_heading_dyn = float(eta[2])
+                ship_u, ship_v, ship_r = float(nu_out[0]), float(nu_out[1]), float(nu_out[2])
+                if collision_dir_world is not None and getattr(cfg, "collision_zero_restitution", True):
+                    v_world = R_xy(ship_heading_dyn) @ np.array([ship_u, ship_v])
+                    away = float(np.dot(v_world, collision_dir_world))
+                    if away > 0:
+                        v_world = v_world - away * collision_dir_world
+                        nu_xy = R_xy(ship_heading_dyn).T @ v_world
+                        ship_u, ship_v = float(nu_xy[0]), float(nu_xy[1])
+                ship_pos_frame = ship_pos_dyn.copy()
+                ship_heading = ship_heading_dyn
+                commanded_trajectory.append((ship_pos_dyn.copy(), ship_heading_dyn))
+                ship_history.append((ship_pos_dyn.copy(), float(ship_heading_dyn)))
+                if ship_diagnostics is not None:
+                    ship_vel_world = R_xy(ship_heading_dyn) @ np.array([ship_u, ship_v])
+                    ship_diagnostics.append({
+                        't': frame * dt,
+                        'F_ice_ship': F_ice_ship.copy(),
+                        'ship_vel': ship_vel_world,
+                        'ship_pos': ship_pos_dyn.copy(),
+                        'desired_pos': ship_pos_dyn.copy(),
+                        'desired_vel': np.zeros(2),
+                        'impulse_cumul': J_cumul,
+                    })
             else:
-                C = np.zeros((3, 3))
-                C[0, 2] = -m * nu[1]
-                C[1, 2] = m * nu[0]
-                C[2, 0], C[2, 1] = -C[0, 2], -C[1, 2]
-            # Current effect on ship: damping uses relative velocity (Fossen body-frame)
-            if has_current:
-                v_c_world = ocean_current.sample(ship_pos_dyn[0], ship_pos_dyn[1])
-                v_c_body = R_xy(psi).T @ v_c_world
-                nu_r_ship = nu - np.array([v_c_body[0], v_c_body[1], 0.0])
-            else:
-                nu_r_ship = nu
-            nu_dot = M3inv @ (tau_control + tau_ice - D3 @ nu_r_ship - C @ nu)
-            nu = nu + nu_dot * dt
-            vc = cfg.ship_velocity_clip
-            nu[0] = np.clip(nu[0], -vc[0], vc[0])
-            nu[1] = np.clip(nu[1], -vc[1], vc[1])
-            nu[2] = np.clip(nu[2], -vc[2], vc[2])
-            ship_u, ship_v, ship_r = nu[0], nu[1], nu[2]
-            u_g, v_g = R_xy(psi) @ np.array([ship_u, ship_v])
-            ship_pos_dyn[0] += dt * u_g
-            ship_pos_dyn[1] += dt * v_g
-            ship_heading_dyn = (ship_heading_dyn + dt * ship_r) % (2 * np.pi)
-            commanded_trajectory.append((desired_pos.copy(), desired_heading))
-            ship_history.append((ship_pos_dyn.copy(), float(ship_heading_dyn)))
-            if ship_diagnostics is not None:
-                desired_vel = desired_vel_world
-                ship_vel_world = R_xy(ship_heading_dyn) @ np.array([ship_u, ship_v])
-                ship_diagnostics.append({
-                    't': frame * dt,
-                    'F_ice_ship': F_ice_ship.copy(),
-                    'ship_vel': ship_vel_world,
-                    'ship_pos': ship_pos_dyn.copy(),
-                    'desired_pos': desired_pos,
-                    'desired_vel': desired_vel,
-                    'impulse_cumul': J_cumul,
-                })
+                tr = ship_trajectory
+                idx = min(frame, len(tr) - 1)
+                idx_next = min(frame + 1, len(tr) - 1)
+                desired_pos = np.array(tr[idx][0])
+                desired_heading = tr[idx][1]
+                e_xy_world = desired_pos - ship_pos_dyn
+                e_xy_body = R_xy(psi).T @ e_xy_world
+                e_psi = ssa(desired_heading - psi)
+                desired_vel_world = (np.array(tr[idx_next][0]) - desired_pos) / dt if idx_next > idx else np.zeros(2)
+                nu_des_xy = R_xy(psi).T @ desired_vel_world
+                nu_des = np.array([nu_des_xy[0], nu_des_xy[1], 0.0])
+                tau_control = np.array([
+                    Kp_xy * e_xy_body[0] + Kd_ship * (nu_des[0] - nu[0]),
+                    Kp_xy * e_xy_body[1] + Kd_ship * (nu_des[1] - nu[1]),
+                    Kp_psi * e_psi - Kd_ship * nu[2],
+                ])
+                if ship_drift_only:
+                    tau_control = np.zeros(3)
+                if getattr(cfg, "use_mss_style_dynamics", False):
+                    C = coriolis_3dof(M3, nu)
+                else:
+                    C = np.zeros((3, 3))
+                    C[0, 2] = -m * nu[1]
+                    C[1, 2] = m * nu[0]
+                    C[2, 0], C[2, 1] = -C[0, 2], -C[1, 2]
+                # Current effect on ship: damping uses relative velocity (Fossen body-frame)
+                if has_current:
+                    v_c_world = ocean_current.sample(ship_pos_dyn[0], ship_pos_dyn[1])
+                    v_c_body = R_xy(psi).T @ v_c_world
+                    nu_r_ship = nu - np.array([v_c_body[0], v_c_body[1], 0.0])
+                else:
+                    nu_r_ship = nu
+                nu_dot = M3inv @ (tau_control + tau_ice - D3 @ nu_r_ship - C @ nu)
+                nu = nu + nu_dot * dt
+                vc = cfg.ship_velocity_clip
+                nu[0] = np.clip(nu[0], -vc[0], vc[0])
+                nu[1] = np.clip(nu[1], -vc[1], vc[1])
+                nu[2] = np.clip(nu[2], -vc[2], vc[2])
+                # Zero restitution: if we had collision, remove any velocity component away from ice (no bounce)
+                if (
+                    collision_dir_world is not None
+                    and getattr(cfg, "collision_zero_restitution", True)
+                ):
+                    v_world = R_xy(psi) @ np.array([nu[0], nu[1]])
+                    away = float(np.dot(v_world, collision_dir_world))
+                    if away > 0:
+                        v_world = v_world - away * collision_dir_world
+                        nu_xy = R_xy(psi).T @ v_world
+                        nu[0], nu[1] = nu_xy[0], nu_xy[1]
+                ship_u, ship_v, ship_r = nu[0], nu[1], nu[2]
+                u_g, v_g = R_xy(psi) @ np.array([ship_u, ship_v])
+                ship_pos_dyn[0] += dt * u_g
+                ship_pos_dyn[1] += dt * v_g
+                ship_heading_dyn = (ship_heading_dyn + dt * ship_r) % (2 * np.pi)
+                commanded_trajectory.append((desired_pos.copy(), desired_heading))
+                ship_history.append((ship_pos_dyn.copy(), float(ship_heading_dyn)))
+                if ship_diagnostics is not None:
+                    desired_vel = desired_vel_world
+                    ship_vel_world = R_xy(ship_heading_dyn) @ np.array([ship_u, ship_v])
+                    ship_diagnostics.append({
+                        't': frame * dt,
+                        'F_ice_ship': F_ice_ship.copy(),
+                        'ship_vel': ship_vel_world,
+                        'ship_pos': ship_pos_dyn.copy(),
+                        'desired_pos': desired_pos,
+                        'desired_vel': desired_vel,
+                        'impulse_cumul': J_cumul,
+                    })
         else:
             if ship_trajectory is not None and frame < len(ship_trajectory):
                 commanded_trajectory.append((np.array(ship_trajectory[frame][0]), float(ship_trajectory[frame][1])))
@@ -767,10 +871,19 @@ def simulate_ice_ship_interaction(
 
         ocean_current.step()
 
+        # Failsafe: thick-ice bonds must never be stored as broken (unbreakable / land-like)
+        if len(bonds) > 0:
+            unbreakable = (thicknesses[bond_i] > max_fracture_thickness) | (thicknesses[bond_j] > max_fracture_thickness)
+            bond_intact[unbreakable] = True
+
         positions_history.append(positions.copy())
         rotations_history.append(rotations.copy())
         bonds_history.append(bond_intact.copy())
         submergence_history.append(submergence.copy())
+
+        # Sanity: when all ice is above max_fracture_thickness, no bonds must break
+        if len(bonds) > 0 and np.all(thicknesses > max_fracture_thickness):
+            assert bond_intact.all(), "Thick-ice invariant: no bonds should break when all thicknesses > max_fracture_thickness"
 
         if frame_callback is not None:
             frame_callback(

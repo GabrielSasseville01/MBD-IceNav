@@ -59,6 +59,8 @@ class SimulationConfig:
     pen_crit_ref: float = 0.5
     # m — thickness at which pen_crit = pen_crit_ref; pen_crit scales with thickness so thick ice needs more penetration to reach F_break (avoids fracturing 10 m ice with a few cm).
     pen_crit_thickness_ref: float = 1.0
+    # m — ice thicker than this cannot fracture (ship collision or DPDEM); treat as unbreakable / land. Prevents unrealistic fracturing of e.g. 100 m "land-like" ice.
+    max_fracture_thickness: float = 15.0
     # Number of sample points along each ice edge for collision detection (reduces missed contacts).
     n_edge_samples: int = 4
     # Contact width for breaking force: w_contact = min(this × sqrt(area), w_contact_cap).
@@ -202,6 +204,12 @@ class SimulationConfig:
     ship_velocity_clip: Tuple[float, float, float] = (15.0, 8.0, 0.15)
     # N — cap on magnitude of ice-on-ship force from collision (thrust limit). Default 25 MN is order-of-magnitude for typical icebreaker bollard pull / installed thrust (e.g. 1–50 MN range); set to None to disable (unlimited thrust).
     max_ship_ice_force: Optional[float] = 25e6
+    # If True, cap ice-on-ship impulse so the ship loses kinetic energy (stops) but does not bounce (no elastic pushback beyond full stop).
+    collision_impulse_dissipation_cap: bool = True
+    # When collision_impulse_dissipation_cap: cap impulse at this fraction of ship momentum along collision direction (1.0 = at most full stop, no reversal).
+    collision_impulse_cap_factor: float = 1.0
+    # If True, after ship integration zero out any velocity component away from the ice (restitution = 0). Prevents bounce from PD controller or numerics.
+    collision_zero_restitution: bool = True
 
 
 # ---------------------------------------------------------------------------

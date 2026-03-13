@@ -26,6 +26,7 @@ from pathlib import Path
 import time
 import argparse
 import multiprocessing
+import matplotlib.pyplot as plt
 
 # Use spawn to avoid fork + multithreaded libs (e.g. JAX) deadlock when parallelizing animation
 try:
@@ -116,13 +117,15 @@ def main():
     parser.add_argument('--current-only', action='store_true',
                         help='With --simple: ship stays far left (no collision). Use to verify ice drifts from current alone.')
     parser.add_argument('--frames', type=int, default=None, metavar='N',
-                        help='Run only the first N simulation frames (for testing). Trajectory is still built at realistic speed; execution is truncated. Simulated time = N × dt.')
+                        help='Number of simulation frames to run. With --simple or --full-map, sets trajectory length to N; otherwise overrides config n_frames. Simulated time = N × dt.')
     parser.add_argument('--target-speed', type=float, default=None, metavar='M/S',
                         help='Target ship speed [m/s] when --plan. Derives n_frames so path is traversed at this speed. Also used in KE collision cost. Default 4.0 (realistic icebreaker).')
     parser.add_argument('--no-target-speed', action='store_true',
                         help='Disable target-speed mode: use fixed n_frames from config (legacy, ship may be unrealistically fast).')
     parser.add_argument('--optimize-speed', action='store_true',
                         help='Optimize speed per path segment: slower in thick ice, faster in open water. Balances impact (KE ∝ v²) vs time.')
+    parser.add_argument('--auto-icenav-ship', action='store_true',
+                        help='Use AUTO-IceNav Fossen_supply 3-DOF vessel dynamics and DP controller (thruster-level), feeding DPDEM ice loads as environmental forces.')
     args = parser.parse_args()
 
     if args.plan_only:
@@ -247,6 +250,15 @@ def main():
     ship_beam = run_cfg.ship_beam
     ship_draft = run_cfg.ship_draft
     ship_displacement = run_cfg.ship_displacement
+
+    # When using AUTO-IceNav ship, use that vessel's geometry everywhere so DPDEM ice forces
+    # and moments (hull, lever arms) match the simulated dynamics (Fossen supply 76.2 m, 6 kt).
+    if getattr(args, 'auto_icenav_ship', False):
+        ship_length = 76.2
+        ship_beam = 17.0
+        ship_draft = 7.0
+        ship_displacement = 6000.0e3
+        print("  [Vessel] AUTO-IceNav Fossen supply: L=76.2 m, B=17 m, mass=6 kt (ice forces use this geometry)", flush=True)
 
     sat_thicknesses_override = None  # when set, use instead of assign_thickness_by_area
     if args.ice_tank_toy:
@@ -420,19 +432,29 @@ def main():
         ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), ship_heading) for frame in range(n_frames + 1)]
         ship_pos = ship_trajectory[0][0]
         drift_vel = 0.0
-        print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames", flush=True)
+        if getattr(args, 'frames', None) is not None:
+            n_frames = args.frames
+            ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), ship_heading) for frame in range(n_frames + 1)]
+            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames (--frames)", flush=True)
+        else:
+            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames", flush=True)
     elif args.full_map:
         inset = ship_length / 2 + run_cfg.path_margin
+        # Original full-map setup: start near bottom-left, goal near top edge (y=600)
         ship_start = np.array([-545.0, -600.0])
-        # TEMP TEST: goal only 50 m above start to verify sim stops when goal reached
-        ship_end   = np.array([-350.0, -550.0])   # end 50 m above start y
-        goal_y_line = -550.0                      # goal line 50 m above start y (-600 + 50)
-        diagonal_heading = np.pi / 4.0            # 45° purely diagonal (bow toward +x and +y)
+        ship_end   = np.array([-350.0,  600.0])
+        goal_y_line = 600.0
+        diagonal_heading = np.pi / 4.0            # 45° diagonal (bow toward +x and +y)
         n_frames = run_cfg.n_frames_medea
         ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
         ship_pos = ship_trajectory[0][0]
         drift_vel = 0.0
-        print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°, {n_frames} frames", flush=True)
+        if getattr(args, 'frames', None) is not None:
+            n_frames = args.frames
+            ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
+            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°, {n_frames} frames (--frames)", flush=True)
+        else:
+            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°, {n_frames} frames", flush=True)
     else:
         rightmost_edge = max(centroids[i, 0] + radii[i] for i in range(len(centroids)))
         ship_bow_x = rightmost_edge + 5
@@ -448,10 +470,12 @@ def main():
             print("  --plan is ignored when not using --simple, --toy-sparse, or --full-map (ship stationary, ice drifts).", flush=True)
 
     # Target-speed mode: derive n_frames so ship travels at realistic speed (path_length / (n_frames*dt) = target_speed)
+    # Skip when --frames is set (user requested exact frame count).
     use_target_speed = (
         args.plan and (synthetic_mode or args.full_map)
         and not getattr(args, 'no_target_speed', False)
         and getattr(run_cfg, 'planning_use_target_speed', True)
+        and getattr(args, 'frames', None) is None
     )
     if use_target_speed:
         target_speed = getattr(args, 'target_speed', None) or getattr(run_cfg, 'planning_target_speed', 4.0)
@@ -743,6 +767,8 @@ def main():
 
         # Receding-horizon callback (AUTO-IceNav style): rebuild costmap from current ice state and replan
         def _replan_callback(frame, world_polygons, centroids, thicknesses, ship_pos_f, ship_heading_f, n_remaining):
+            # Rebuild costmap from current ice state (counted as additional planning time)
+            t0_cost = time.time()
             all_verts = np.vstack(world_polygons)
             x_min_f = float(all_verts[:, 0].min())
             x_max_f = float(all_verts[:, 0].max())
@@ -776,9 +802,11 @@ def main():
                 obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
                 ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 1.0),
             )
+            diag["costmap"] += time.time() - t0_cost
             costmap_snapshots.append((frame, cost_map_f))
             start_f = (float(ship_pos_f[0]), float(ship_pos_f[1]), float(ship_heading_f))
             bounds_f = {"x_origin": cost_map_f.x_origin, "y_origin": cost_map_f.y_origin, "width": cost_map_f.width, "height": cost_map_f.height}
+            t0_plan = time.time()
             if skip_astar:
                 path_f = np.array([
                     [start_f[0], start_f[1], start_f[2]],
@@ -792,6 +820,8 @@ def main():
                 path_f = plan_path(planner_f, start_f, goal, plan_cfg, cost_map=cost_map_f)
                 if path_f is None:
                     return None
+            # Count all replanning work (lattice + optional sampling MPC refinement) as planning time
+            diag["astar"] += time.time() - t0_plan
             if use_sampling_mpc:
                 if use_diffusion_mpc:
                     path_f = optimize_with_diffusion(
@@ -904,6 +934,7 @@ def main():
         ship_pos=ship_pos, ship_length=ship_length, ship_beam=ship_beam,
         n_frames=run_n_frames, dt=run_cfg.dt, drift_vel=drift_vel, thicknesses=thicknesses,
         ship_props=ship_props, ship_trajectory=ship_trajectory,
+        return_ship_diagnostics=True,
         config=sim_cfg,
         replan_every_n_frames=replan_every_n_frames,
         replan_callback=replan_callback,
@@ -915,13 +946,17 @@ def main():
         goal_point=_goal_point,
         goal_y_line=goal_y_line,
         goal_tolerance=_goal_tol,
+        use_auto_icenav_ship=getattr(args, 'auto_icenav_ship', False),
     )
     positions_history = sim_result[0]
     rotations_history = sim_result[1]
     bonds_history = sim_result[2]
     ship_history = sim_result[3]
     submergence_history = sim_result[4] if len(sim_result) > 4 else None
-    damage_summary = sim_result[5] if len(sim_result) > 5 and isinstance(sim_result[5], dict) else None
+    ship_diagnostics = sim_result[5] if len(sim_result) > 5 and isinstance(sim_result[5], list) else None
+    damage_summary = None
+    if ship_diagnostics and isinstance(ship_diagnostics[-1], dict) and "damage_summary" in ship_diagnostics[-1]:
+        damage_summary = ship_diagnostics[-1]["damage_summary"]
     sim_time = time.time() - t0
     diag["simulation"] = sim_time
     run_n_frames = len(positions_history)  # actual frames (may be less if goal reached early)
@@ -951,6 +986,40 @@ def main():
                 output_file=hull_out,
             )
             print(f"  Saved hull impact vectors: {hull_out}", flush=True)
+    if ship_diagnostics:
+        # Diagnostic plot: ice force vs ship speed along ship heading.
+        # Filter out the trailing damage_summary-only entry and any malformed diagnostics.
+        import matplotlib.pyplot as plt
+        diag_frames = [
+            d for d in ship_diagnostics
+            if isinstance(d, dict)
+            and ("t" in d)
+            and ("F_ice_ship" in d)
+            and ("ship_vel" in d)
+        ]
+        if len(diag_frames) >= 2:
+            t = np.array([d["t"] for d in diag_frames])
+            F_ice = np.stack([d["F_ice_ship"] for d in diag_frames])   # (N, 2)
+            v_ship = np.stack([d["ship_vel"] for d in diag_frames])    # (N, 2)
+            headings = np.array([h[1] for h in ship_history[:len(diag_frames)]])
+            forward = np.column_stack([np.cos(headings), np.sin(headings)])
+            F_ice_along = np.einsum("ij,ij->i", F_ice, forward)
+            v_along = np.einsum("ij,ij->i", v_ship, forward)
+            fig, ax1 = plt.subplots(figsize=(10, 6))
+            ax1.set_title("Ice force vs ship speed along heading")
+            ax1.plot(t, F_ice_along / 1e6, color="C0")
+            ax1.set_xlabel("t [s]")
+            ax1.set_ylabel("F_ice · heading [MN]", color="C0")
+            ax1.tick_params(axis="y", labelcolor="C0")
+            ax2 = ax1.twinx()
+            ax2.plot(t, v_along, color="C1")
+            ax2.set_ylabel("Ship speed · heading [m/s]", color="C1")
+            ax2.tick_params(axis="y", labelcolor="C1")
+            fig.tight_layout()
+            out_plot = out_dir / ("ship_force_vs_speed_simple_thick_ice.png" if synthetic_mode else "ship_force_vs_speed_medea_thick_ice.png")
+            plt.savefig(out_plot, dpi=150)
+            plt.close(fig)
+            print(f"  Saved ship force/speed plot: {out_plot}", flush=True)
     print(f"  Simulation time: {sim_time:.1f}s", flush=True)
 
     if args.live:
@@ -981,14 +1050,16 @@ def main():
             ("Simulation", diag["simulation"]),
         ]:
             if val > 0:
-                print(f"  {name}: {val:.1f}s ({100*val/total:.0f}%)")
-        print(f"{'='*60}\nQuick mode complete! Total: {total:.1f}s")
+                print(f"  {name}: {val:.3f}s ({100*val/total:.1f}%)")
+        print(f"{'='*60}\nQuick mode complete! Total: {total:.3f}s")
         return
 
-    out_2d = str(out_dir / (('simple_ship_fracture' if synthetic_mode else 'medea_ship_fracture') + video_ext))
-    out_3d = str(out_dir / (('simple_ship_fracture_3d' if synthetic_mode else 'medea_ship_fracture_3d') + video_ext))
+    out_2d = str(out_dir / (('simple_ship_fracture' if synthetic_mode else 'medea_ship_fracture') + ('_thick_ice' if args.thick_ice is not None else '') + video_ext))
+    out_3d = str(out_dir / (('simple_ship_fracture_3d' if synthetic_mode else 'medea_ship_fracture_3d') + ('_thick_ice' if args.thick_ice is not None else '') + video_ext))
     t0 = time.time()
     print("\nGenerating 2D animation...", flush=True)
+    if args.thick_ice is not None:
+        print(f"  Thick-ice run: writing to {out_2d} (rigid-display mode)", flush=True)
     animate_ice_ship_2d(
         polygons, positions_history, rotations_history, bonds_history, bonds,
         ship_history, ship_length, ship_beam, centroids, thicknesses,
@@ -997,6 +1068,8 @@ def main():
         ocean_current=ocean_current_model,
         path_snapshots=path_snapshots if (args.plan and planned_path is not None) else None,
         goal_y_line=goal_y_line,
+        max_fracture_thickness=getattr(sim_cfg, "max_fracture_thickness", 15.0),
+        initial_floe_of=parent_floe_ids,
     )
     diag["anim_2d"] = time.time() - t0
     print(f"  2D animation time: {diag['anim_2d']:.1f}s", flush=True)
@@ -1011,6 +1084,8 @@ def main():
             figsize=run_cfg.figsize_3d,
             n_workers=run_cfg.n_workers,
             path_snapshots=path_snapshots if (args.plan and planned_path is not None) else None,
+            max_fracture_thickness=getattr(sim_cfg, "max_fracture_thickness", 15.0),
+            initial_floe_of=parent_floe_ids,
         )
         diag["anim_3d"] = time.time() - t0
         print(f"  3D animation time: {diag['anim_3d']:.1f}s", flush=True)

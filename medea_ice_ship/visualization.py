@@ -24,7 +24,126 @@ from medea_ice_ship.geometry import (
     point_in_polygon,
     closest_point_and_outward_normal,
 )
+from medea_ice_ship.bonds import find_connected_components
 from medea_ice_ship.config import VisualizationConfig, get_default_visualization_config
+
+try:
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    _HAS_SHAPELY = True
+except ImportError:
+    _HAS_SHAPELY = False
+
+
+def _rigid_correct_positions_if_thick_ice(positions_history, bonds, thicknesses, max_fracture_thickness, n_elements, initial_floe_of=None, rotations_history=None):
+    """When all thicknesses > max_fracture_thickness, return (positions_history, rotations_history) with each
+    component drawn rigidly: same relative positions and same rotation as frame 0 (no gaps, no spin).
+    If initial_floe_of is provided (parent floe ID per cell), use one component per floe.
+    Returns (positions_out, rotations_out); if no correction applied, returns (positions_history, rotations_history)."""
+    if not positions_history or thicknesses is None or len(thicknesses) != n_elements:
+        return positions_history, (rotations_history if rotations_history is not None else None)
+    if max_fracture_thickness is None or np.any(thicknesses <= max_fracture_thickness):
+        return positions_history, rotations_history
+    n = n_elements
+    if initial_floe_of is not None and len(initial_floe_of) == n_elements:
+        floe_ids = np.asarray(initial_floe_of, dtype=int)
+        components = [np.where(floe_ids == k)[0].tolist() for k in np.unique(floe_ids)]
+        print(f"  [Thick-ice] Rigid display: {len(components)} floes (from parent IDs)", flush=True)
+    elif bonds and len(bonds) > 0:
+        intact_all = np.ones(len(bonds), dtype=bool)
+        components = find_connected_components(n, bonds, intact_all)
+    else:
+        return positions_history, rotations_history
+    pos0 = np.asarray(positions_history[0], dtype=float)
+    out_pos = []
+    for pos_f in positions_history:
+        pos_f = np.asarray(pos_f, dtype=float)
+        new_pos = pos_f.copy()
+        for comp in components:
+            if len(comp) == 0:
+                continue
+            comp = np.array(comp)
+            com0 = np.mean(pos0[comp], axis=0)
+            com_f = np.mean(pos_f[comp], axis=0)
+            offset = com_f - com0
+            for i in comp:
+                new_pos[i] = pos0[i] + offset
+        out_pos.append(new_pos)
+    # Keep initial rotations for all frames so each floe doesn't spin or show per-cell rotation drift.
+    # Use frame-0 rotation per cell (no override) so polygons stay aligned with the rigid-corrected positions.
+    if rotations_history is not None and len(rotations_history) > 0:
+        rot0 = np.asarray(rotations_history[0], dtype=float)
+        out_rot = [rot0.copy() for _ in range(len(positions_history))]
+        return out_pos, out_rot
+    return out_pos, rotations_history
+
+
+def _build_merged_floe_polygons_per_frame(local_polys, positions_history, rotations_history, initial_floe_of, ice_colors):
+    """When all ice is thick and initial_floe_of is set, build one merged polygon per floe per frame (rigid body: frame-0 shape + COM offset).
+    Returns (merged_display_per_frame, floe_ids) where merged_display_per_frame[f] = [(poly Nx2, color), ...] for each floe, or (None, []) if not applicable."""
+    if not _HAS_SHAPELY or not local_polys or not positions_history or initial_floe_of is None or len(initial_floe_of) != len(local_polys):
+        return None, []
+    n_elements = len(local_polys)
+    floe_ids = np.unique(np.asarray(initial_floe_of, dtype=int)).tolist()
+    pos0 = np.asarray(positions_history[0], dtype=float)
+    rot0 = np.asarray(rotations_history[0], dtype=float)
+
+    def rotate_poly(poly, angle):
+        c, s = np.cos(angle), np.sin(angle)
+        return np.asarray(poly, dtype=float) @ np.array([[c, -s], [s, c]]).T
+
+    # Build merged polygon per floe in frame-0 world coordinates
+    merged_by_floe = {}
+    floe_color = {}
+    for fid in floe_ids:
+        indices = [i for i in range(n_elements) if initial_floe_of[i] == fid]
+        if not indices:
+            continue
+        geoms = []
+        for i in indices:
+            world_poly = rotate_poly(local_polys[i], rot0[i]) + pos0[i]
+            if len(world_poly) >= 3:
+                geoms.append(ShapelyPolygon(world_poly))
+        if not geoms:
+            continue
+        union = unary_union(geoms)
+        if union.is_empty:
+            continue
+        if hasattr(union, 'geoms'):
+            # MultiPolygon: collect all parts (e.g. floe split by narrow gap)
+            polys_for_floe = []
+            for g in union.geoms:
+                if not g.is_empty and g.area >= 1e-10:
+                    polys_for_floe.append(np.array(g.exterior.coords))
+            if not polys_for_floe:
+                continue
+            merged_by_floe[fid] = polys_for_floe
+        else:
+            if union.area < 1e-10:
+                continue
+            ext = np.array(union.exterior.coords)
+            merged_by_floe[fid] = [ext]
+        floe_color[fid] = ice_colors[indices[0]] if indices[0] < len(ice_colors) else "#C0E0F0"
+
+    if not merged_by_floe:
+        return None, []
+
+    # Per-frame: translate merged polygon(s) by (com_f - com0)
+    com0_by_floe = {fid: np.mean(pos0[[i for i in range(n_elements) if initial_floe_of[i] == fid]], axis=0) for fid in merged_by_floe}
+    merged_display_per_frame = []
+    for f in range(len(positions_history)):
+        pos_f = np.asarray(positions_history[f], dtype=float)
+        frame_list = []
+        for fid in floe_ids:
+            if fid not in merged_by_floe:
+                continue
+            indices = [i for i in range(n_elements) if initial_floe_of[i] == fid]
+            com_f = np.mean(pos_f[indices], axis=0)
+            offset = com_f - com0_by_floe[fid]
+            for poly in merged_by_floe[fid]:
+                frame_list.append((poly + offset, floe_color[fid]))
+        merged_display_per_frame.append(frame_list)
+    return merged_display_per_frame, floe_ids
 
 
 def make_live_2d_callback(
@@ -422,17 +541,23 @@ def _draw_2d_frame_to_array(data, frame_idx):
     """Draw a single 2D frame; return RGB array (H, W, 3) uint8. Used by parallel workers."""
     frame = data["frames_to_render"][frame_idx]
     n_elements = data["n_elements"]
-    positions = data["positions_history"][frame]
-    rotations = data["rotations_history"][frame]
     intact = data["bonds_history"][frame]
     bonds = data["bonds"]
+    thicknesses_arr = data.get("thicknesses")
+    max_ft = data.get("max_fracture_thickness", 15.0)
     local_polys = data["local_polys"]
     ice_colors = data["ice_colors"]
     broken_neighbors = {i: set() for i in range(n_elements)}
     for b, (i, j) in enumerate(bonds):
         if not intact[b]:
-            broken_neighbors[i].add(j)
-            broken_neighbors[j].add(i)
+            # Only show as broken if both endpoints are at or below max_fracture_thickness (thick ice never appears fractured)
+            if thicknesses_arr is not None and len(thicknesses_arr) > max(i, j) and max_ft is not None:
+                if thicknesses_arr[i] <= max_ft and thicknesses_arr[j] <= max_ft:
+                    broken_neighbors[i].add(j)
+                    broken_neighbors[j].add(i)
+            else:
+                broken_neighbors[i].add(j)
+                broken_neighbors[j].add(i)
 
     fig, ax = plt.subplots(figsize=data["figsize"], dpi=data["dpi"])
     ax.set_xlim(data["x_min"], data["x_max"])
@@ -450,15 +575,23 @@ def _draw_2d_frame_to_array(data, frame_idx):
         ax.quiver(cX, cY, cU_plot, cV_plot, cMag, cmap='cool', alpha=0.45,
                   angles='xy', scale_units='xy', scale=1,
                   zorder=0, width=0.003)
-    for i in range(n_elements):
-        c, s = np.cos(rotations[i]), np.sin(rotations[i])
-        rotated = local_polys[i] @ np.array([[c, -s], [s, c]]).T
-        world_poly = rotated + positions[i]
-        has_broken = len(broken_neighbors[i]) > 0
-        edge_color = "#1A4D70" if has_broken else ice_colors[i]
-        edge_width = 1.5 if has_broken else 0.5
-        patch = MplPolygon(world_poly, closed=True, facecolor=ice_colors[i], edgecolor=edge_color, linewidth=edge_width, alpha=0.95)
-        ax.add_patch(patch)
+    if data.get("merged_floe_display_per_frame") is not None:
+        # Thick-ice: one merged polygon per floe (no internal edges)
+        for poly, color in data["merged_floe_display_per_frame"][frame]:
+            patch = MplPolygon(poly, closed=True, facecolor=color, edgecolor=color, linewidth=0.5, alpha=0.95)
+            ax.add_patch(patch)
+    else:
+        positions = data["positions_history"][frame]
+        rotations = data["rotations_history"][frame]
+        for i in range(n_elements):
+            c, s = np.cos(rotations[i]), np.sin(rotations[i])
+            rotated = local_polys[i] @ np.array([[c, -s], [s, c]]).T
+            world_poly = rotated + positions[i]
+            has_broken = len(broken_neighbors[i]) > 0
+            edge_color = "#1A4D70" if has_broken else ice_colors[i]
+            edge_width = 1.5 if has_broken else 0.5
+            patch = MplPolygon(world_poly, closed=True, facecolor=ice_colors[i], edgecolor=edge_color, linewidth=edge_width, alpha=0.95)
+            ax.add_patch(patch)
     if frame < len(data["ship_history"]):
         ship_pos_frame, ship_heading = data["ship_history"][frame]
         ship_outline = create_ship_hull_at_position_heading(data["ship_length"], data["ship_beam"], ship_pos_frame, ship_heading)
@@ -562,7 +695,14 @@ def _draw_3d_frame_to_array(data, frame_idx):
             bottom_verts.append([v[0], v[1], z_center - h * 0.9 + z_offset])
         top_verts = np.array(top_verts)
         bottom_verts = np.array(bottom_verts)
-        has_breaks = any(not intact[b] for b, (pi, pj) in enumerate(bonds) if pi == i or pj == i)
+        max_ft = data.get("max_fracture_thickness", 15.0)
+        def _bond_break_visible(b, pi, pj):
+            if not intact[b]:
+                if thicknesses is not None and len(thicknesses) > max(pi, pj) and max_ft is not None:
+                    return thicknesses[pi] <= max_ft and thicknesses[pj] <= max_ft
+                return True
+            return False
+        has_breaks = any(_bond_break_visible(b, pi, pj) for b, (pi, pj) in enumerate(bonds) if pi == i or pj == i)
         edge_color = "#2080A0" if has_breaks else "#A0C8D8"
         ax.add_collection3d(Poly3DCollection([top_verts], facecolor=face_color, edgecolor=edge_color, linewidth=0.5 if has_breaks else 0.2, alpha=0.9))
         n_verts = len(world_poly)
@@ -1085,6 +1225,8 @@ def animate_ice_ship_2d(
     ocean_current=None,
     path_snapshots=None,
     goal_y_line=None,
+    max_fracture_thickness=15.0,
+    initial_floe_of=None,
 ):
     """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame.
     view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice.
@@ -1097,6 +1239,10 @@ def animate_ice_ship_2d(
         frames_to_render.append(n_frames - 1)
     n_render = len(frames_to_render)
     n_elements = len(polygons)
+    # When all ice is thick, draw each component rigidly so the movie never shows gaps (fixes any sim drift).
+    positions_history, rotations_history = _rigid_correct_positions_if_thick_ice(
+        positions_history, bonds, thicknesses, max_fracture_thickness, n_elements, initial_floe_of=initial_floe_of, rotations_history=rotations_history
+    )
     local_polys = []
     for poly in polygons:
         centroid = polygon_centroid(poly)
@@ -1131,6 +1277,16 @@ def animate_ice_ship_2d(
     else:
         ice_colors = []
 
+    # When thick-ice rigid display is active, draw one merged polygon per floe (no internal cell edges).
+    merged_floe_display_per_frame = None
+    if (initial_floe_of is not None and thicknesses is not None and max_fracture_thickness is not None
+            and len(thicknesses) == n_elements and np.all(thicknesses > max_fracture_thickness)):
+        merged_floe_display_per_frame, _ = _build_merged_floe_polygons_per_frame(
+            local_polys, positions_history, rotations_history, initial_floe_of, ice_colors
+        )
+        if merged_floe_display_per_frame is not None:
+            print(f"  [Thick-ice] Drawing {len(merged_floe_display_per_frame[0])} floes as merged polygons (no internal edges)", flush=True)
+
     writer, out_path = _animation_writer(output_file, fps)
     use_mp4 = str(output_file).lower().endswith(".mp4") and out_path.lower().endswith(".mp4")
 
@@ -1161,7 +1317,11 @@ def animate_ice_ship_2d(
             "current_viz": _current_viz_data,
             "path_snapshots": list(path_snapshots) if path_snapshots else None,
             "goal_y_line": goal_y_line,
+            "thicknesses": np.asarray(thicknesses) if thicknesses is not None and len(thicknesses) == n_elements else None,
+            "max_fracture_thickness": max_fracture_thickness,
         }
+        if merged_floe_display_per_frame is not None:
+            data["merged_floe_display_per_frame"] = merged_floe_display_per_frame
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
         try:
@@ -1183,6 +1343,14 @@ def animate_ice_ship_2d(
                             while next_idx in pending:
                                 vid.append_data(pending.pop(next_idx))
                                 next_idx += 1
+            # Save last frame as PNG for visual verification (e.g. thick-ice no-fracture check)
+            last_frame_path = os.path.splitext(out_path)[0] + "_last_frame.png"
+            try:
+                last_buf = _draw_2d_frame_to_array(data, n_render - 1)
+                imageio.imwrite(last_frame_path, last_buf)
+                print(f"  Saved last frame: {last_frame_path}", flush=True)
+            except Exception as e:
+                print(f"  Could not save last frame PNG: {e}", flush=True)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -1220,23 +1388,34 @@ def animate_ice_ship_2d(
                       cmap='cool', alpha=0.45,
                       angles='xy', scale_units='xy', scale=1,
                       zorder=0, width=0.003)
-        positions = positions_history[frame]
-        rotations = rotations_history[frame]
         intact = bonds_history[frame]
-        broken_neighbors = {i: set() for i in range(n_elements)}
-        for b, (i, j) in enumerate(bonds):
-            if not intact[b]:
-                broken_neighbors[i].add(j)
-                broken_neighbors[j].add(i)
-        for i in range(n_elements):
-            rotated = rotate_polygon(local_polys[i], rotations[i])
-            world_poly = rotated + positions[i]
-            has_broken = len(broken_neighbors[i]) > 0
-            edge_color = '#1A4D70' if has_broken else ice_colors[i]
-            edge_width = 1.5 if has_broken else 0.5
-            patch = MplPolygon(world_poly, closed=True, facecolor=ice_colors[i], edgecolor=edge_color,
-                              linewidth=edge_width, alpha=0.95)
-            ax.add_patch(patch)
+        n_broken = np.sum(~intact)
+        if merged_floe_display_per_frame is not None:
+            for poly, color in merged_floe_display_per_frame[frame]:
+                patch = MplPolygon(poly, closed=True, facecolor=color, edgecolor=color, linewidth=0.5, alpha=0.95)
+                ax.add_patch(patch)
+        else:
+            positions = positions_history[frame]
+            rotations = rotations_history[frame]
+            broken_neighbors = {i: set() for i in range(n_elements)}
+            for b, (i, j) in enumerate(bonds):
+                if not intact[b]:
+                    if thicknesses is not None and len(thicknesses) > max(i, j) and max_fracture_thickness is not None:
+                        if thicknesses[i] <= max_fracture_thickness and thicknesses[j] <= max_fracture_thickness:
+                            broken_neighbors[i].add(j)
+                            broken_neighbors[j].add(i)
+                    else:
+                        broken_neighbors[i].add(j)
+                        broken_neighbors[j].add(i)
+            for i in range(n_elements):
+                rotated = rotate_polygon(local_polys[i], rotations[i])
+                world_poly = rotated + positions[i]
+                has_broken = len(broken_neighbors[i]) > 0
+                edge_color = '#1A4D70' if has_broken else ice_colors[i]
+                edge_width = 1.5 if has_broken else 0.5
+                patch = MplPolygon(world_poly, closed=True, facecolor=ice_colors[i], edgecolor=edge_color,
+                                  linewidth=edge_width, alpha=0.95)
+                ax.add_patch(patch)
         if frame < len(ship_history):
             ship_pos_frame, ship_heading = ship_history[frame]
             ship_outline = create_ship_hull_at_position_heading(
@@ -1261,6 +1440,13 @@ def animate_ice_ship_2d(
     anim = FuncAnimation(fig, update, frames=n_render, blit=False)
     print(f"Saving to {out_path}...", flush=True)
     anim.save(out_path, writer=writer)
+    last_frame_path = os.path.splitext(out_path)[0] + "_last_frame.png"
+    try:
+        update(n_render - 1)
+        fig.savefig(last_frame_path, dpi=fig.get_dpi() or 100)
+        print(f"  Saved last frame: {last_frame_path}", flush=True)
+    except Exception as e:
+        print(f"  Could not save last frame PNG: {e}", flush=True)
     print("Done!", flush=True)
     plt.close(fig)
 
@@ -1346,12 +1532,17 @@ def animate_ice_ship_3d(
     figsize=(12, 8.96),  # 1200×896 px at 100 DPI; divisible by 16 for FFmpeg macro_block_size
     n_workers=1,
     path_snapshots=None,
+    max_fracture_thickness=15.0,
+    initial_floe_of=None,
 ):
     """3D animation with z from submergence. n_workers>1 uses parallel rendering (faster).
     path_snapshots: optional list of (frame_idx, path Nx3); when set, draws remaining planned path at z=0."""
     vc = viz_config or get_default_visualization_config()
     n_frames = len(positions_history)
     n_elements = len(polygons)
+    positions_history, rotations_history = _rigid_correct_positions_if_thick_ice(
+        positions_history, bonds, thicknesses, max_fracture_thickness, n_elements, initial_floe_of=initial_floe_of, rotations_history=rotations_history
+    )
     local_polys = [poly - polygon_centroid(poly) for poly in polygons]
     all_pos = np.concatenate(positions_history)
     x_min_raw = np.nanmin(all_pos[:, 0])
@@ -1422,6 +1613,7 @@ def animate_ice_ship_3d(
             "figsize": figsize,
             "dpi": _RENDER_DPI,
             "path_snapshots": list(path_snapshots) if path_snapshots else None,
+            "max_fracture_thickness": max_fracture_thickness,
         }
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
@@ -1496,7 +1688,10 @@ def animate_ice_ship_3d(
                 bottom_verts.append([v[0], v[1], z_center - h * 0.9 + z_offset])
             top_verts = np.array(top_verts)
             bottom_verts = np.array(bottom_verts)
-            has_breaks = any(not intact[b] for b, (pi, pj) in enumerate(bonds) if pi == i or pj == i)
+            has_breaks = any(
+                not intact[b] and (thicknesses[pi] <= max_fracture_thickness and thicknesses[pj] <= max_fracture_thickness)
+                for b, (pi, pj) in enumerate(bonds) if pi == i or pj == i
+            )
             edge_color = '#2080A0' if has_breaks else '#A0C8D8'
             ax.add_collection3d(Poly3DCollection(
                 [top_verts], facecolor=face_color, edgecolor=edge_color,
