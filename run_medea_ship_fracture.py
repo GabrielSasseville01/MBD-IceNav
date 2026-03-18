@@ -126,6 +126,13 @@ def main():
                         help='Optimize speed per path segment: slower in thick ice, faster in open water. Balances impact (KE ∝ v²) vs time.')
     parser.add_argument('--auto-icenav-ship', action='store_true',
                         help='Use AUTO-IceNav Fossen_supply 3-DOF vessel dynamics and DP controller (thruster-level), feeding DPDEM ice loads as environmental forces.')
+    parser.add_argument('--jax-sim', action='store_true',
+                        help='Use JAX-vectorized simulation backend (jax_simulation.py) instead of NumPy. '
+                             'JIT-compiles physics loop for GPU/TPU execution. First call triggers XLA compilation (~30s). '
+                             'Float64 is enabled by default for validation. Combine with --auto-icenav-ship for full JAX pipeline.')
+    parser.add_argument('--jax-float32', action='store_true',
+                        help='With --jax-sim: use float32 instead of float64 (faster on GPU, less accurate). '
+                             'Only use after validating results match NumPy baseline.')
     args = parser.parse_args()
 
     if args.plan_only:
@@ -148,6 +155,7 @@ def main():
         scale_floes_to_world,
         create_simple_ice_field,
         create_sparse_toy_ice_field,
+        create_ice_tank_basin,
         create_ship_hull_at_position_heading,
         polygon_area,
         polygon_centroid,
@@ -157,10 +165,13 @@ def main():
         simulate_ice_ship_interaction,
         animate_ice_ship_2d,
         animate_ice_ship_3d,
-    animate_costmap_movie,
-    make_live_2d_callback,
-    plot_hull_impact_vectors,
+        animate_costmap_movie,
+        make_live_2d_callback,
+        plot_hull_impact_vectors,
         animate_lattice_search,
+        plot_costmap_with_grid,
+        plot_lattice_search_costs,
+        animate_lattice_primitives_stepwise,
         save_simulation_state,
         load_simulation_state,
         build_costmap_from_ice_state,
@@ -229,10 +240,23 @@ def main():
         print(f"\nReplay complete. Output: {out_2d}" + (f", {out_3d}" if not args.no_3d else ""))
         return
 
+    # ── JAX backend setup ─────────────────────────────────────────────────────
+    if getattr(args, 'jax_sim', False):
+        import jax
+        use_f64 = not getattr(args, 'jax_float32', False)
+        if use_f64:
+            jax.config.update("jax_enable_x64", True)
+        print("=" * 70)
+        print(f"JAX backend: {[str(d) for d in jax.devices()]}")
+        print(f"  Precision: {'float64' if use_f64 else 'float32'}")
+        print("=" * 70)
+
     t_setup_start = time.time()
     print("=" * 70)
     print("DPDEM: MEDEA Satellite Ice + Ship Fracture Simulation")
     synthetic_mode = args.simple or args.toy_sparse or args.ice_tank_toy
+    if getattr(args, 'jax_sim', False):
+        print("  [JAX-SIM MODE - vectorized JAX physics backend]")
     if args.simple:
         print("  [SIMPLE MODE - synthetic ice field for quick testing]")
     if args.toy_sparse:
@@ -263,18 +287,16 @@ def main():
     sat_thicknesses_override = None  # when set, use instead of assign_thickness_by_area
     if args.ice_tank_toy:
         t0 = time.time()
-        print("Creating NRC ice-tank-style toy ice field (75 m × 32 m basin)...", flush=True)
-        # Basin: 75 m (x) × 32 m (y). Use sparse floes with a few thick 'icebergs'.
-        sat_polygons, sat_centroids, sat_thicknesses_override = create_sparse_toy_ice_field(
+        basin_x, basin_y = (0.0, 1100.0), (0.0, 200.0)
+        ice_coverage = 0.2
+        print(f"Creating ice-tank basin {basin_x[1]:.0f}×{basin_y[1]:.0f} m with {ice_coverage*100:.0f}% ice (no overlapping floes)...", flush=True)
+        sat_polygons, sat_centroids, sat_thicknesses_override = create_ice_tank_basin(
             seed=args.seed,
-            domain_x=(0.0, 75.0),
-            domain_y=(-16.0, 16.0),
-            n_floes=12,
-            n_icebergs=3,
-            iceberg_thickness=10.0,
-            moderate_thickness_range=(0.5, 2.0),
-            floe_size_range=(4.0, 15.0),
-            min_gap=5.0,
+            domain_x=basin_x,
+            domain_y=basin_y,
+            ice_coverage_fraction=ice_coverage,
+            floe_size_range=(8.0, 45.0),
+            thickness_range=(0.5, 2.0),
         )
         print(f"  Created {len(sat_polygons)} floes ({time.time()-t0:.1f}s)", flush=True)
         all_cells, all_cell_centroids, all_parent_ids = tessellate_all_floes(
@@ -385,6 +407,10 @@ def main():
         y_min = -DOMAIN_LIMIT #max(y_min, -DOMAIN_LIMIT)
         y_max = DOMAIN_LIMIT #min(y_max,  DOMAIN_LIMIT)
         print(f"  Clamped domain: X=[{x_min:.1f}, {x_max:.1f}], Y=[{y_min:.1f}, {y_max:.1f}]", flush=True)
+    if getattr(args, 'ice_tank_toy', False):
+        x_min, x_max = 0.0, 1100.0
+        y_min, y_max = 0.0, 200.0
+        print(f"  Ice-tank basin domain: X=[{x_min:.0f}, {x_max:.0f}], Y=[{y_min:.0f}, {y_max:.0f}] m", flush=True)
 
     if args.view_map:
         import matplotlib.pyplot as plt
@@ -531,6 +557,10 @@ def main():
         # Toy-sparse has thick (10 m) ice → very high cost; use shorter primitives so first step stays in open water
         if args.toy_sparse:
             plan_cfg = replace_config(plan_cfg, planning_turning_radius=25.0)
+        # For the simple example, use a tighter goal tolerance than the default 150 m
+        # so the lattice path ends reasonably close to the goal without being too strict.
+        if args.simple:
+            plan_cfg = replace_config(plan_cfg, planning_goal_tolerance=50.0)
         if args.no_warm_start:
             plan_cfg = replace_config(
                 plan_cfg,
@@ -614,6 +644,13 @@ def main():
             if path is None:
                 print("  Planner did not find a path; aborting. Try without --plan for fixed trajectory.", flush=True)
                 return
+            # Extend path to exact goal so lattice movie and costmap show path reaching the goal (planner stops within tolerance).
+            if goal_y_line is None and len(path) > 0:
+                last_pt = path[-1, :2]
+                dist = np.hypot(last_pt[0] - goal[0], last_pt[1] - goal[1])
+                tol = getattr(plan_cfg, "planning_goal_tolerance", 150.0)
+                if 1e-6 < dist <= tol:
+                    path = np.vstack([path, [goal[0], goal[1], path[-1, 2]]])
             lattice_name = 'lattice_search_simple' if synthetic_mode else 'lattice_search_medea'
             lattice_out = str(out_dir / (lattice_name + video_ext))
             print("  Generating lattice search visualization...", flush=True)
@@ -623,9 +660,36 @@ def main():
                 output_file=lattice_out,
                 frame_stride=max(1, planner.nodes_expanded // 200),
                 fps=15,
+                show_edge_costs=True,
             )
             diag["lattice_movie"] = time.time() - t0
             print(f"  Saved: {lattice_out}", flush=True)
+            # Primitive-by-primitive movie: show one primitive per frame (current in black, previous in blue)
+            primitives_out = str(out_dir / (("lattice_primitives_simple" if synthetic_mode else "lattice_primitives_medea") + video_ext))
+            print("  Generating lattice primitives (stepwise) visualization...", flush=True)
+            animate_lattice_primitives_stepwise(
+                cost_map,
+                search_history,
+                output_file=primitives_out,
+                fps=15,
+            )
+            print(f"  Saved: {primitives_out}", flush=True)
+            # Understanding plots: costmap with grid + cell costs, g(n)/h(n) decomposition
+            plot_costmap_with_grid(
+                cost_map,
+                path=path,
+                start=(start[0], start[1]),
+                goal=goal,
+                output_file=str(out_dir / "costmap_with_grid.png"),
+                cell_label_stride=4,
+                max_labels=60,
+            )
+            print(f"  Saved: {out_dir / 'costmap_with_grid.png'}", flush=True)
+            plot_lattice_search_costs(
+                search_history,
+                output_file=str(out_dir / "lattice_search_costs.png"),
+            )
+            print(f"  Saved: {out_dir / 'lattice_search_costs.png'}", flush=True)
         else:
             if not use_sampling_mpc and getattr(args, 'no_lattice_search_movie', False):
                 print("  Skipping lattice search movie (--no-lattice-search-movie)", flush=True)
@@ -924,12 +988,21 @@ def main():
         print(f"  Ocean current: mode={args.current}, speed={_oc_speed:.2f} m/s", flush=True)
 
     t0 = time.time()
-    print(f"\nRunning fracture simulation ({run_n_frames} frames)...", flush=True)
+    _use_jax_sim = getattr(args, 'jax_sim', False)
+    if _use_jax_sim:
+        import jax
+        _jax_float32 = getattr(args, 'jax_float32', False)
+        if not _jax_float32:
+            jax.config.update("jax_enable_x64", True)
+        print(f"  [JAX] devices: {jax.devices()}", flush=True)
+        print(f"  [JAX] precision: {'float32' if _jax_float32 else 'float64'}", flush=True)
+    print(f"\nRunning fracture simulation ({run_n_frames} frames)"
+          f"{' [JAX backend]' if _use_jax_sim else ''}...", flush=True)
     _goal_point = None
     if goal_y_line is None and ship_trajectory is not None and len(ship_trajectory) > 0:
         _goal_point = tuple(ship_trajectory[-1][0])
     _goal_tol = 15.0  # metres for early-stop (goal reached) check
-    sim_result = simulate_ice_ship_interaction(
+    _sim_kwargs = dict(
         polygons=polygons, centroids=centroids.copy(), bonds=bonds,
         ship_pos=ship_pos, ship_length=ship_length, ship_beam=ship_beam,
         n_frames=run_n_frames, dt=run_cfg.dt, drift_vel=drift_vel, thicknesses=thicknesses,
@@ -948,6 +1021,12 @@ def main():
         goal_tolerance=_goal_tol,
         use_auto_icenav_ship=getattr(args, 'auto_icenav_ship', False),
     )
+    if _use_jax_sim:
+        from medea_ice_ship.jax_simulation import jax_simulate_ice_ship_interaction
+        print("  [JAX] XLA compilation on first frame — may take up to ~60s...", flush=True)
+        sim_result = jax_simulate_ice_ship_interaction(**_sim_kwargs)
+    else:
+        sim_result = simulate_ice_ship_interaction(**_sim_kwargs)
     positions_history = sim_result[0]
     rotations_history = sim_result[1]
     bonds_history = sim_result[2]

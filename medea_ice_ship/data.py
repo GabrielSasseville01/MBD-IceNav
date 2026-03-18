@@ -147,3 +147,65 @@ def create_sparse_toy_ice_field(
     sat_centroids = np.array(sat_centroids)
     sat_thicknesses = np.array(sat_thicknesses, dtype=float)
     return sat_polygons, sat_centroids, sat_thicknesses
+
+
+def create_ice_tank_basin(
+    domain_x=(0.0, 1100.0),
+    domain_y=(0.0, 200.0),
+    ice_coverage_fraction=0.2,
+    seed=42,
+    floe_size_range=(8.0, 45.0),
+    thickness_range=(0.5, 2.0),
+    max_attempts=2000,
+):
+    """
+    Create a basin (e.g. 1100×200 m) with non-overlapping ice floes covering
+    approximately ice_coverage_fraction of the area (e.g. 0.2 = 20% ice, 80% open water).
+
+    Returns:
+        sat_polygons: list of 2D polygon arrays [m]
+        sat_centroids: (n,) array [m]
+        sat_thicknesses: (n,) array [m]
+    """
+    np.random.seed(seed)
+    x_min, x_max = domain_x
+    y_min, y_max = domain_y
+    basin_area = (x_max - x_min) * (y_max - y_min)
+    target_ice_area = basin_area * ice_coverage_fraction
+
+    sat_polygons = []
+    sat_centroids = []
+    sat_thicknesses = []
+    placed = []  # (cx, cy, w, h) for overlap check
+    total_ice_area = 0.0
+
+    for _ in range(max_attempts):
+        if total_ice_area >= target_ice_area * 0.98:
+            break
+        w = np.random.uniform(floe_size_range[0], floe_size_range[1])
+        h = np.random.uniform(w * 0.4, w * 0.8)
+        cx = np.random.uniform(x_min + w, x_max - w)
+        cy = np.random.uniform(y_min + h, y_max - h)
+        # Axis-aligned: no overlap if one is strictly left of other or one strictly below other
+        overlaps = False
+        for (ox, oy, ow, oh) in placed:
+            if not (cx + w < ox - ow or ox + ow < cx - w or cy + h < oy - oh or oy + oh < cy - h):
+                overlaps = True
+                break
+        if overlaps:
+            continue
+        placed.append((cx, cy, w, h))
+        poly = np.array([
+            [cx - w, cy - h],
+            [cx + w, cy - h],
+            [cx + w, cy + h],
+            [cx - w, cy + h],
+        ])
+        sat_polygons.append(poly)
+        sat_centroids.append(np.array([cx, cy]))
+        sat_thicknesses.append(np.random.uniform(*thickness_range))
+        total_ice_area += 4.0 * w * h
+
+    sat_centroids = np.array(sat_centroids)
+    sat_thicknesses = np.array(sat_thicknesses, dtype=float)
+    return sat_polygons, sat_centroids, sat_thicknesses

@@ -211,6 +211,14 @@ class SimulationConfig:
     # If True, after ship integration zero out any velocity component away from the ice (restitution = 0). Prevents bounce from PD controller or numerics.
     collision_zero_restitution: bool = True
 
+    # --- JAX simulation ---
+    # If True, use the vectorized JAX simulation backend (jax_simulation.py) instead of NumPy.
+    # Enables GPU execution and JIT compilation. Enable float64 with jax_enable_x64 for validation.
+    use_jax_simulation: bool = False
+    # If True, enable float64 in JAX (jax.config.update("jax_enable_x64", True)). Slower on GPU
+    # but required for numerical validation against NumPy baseline. Auto-enabled when use_jax_simulation.
+    jax_enable_x64: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Run / script (domain, ship size, tessellation, thickness, frames)

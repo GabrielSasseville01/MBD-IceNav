@@ -90,8 +90,10 @@ class LatticePlanner:
             goal: Goal position (x, y)
             max_iterations: Maximum search iterations
             return_search_history: If True, return (path, search_history) for visualization.
-                search_history is a list of (expanded_xyh, edges) where edges is a list of
-                (path_world Nx3, end_xy) for each neighbor added this expansion.
+                search_history is a list of (expanded_xyh, g, h, f, valid_edges, invalid_edges)
+                where valid_edges = [(path_world Nx3, end_xy, cost), ...] and
+                invalid_edges = [(path_world Nx3, end_xy, reason), ...] with reason in
+                {"out_of_bounds", "impassable", "dominated"}.
             
         Returns:
             Path as Nx3 array [x, y, heading], or None if no path found.
@@ -148,9 +150,10 @@ class LatticePlanner:
                 path = self._reconstruct_path(current)
                 return (path, search_history) if return_search_history else path
             
-            # Expand node: record edges we add (for search-history visualization)
+            # Expand node: record edges we add and rejected edges (for search-history visualization)
             expanded_xyh = (current.x, current.y, current.heading_idx)
-            edges_this_step: List[Tuple[np.ndarray, Tuple[float, float]]] = []
+            edges_this_step: List[Tuple[np.ndarray, Tuple[float, float], float]] = []
+            invalid_edges_this_step: List[Tuple[np.ndarray, Tuple[float, float], str]] = []
             
             for primitive in self.primitives.get_primitives(current.heading_idx):
                 # Transform primitive to world coordinates
@@ -162,9 +165,12 @@ class LatticePlanner:
                 # End position
                 end_x, end_y = path[-1, 0], path[-1, 1]
                 end_heading_idx = primitive.end_heading
+                path_copy = path.copy()
                 
                 # Check bounds
                 if not self._in_bounds(end_x, end_y):
+                    if return_search_history:
+                        invalid_edges_this_step.append((path_copy, (end_x, end_y), "out_of_bounds"))
                     continue
                 
                 # Compute traversal cost
@@ -172,6 +178,8 @@ class LatticePlanner:
                 
                 # Skip if path goes through impassable area (MAX_COST / inf)
                 if traversal_cost >= MAX_COST or not np.isfinite(traversal_cost):
+                    if return_search_history:
+                        invalid_edges_this_step.append((path_copy, (end_x, end_y), "impassable"))
                     continue
                 
                 # New g-cost
@@ -180,12 +188,14 @@ class LatticePlanner:
                 # Check if this path is better
                 neighbor_key = self._discretize_state(end_x, end_y, end_heading_idx)
                 if neighbor_key in g_costs and g_costs[neighbor_key] <= new_g:
+                    if return_search_history:
+                        invalid_edges_this_step.append((path_copy, (end_x, end_y), "dominated"))
                     continue
                 
                 g_costs[neighbor_key] = new_g
                 
                 if return_search_history:
-                    edges_this_step.append((path.copy(), (end_x, end_y)))
+                    edges_this_step.append((path_copy, (end_x, end_y), float(traversal_cost)))
                 
                 # Compute heuristic
                 h = self._heuristic(end_x, end_y, goal)
@@ -210,7 +220,14 @@ class LatticePlanner:
                 self.nodes_generated += 1
             
             if return_search_history:
-                search_history.append((expanded_xyh, edges_this_step))
+                search_history.append((
+                    expanded_xyh,
+                    float(current.g_cost),
+                    float(current.h_cost),
+                    float(current.f_cost),
+                    edges_this_step,
+                    invalid_edges_this_step,
+                ))
         
         # No path found — provide diagnostics
         if not open_set:

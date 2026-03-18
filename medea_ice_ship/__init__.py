@@ -5,7 +5,7 @@ Submodules: properties, data, geometry, bonds, tessellation, simulation, visuali
 """
 
 from medea_ice_ship.properties import IceProperties, ShipProperties, R_xy, ssa
-from medea_ice_ship.data import load_medea_floes, scale_floes_to_world, create_simple_ice_field, create_sparse_toy_ice_field
+from medea_ice_ship.data import load_medea_floes, scale_floes_to_world, create_simple_ice_field, create_sparse_toy_ice_field, create_ice_tank_basin
 from medea_ice_ship.geometry import (
     polygon_area,
     polygon_centroid,
@@ -16,7 +16,7 @@ from medea_ice_ship.geometry import (
 from medea_ice_ship.bonds import create_proximity_bonds, assign_thickness_by_area, find_connected_components
 from medea_ice_ship.tessellation import tessellate_all_floes
 from medea_ice_ship.simulation import point_to_ship_collision, simulate_ice_ship_interaction
-from medea_ice_ship.visualization import animate_ice_ship_2d, animate_ice_ship_3d, animate_costmap_movie, make_live_2d_callback, plot_hull_impact_vectors, animate_lattice_search
+from medea_ice_ship.visualization import animate_ice_ship_2d, animate_ice_ship_3d, animate_costmap_movie, make_live_2d_callback, plot_hull_impact_vectors, animate_lattice_search, plot_costmap_with_grid, plot_lattice_search_costs, animate_lattice_primitives_stepwise
 from medea_ice_ship.state_io import save_simulation_state, load_simulation_state
 from medea_ice_ship.costmap_build import build_costmap_from_ice_state
 from medea_ice_ship.ridge_density import (
@@ -45,6 +45,7 @@ __all__ = [
     'scale_floes_to_world',
     'create_simple_ice_field',
     'create_sparse_toy_ice_field',
+    'create_ice_tank_basin',
     'polygon_area',
     'polygon_centroid',
     'create_ship_hull_at_position_heading',
@@ -62,6 +63,9 @@ __all__ = [
     'make_live_2d_callback',
     'plot_hull_impact_vectors',
     'animate_lattice_search',
+    'animate_lattice_primitives_stepwise',
+    'plot_costmap_with_grid',
+    'plot_lattice_search_costs',
     'save_simulation_state',
     'load_simulation_state',
     'build_costmap_from_ice_state',

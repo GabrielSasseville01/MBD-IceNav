@@ -16,6 +16,7 @@ from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib import colors as mpl_colors
 from matplotlib.colors import LogNorm
+from matplotlib.patheffects import withStroke
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from medea_ice_ship.geometry import (
@@ -358,6 +359,50 @@ def plot_hull_impact_vectors(
     plt.close(fig)
 
 
+def _parse_search_history(search_history: list):
+    """
+    Parse search_history supporting:
+    - New format: (expanded_xyh, g, h, f, valid_edges, invalid_edges)
+      valid_edges = [(path_world, (end_x, end_y), cost), ...]
+      invalid_edges = [(path_world, (end_x, end_y), reason), ...]
+    - Old format: (expanded_xyh, edges) with edges = [(path_world, (end_x, end_y)), ...]
+    Returns: (all_nodes, all_edges, all_edge_costs, all_invalid_per_step, g_h_f_per_step).
+    all_edge_costs is None if old format; g_h_f_per_step is list of (g,h,f) or None.
+    """
+    all_nodes = []
+    all_edges = []
+    all_edge_costs = []
+    all_invalid_per_step = []
+    g_h_f_per_step = []
+    extended = False
+    for entry in search_history:
+        if len(entry) >= 6 and isinstance(entry[1], (int, float)):
+            extended = True
+            xyh, g, h, f, valid_edges, invalid_edges = entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]
+            x, y, _ = xyh
+            all_nodes.append((x, y))
+            g_h_f_per_step.append((g, h, f))
+            for t in valid_edges:
+                path_world = t[0]
+                all_edges.append(path_world[:, :2].copy())
+                all_edge_costs.append(t[2] if len(t) > 2 else None)
+            all_invalid_per_step.append(invalid_edges)
+        else:
+            xyh, edges = entry[0], entry[1]
+            x, y, _ = xyh
+            all_nodes.append((x, y))
+            g_h_f_per_step.append(None)
+            for t in edges:
+                path_world = t[0]
+                all_edges.append(path_world[:, :2].copy())
+                all_edge_costs.append(None)
+            all_invalid_per_step.append([])
+    if not extended:
+        all_edge_costs = None
+        g_h_f_per_step = None
+    return all_nodes, all_edges, all_edge_costs, all_invalid_per_step, g_h_f_per_step
+
+
 def animate_lattice_search(
     cost_map,
     search_history: list,
@@ -368,18 +413,20 @@ def animate_lattice_search(
     frame_stride: int = 1,
     fps: int = 15,
     figsize: tuple = (10, 8),
+    show_edge_costs: bool = True,
 ):
     """
     Generate a movie showing the A* lattice graph search evolution.
 
-    Frames show the costmap, start/goal, and the growing set of expanded nodes
-    and edges (motion primitives) as the search progresses. The final chosen path
-    is drawn at the end.
+    Frames show the costmap, start/goal, the growing set of expanded nodes and
+    edges (motion primitives), invalid/rejected edges (out of bounds, impassable,
+    dominated), optional edge cost labels, and the final chosen path on the last frame.
 
     Args:
         cost_map: CostMap (dpdem.planning.cost_map) with .cost_map, .x_origin, .y_origin, .width, .height
-        search_history: From planner.plan(..., return_search_history=True); list of
-            ( (x, y, heading_idx), [ (path_world Nx3, (end_x, end_y)), ... ] )
+        search_history: From planner.plan(..., return_search_history=True). New format:
+            ( (x, y, heading_idx), g, h, f, valid_edges, invalid_edges ) per expansion.
+            Old format: ( (x, y, heading_idx), [ (path_world, (end_x, end_y)), ... ] ).
         path: Nx3 [x, y, heading] or None (the planned path)
         start: (x, y, heading)
         goal: (x, y)
@@ -387,22 +434,26 @@ def animate_lattice_search(
         frame_stride: Show every Nth expansion (1 = every step; 5 = fewer, faster video)
         fps: Frames per second
         figsize: Figure size (inches)
+        show_edge_costs: If True and history has costs, annotate edge costs at midpoints
     """
     ox = cost_map.x_origin
     oy = cost_map.y_origin
     w = cost_map.width
     h = cost_map.height
-    # cost_map: row = (y - y_origin)/resolution, so row 0 = bottom (y_origin); imshow origin='lower' draws row 0 at bottom
     grid = np.asarray(cost_map.cost_map)
 
-    # Build cumulative nodes and edges per display frame
-    all_nodes = []  # list of (x, y) for each expansion
-    all_edges = []  # list of (path_xy Nx2) for each edge
-    for (xyh, edges) in search_history:
-        x, y, _ = xyh
-        all_nodes.append((x, y))
-        for (path_world, _) in edges:
-            all_edges.append(path_world[:, :2].copy())
+    parsed = _parse_search_history(search_history)
+    all_nodes, all_edges_flat, all_edge_costs, all_invalid_per_step, g_h_f_per_step = parsed
+    # Cumulative index into all_edges_flat per expansion (for frame k we show edges up to edge_end_idx[k])
+    edge_end_idx = []
+    idx = 0
+    for entry in search_history:
+        if len(entry) >= 6 and isinstance(entry[1], (int, float)):
+            n_valid = len(entry[4])
+        else:
+            n_valid = len(entry[1])
+        idx += n_valid
+        edge_end_idx.append(idx)
 
     # Display frames: show state after expansion 0, stride, 2*stride, ... then final
     n_expansions = len(search_history)
@@ -442,42 +493,132 @@ def animate_lattice_search(
     ax.plot(start[0], start[1], "go", markersize=12, label="Start", zorder=5)
     ax.plot(goal[0], goal[1], "r*", markersize=16, label="Goal", zorder=5)
 
-    # Dynamic: edges (LineCollection of segments) and nodes (scatter), path (line)
-    edge_collection = LineCollection([], colors="b", linewidths=0.5, alpha=0.7, label="Explored edges")
+    # Dynamic: valid edges (all history), current-expansion edges, chosen primitive, invalid edges, nodes, optional cost labels, path
+    edge_collection = LineCollection([], colors="b", linewidths=0.8, alpha=0.4, label="Valid edges", zorder=2)
     ax.add_collection(edge_collection)
-    node_scatter = ax.scatter([], [], c="cyan", s=6, alpha=0.9, label="Expanded nodes", zorder=3)
-    path_line = ax.plot([], [], "r-", linewidth=2.5, label="Chosen path", zorder=4)[0]
+    current_edge_collection = LineCollection([], colors="red", linewidths=1.2, alpha=0.9, label="Current primitives", zorder=3)
+    ax.add_collection(current_edge_collection)
+    chosen_edge_collection = LineCollection([], colors="black", linewidths=2.0, alpha=0.9, label="Chosen primitive", zorder=5)
+    ax.add_collection(chosen_edge_collection)
+    invalid_collection = LineCollection([], colors="r", linewidths=0.5, alpha=0.5, linestyles="dashed", label="Invalid (rejected)", zorder=1)
+    ax.add_collection(invalid_collection)
+    node_scatter = ax.scatter([], [], c="cyan", s=8, alpha=0.9, label="Expanded nodes", zorder=6)
+    path_line = ax.plot([], [], "lime", linewidth=3.0, label="Chosen path", zorder=7)[0]
+    cost_annotations = []  # list of ax.text; cleared and recreated each update when show_edge_costs
 
     def init():
         edge_collection.set_segments([])
+        current_edge_collection.set_segments([])
+        chosen_edge_collection.set_segments([])
+        invalid_collection.set_segments([])
         node_scatter.set_offsets(np.empty((0, 2)))
         path_line.set_data([], [])
-        return edge_collection, node_scatter, path_line
+        for ann in cost_annotations:
+            ann.remove()
+        cost_annotations.clear()
+        return edge_collection, invalid_collection, node_scatter, path_line
 
     def update(frame_idx):
+        for ann in cost_annotations:
+            ann.remove()
+        cost_annotations.clear()
+
         k = frame_indices[frame_idx]
-        # Nodes up to and including expansion k
         nodes_xy = all_nodes[: k + 1]
         if nodes_xy:
             node_scatter.set_offsets(np.array(nodes_xy))
         else:
             node_scatter.set_offsets(np.empty((0, 2)))
 
-        # Edges: list of (Nx2) arrays for each primitive path
-        segments = []
-        for (_, edges) in search_history[: k + 1]:
-            for (path_world, _) in edges:
-                segments.append(path_world[:, :2])
-        edge_collection.set_segments(segments if segments else [[]])
+        # Valid edges up to and including expansion k (all history, faded blue)
+        end_i = edge_end_idx[k] if k < len(edge_end_idx) else len(all_edges_flat)
+        segments = [all_edges_flat[i][:, :2] for i in range(end_i)]
+        edge_collection.set_segments(segments)
 
-        # On last frame, draw chosen path
+        # Current-expansion valid edges (highlighted red)
+        segments_current = []
+        if 0 <= k < len(search_history):
+            entry = search_history[k]
+            if len(entry) >= 6 and isinstance(entry[1], (int, float)):
+                # Extended format: (xyh, g, h, f, valid_edges, invalid_edges)
+                valid_edges = entry[4]
+                for ve in valid_edges:
+                    seg = ve[0]
+                    segments_current.append(seg[:, :2])
+            else:
+                # Legacy format: (xyh, edges)
+                edges = entry[1]
+                for e in edges:
+                    seg = e[0]
+                    segments_current.append(seg[:, :2])
+        current_edge_collection.set_segments(segments_current)
+
+        # Chosen primitive P*: edge whose end node is the current expanded node (approximate match)
+        chosen_segments = []
+        if 0 <= k < len(all_nodes):
+            xk, yk = all_nodes[k]
+            # Search backwards so we pick the most recent parent that produced this node
+            tol = getattr(cost_map, "resolution", 1.0) * 0.75
+            found = False
+            for prev_idx in range(k - 1, -1, -1):
+                if prev_idx >= len(search_history):
+                    continue
+                entry = search_history[prev_idx]
+                # Extended format
+                if len(entry) >= 6 and isinstance(entry[1], (int, float)):
+                    valid_edges = entry[4]
+                    for ve in valid_edges:
+                        path_world, end_xy = ve[0], ve[1]
+                        ex, ey = end_xy
+                        if np.hypot(ex - xk, ey - yk) <= tol:
+                            chosen_segments.append(path_world[:, :2])
+                            found = True
+                            break
+                else:
+                    # Legacy format
+                    edges = entry[1]
+                    for e in edges:
+                        path_world, end_xy = e[0], e[1]
+                        ex, ey = end_xy
+                        if np.hypot(ex - xk, ey - yk) <= tol:
+                            chosen_segments.append(path_world[:, :2])
+                            found = True
+                            break
+                if found:
+                    break
+        chosen_edge_collection.set_segments(chosen_segments)
+
+        # Invalid edges: all invalid from expansions 0..k
+        invalid_segments = []
+        for i in range(k + 1):
+            if i < len(all_invalid_per_step):
+                for (path_world, _, _) in all_invalid_per_step[i]:
+                    invalid_segments.append(path_world[:, :2])
+        invalid_collection.set_segments(invalid_segments)
+
+        # Edge cost labels (at midpoint of each valid edge) for current expansion only to avoid clutter
+        if show_edge_costs and all_edge_costs is not None and end_i > 0:
+            start_i = edge_end_idx[k - 1] if k > 0 else 0
+            for i in range(start_i, min(end_i, start_i + 25)):
+                if i < len(all_edge_costs) and all_edge_costs[i] is not None:
+                    seg = all_edges_flat[i]
+                    if len(seg) >= 2:
+                        mid = (seg[0] + seg[-1]) / 2
+                        ann = ax.text(mid[0], mid[1], f"{all_edge_costs[i]:.0f}", fontsize=6, color="white",
+                                      ha="center", va="center", path_effects=[withStroke(linewidth=2, foreground="black")], zorder=6)
+                        cost_annotations.append(ann)
+
         if path is not None and frame_idx == n_frames - 1 and len(path) > 0:
             path_line.set_data(path[:, 0], path[:, 1])
         else:
             path_line.set_data([], [])
 
-        ax.set_title(f"A* lattice search — expansion {k + 1}/{n_expansions}" if n_expansions else "A* lattice search (no expansions)")
-        return edge_collection, node_scatter, path_line
+        title = f"A* lattice search — expansion {k + 1}/{n_expansions}"
+        if g_h_f_per_step is not None and k < len(g_h_f_per_step) and g_h_f_per_step[k] is not None:
+            g, h, f = g_h_f_per_step[k]
+            title += f"  g={g:.0f} h={h:.0f} f={f:.0f}"
+        ax.set_title(title if n_expansions else "A* lattice search (no expansions)")
+        return edge_collection, current_edge_collection, chosen_edge_collection, invalid_collection, node_scatter, path_line
 
     anim = FuncAnimation(
         fig,
@@ -489,6 +630,234 @@ def animate_lattice_search(
     )
     writer, out_path = _animation_writer(output_file, fps)
     anim.save(out_path, writer=writer, dpi=120)
+    plt.close(fig)
+
+
+def animate_lattice_primitives_stepwise(
+    cost_map,
+    search_history: list,
+    output_file: str = "lattice_primitives_stepwise.mp4",
+    fps: int = 15,
+    figsize: tuple = (10, 8),
+):
+    """
+    Animate the lattice search primitive-by-primitive: in each frame, show
+    all previously sampled primitives in blue and the current primitive in black.
+    This is useful to understand how motion primitives are sampled and costed.
+
+    Args:
+        cost_map: CostMap with .cost_map, .x_origin, .y_origin, .width, .height
+        search_history: From planner.plan(..., return_search_history=True)
+        output_file: Output path (.mp4 or .gif)
+        fps: Frames per second
+        figsize: Figure size (inches)
+    """
+    ox = cost_map.x_origin
+    oy = cost_map.y_origin
+    w = cost_map.width
+    h = cost_map.height
+    grid = np.asarray(cost_map.cost_map)
+
+    # Flatten all valid primitives into a single ordered list of paths (Nx2)
+    edges_flat: list[np.ndarray] = []
+    for entry in search_history:
+        if len(entry) >= 6 and isinstance(entry[1], (int, float)):
+            # Extended format: (xyh, g, h, f, valid_edges, invalid_edges)
+            valid_edges = entry[4]
+            for ve in valid_edges:
+                path_world = ve[0]
+                edges_flat.append(path_world[:, :2].copy())
+        else:
+            # Legacy format: (xyh, edges)
+            if len(entry) >= 2:
+                edges = entry[1]
+                for e in edges:
+                    path_world = e[0]
+                    edges_flat.append(path_world[:, :2].copy())
+
+    if not edges_flat:
+        return
+
+    n_edges = len(edges_flat)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_aspect("equal")
+    ax.set_xlim(ox, ox + w)
+    ax.set_ylim(oy, oy + h)
+
+    # Static background: costmap
+    grid_max = float(np.nanmax(grid))
+    grid_min = float(np.nanmin(grid[grid > 0])) if np.any(grid > 0) else 1.0
+    vmin = max(0.5, grid_min * 0.5)
+    vmax = max(2.0, grid_max)
+    grid_display = np.where(grid > 0, grid, vmin)
+    ax.imshow(
+        grid_display,
+        extent=[ox, ox + w, oy, oy + h],
+        origin="lower",
+        cmap="viridis",
+        alpha=0.85,
+        norm=LogNorm(vmin=vmin, vmax=vmax),
+    )
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+
+    prev_collection = LineCollection([], colors="b", linewidths=0.8, alpha=0.5, label="Previous primitives", zorder=2)
+    ax.add_collection(prev_collection)
+    current_collection = LineCollection([], colors="black", linewidths=2.0, alpha=0.9, label="Current primitive", zorder=3)
+    ax.add_collection(current_collection)
+
+    def init():
+        prev_collection.set_segments([])
+        current_collection.set_segments([])
+        ax.set_title("Lattice primitives (stepwise)")
+        return prev_collection, current_collection
+
+    def update(i):
+        # Previous primitives: 0..i-1
+        if i > 0:
+            prev_segments = [edges_flat[j] for j in range(i)]
+        else:
+            prev_segments = []
+        prev_collection.set_segments(prev_segments)
+
+        # Current primitive: i
+        current_collection.set_segments([edges_flat[i]])
+
+        ax.set_title(f"Lattice primitives (stepwise) — primitive {i+1}/{n_edges}")
+        return prev_collection, current_collection
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=n_edges,
+        init_func=init,
+        blit=False,
+        interval=1000 / fps,
+    )
+    writer, out_path = _animation_writer(output_file, fps)
+    anim.save(out_path, writer=writer, dpi=120)
+    plt.close(fig)
+
+
+def plot_costmap_with_grid(
+    cost_map,
+    path=None,
+    start=None,
+    goal=None,
+    output_file: str = "costmap_with_grid.png",
+    cell_label_stride: int = 5,
+    max_labels: int = 80,
+    figsize: tuple = (12, 10),
+):
+    """
+    Save a PNG of the costmap with grid lines (discretized cells) and cost values
+    annotated on a subset of cells to show how the map is discretized.
+
+    Args:
+        cost_map: CostMap with .cost_map, .x_origin, .y_origin, .width, .height, .resolution
+        path: Optional Nx3 path to overlay
+        start: Optional (x, y) or (x, y, heading)
+        goal: Optional (x, y)
+        output_file: Output path
+        cell_label_stride: Label every Nth cell in each dimension (e.g. 5 = sparse labels)
+        max_labels: Cap total number of cell labels so the figure stays readable
+        figsize: Figure size (inches)
+    """
+    grid = np.asarray(cost_map.cost_map)
+    ox = cost_map.x_origin
+    oy = cost_map.y_origin
+    w = cost_map.width
+    h = cost_map.height
+    res = getattr(cost_map, "resolution", 1.0)
+    n_rows, n_cols = grid.shape
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_aspect("equal")
+    vmin = float(np.nanmin(grid[grid > 0])) if np.any(grid > 0) else 0.5
+    vmax = float(np.nanmax(grid))
+    if vmax <= 0:
+        vmax = 1.0
+    im = ax.imshow(
+        np.where(grid > 0, grid, vmin),
+        extent=[ox, ox + w, oy, oy + h],
+        origin="lower",
+        cmap="viridis",
+        alpha=0.9,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    # Grid lines at cell boundaries
+    for i in range(0, n_cols + 1):
+        x = ox + i * res
+        ax.axvline(x, color="white", linewidth=0.3, alpha=0.6)
+    for j in range(0, n_rows + 1):
+        y = oy + j * res
+        ax.axhline(y, color="white", linewidth=0.3, alpha=0.6)
+    # Cell cost labels (sample)
+    count = 0
+    for j in range(0, n_rows, cell_label_stride):
+        for i in range(0, n_cols, cell_label_stride):
+            if count >= max_labels:
+                break
+            cx = ox + (i + 0.5) * res
+            cy = oy + (j + 0.5) * res
+            val = grid[j, i]
+            if np.isfinite(val) and val < 1e9:
+                ax.text(cx, cy, f"{val:.1f}", fontsize=5, ha="center", va="center", color="white",
+                        path_effects=[withStroke(linewidth=1, foreground="black")])
+                count += 1
+        if count >= max_labels:
+            break
+    if path is not None and len(path) > 0:
+        ax.plot(path[:, 0], path[:, 1], "lime", linewidth=2, label="Path", zorder=4)
+    if start is not None:
+        ax.plot(start[0], start[1], "go", markersize=10, label="Start", zorder=5)
+    if goal is not None:
+        ax.plot(goal[0], goal[1], "r*", markersize=14, label="Goal", zorder=5)
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title(f"Costmap (resolution={res} m) — grid cells {n_cols}×{n_rows}, sample cost values")
+    plt.colorbar(im, ax=ax, label="Cost", shrink=0.7)
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    fig.savefig(output_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_lattice_search_costs(
+    search_history: list,
+    output_file: str = "lattice_search_costs.png",
+    figsize: tuple = (10, 6),
+):
+    """
+    Plot g(n), h(n), and f(n) for each expanded node during A* to show whether
+    g (accumulated cost) or h (heuristic) dominates over the search.
+
+    Expects the extended search_history format: each entry is
+    (expanded_xyh, g, h, f, valid_edges, invalid_edges). If old format is used,
+    no plot is generated.
+    """
+    g_list, h_list, f_list = [], [], []
+    for entry in search_history:
+        if len(entry) >= 6 and isinstance(entry[1], (int, float)):
+            g_list.append(entry[1])
+            h_list.append(entry[2])
+            f_list.append(entry[3])
+    if not g_list:
+        return
+    n = len(g_list)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(range(1, n + 1), g_list, "b-", label="g(n) — cost from start", linewidth=1.5)
+    ax.plot(range(1, n + 1), h_list, "r-", label="h(n) — heuristic to goal", linewidth=1.5)
+    ax.plot(range(1, n + 1), f_list, "k--", alpha=0.7, label="f(n) = g + w×h", linewidth=1)
+    ax.set_xlabel("Expansion index (node number)")
+    ax.set_ylabel("Cost")
+    ax.set_title("A* search: g(n) vs h(n) per expanded node")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(output_file, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
