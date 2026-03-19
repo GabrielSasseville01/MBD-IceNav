@@ -35,6 +35,42 @@ except RuntimeError:
     pass
 
 
+def _clip_path_to_goal(path_arr, goal_pt, goal_y_line_val=None):
+    """Ensure path ends at the goal.
+
+    For goal_y_line: truncates at the first waypoint crossing y >= goal_y_line,
+    interpolates the exact crossing, and appends it so the path ends on the goal line.
+    If the path never reaches goal_y_line, appends the goal point as a fallback.
+
+    For point goals: always appends the goal point if the path does not already end
+    there (removes the old distance-tolerance restriction).
+    """
+    if path_arr is None or len(path_arr) == 0:
+        return path_arr
+    path_arr = np.asarray(path_arr, dtype=float)
+    if goal_y_line_val is not None:
+        for i in range(len(path_arr)):
+            if path_arr[i, 1] >= goal_y_line_val:
+                if i == 0:
+                    return path_arr[:1]
+                y0, y1 = path_arr[i - 1, 1], path_arr[i, 1]
+                t = (goal_y_line_val - y0) / (y1 - y0) if y1 > y0 else 0.0
+                cx = path_arr[i - 1, 0] + t * (path_arr[i, 0] - path_arr[i - 1, 0])
+                da = (path_arr[i, 2] - path_arr[i - 1, 2] + np.pi) % (2 * np.pi) - np.pi
+                cpsi = path_arr[i - 1, 2] + t * da
+                return np.vstack([path_arr[:i], [[cx, goal_y_line_val, cpsi]]])
+        # Path doesn't reach goal_y_line — append goal point as fallback
+        gp = np.asarray(goal_pt, dtype=float)
+        if np.hypot(path_arr[-1, 0] - gp[0], path_arr[-1, 1] - gp[1]) > 1e-3:
+            return np.vstack([path_arr, [[gp[0], gp[1], path_arr[-1, 2]]]])
+        return path_arr
+    else:
+        gp = np.asarray(goal_pt, dtype=float)
+        if np.hypot(path_arr[-1, 0] - gp[0], path_arr[-1, 1] - gp[1]) > 1e-3:
+            return np.vstack([path_arr, [[gp[0], gp[1], path_arr[-1, 2]]]])
+        return path_arr
+
+
 def main():
     parser = argparse.ArgumentParser(description='MEDEA Ice Ship Fracture Simulation')
     parser.add_argument('--live', action='store_true',
@@ -133,6 +169,8 @@ def main():
     parser.add_argument('--jax-float32', action='store_true',
                         help='With --jax-sim: use float32 instead of float64 (faster on GPU, less accurate). '
                              'Only use after validating results match NumPy baseline.')
+    parser.add_argument('--mbd-viz-dir', type=str, default=None, metavar='DIR',
+                        help='With --planner jax-mbd: save per-replan debug plots (density, top-5, cost breakdown) to DIR.')
     args = parser.parse_args()
 
     if args.plan_only:
@@ -700,14 +738,9 @@ def main():
                 print("  Planner did not find a path; aborting. Try without --plan for fixed trajectory.", flush=True)
                 return
 
-        # When using a point goal (no goal_y_line), extend path to the exact goal if last waypoint is within tolerance
-        # so the ship and visualization both reach the displayed goal (planner may stop within goal_tolerance).
-        if goal_y_line is None and path is not None and len(path) > 0:
-            last_pt = path[-1, :2]
-            dist = np.hypot(last_pt[0] - goal[0], last_pt[1] - goal[1])
-            tol = getattr(plan_cfg, "planning_goal_tolerance", 150.0)
-            if 1e-6 < dist <= tol:
-                path = np.vstack([path, [goal[0], goal[1], path[-1, 2]]])
+        # Clip/extend the path to end exactly at the goal (handles both point goals and goal_y_line).
+        if path is not None and len(path) > 0:
+            path = _clip_path_to_goal(path, goal, goal_y_line_val=goal_y_line)
 
         path_lattice = path.copy() if (args.plan_only and getattr(args, 'compare_planners', False)) else None
 
@@ -735,6 +768,9 @@ def main():
                     path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
                 )
             diag["sampling_mpc"] = time.time() - t0
+            # Clip/extend the optimized path to end at the goal (MBD/etc may overshoot).
+            if path is not None and len(path) > 0:
+                path = _clip_path_to_goal(path, goal, goal_y_line_val=goal_y_line)
         use_speed_opt = getattr(args, 'optimize_speed', False) or getattr(plan_cfg, 'planning_optimize_speed', False)
         speed_profile = None
         if use_speed_opt:
@@ -830,6 +866,9 @@ def main():
             return
 
         # Receding-horizon callback (AUTO-IceNav style): rebuild costmap from current ice state and replan
+        _mbd_viz_dir = getattr(args, 'mbd_viz_dir', None)
+        _mbd_replan_counter = [0]  # mutable counter accessible inside closure
+
         def _replan_callback(frame, world_polygons, centroids, thicknesses, ship_pos_f, ship_heading_f, n_remaining):
             # Rebuild costmap from current ice state (counted as additional planning time)
             t0_cost = time.time()
@@ -889,8 +928,13 @@ def main():
             if use_sampling_mpc:
                 if use_diffusion_mpc:
                     path_f = optimize_with_diffusion(
-                        path_f, start_f, goal, cost_map_f, plan_cfg, start_nu=(2.0, 0.0, 0.0)
+                        path_f, start_f, goal, cost_map_f, plan_cfg, start_nu=(2.0, 0.0, 0.0),
+                        viz_dir=_mbd_viz_dir,
+                        replan_idx=_mbd_replan_counter[0],
+                        viz_world_polygons=world_polygons,
+                        viz_thicknesses=thicknesses,
                     )
+                    _mbd_replan_counter[0] += 1
                 elif use_mppi:
                     path_f = optimize_with_mppi(
                         path_f, start_f, goal, cost_map_f, plan_cfg, start_nu=(2.0, 0.0, 0.0)
@@ -903,13 +947,9 @@ def main():
                     path_f = optimize_with_gradcem(
                         path_f, start_f, goal, cost_map_f, plan_cfg, start_nu=(2.0, 0.0, 0.0)
                     )
-            # Extend path to exact goal when within tolerance (point goal only) so trajectory reaches displayed goal
-            if goal_y_line is None and path_f is not None and len(path_f) > 0:
-                last_pt = path_f[-1, :2]
-                dist = np.hypot(last_pt[0] - goal[0], last_pt[1] - goal[1])
-                tol = getattr(plan_cfg, "planning_goal_tolerance", 150.0)
-                if 1e-6 < dist <= tol:
-                    path_f = np.vstack([path_f, [goal[0], goal[1], path_f[-1, 2]]])
+            # Clip/extend path to end exactly at the goal (handles both point goals and goal_y_line).
+            if path_f is not None and len(path_f) > 0:
+                path_f = _clip_path_to_goal(path_f, goal, goal_y_line_val=goal_y_line)
             path_snapshots.append((frame, path_f.copy()))  # for costmap movie: show this plan from this frame on
             sp_f = None
             if use_speed_opt and path_f is not None and len(path_f) >= 2:

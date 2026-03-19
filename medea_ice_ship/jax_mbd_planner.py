@@ -55,12 +55,12 @@ def make_dynamics_rollout(
     m22 = float(mass * (1.0 + added_mass_sway_frac))
     m33 = float(Izz * (1.0 + added_mass_yaw_frac))
 
-    M3_inv_diag = jnp.array([1.0 / m11, 1.0 / m22, 1.0 / m33])
+    M3_inv_diag = jnp.array([1.0 / m11, 1.0 / m22, 1.0 / m33], dtype=jnp.float32)
     D3_diag = jnp.array([
         mass * ship_damping_xy,
         mass * ship_damping_xy,
         Izz * ship_damping_psi,
-    ])
+    ], dtype=jnp.float32)
 
     _m11 = jnp.float32(m11)
     _m22 = jnp.float32(m22)
@@ -68,6 +68,7 @@ def make_dynamics_rollout(
 
     def _euler_step(state, tau):
         """Single Euler sub-step.  state = [eta(3); nu(3)]."""
+        tau = tau.astype(state.dtype)  # guard against float64 leaking from diffusion loop
         eta, nu = state[:3], state[3:6]
         C_nu = jnp.stack([
             -_m22 * nu[1] * nu[2],
@@ -238,8 +239,8 @@ def make_cost_fn(
     use_hull = ship_length > 0 and ship_beam > 0
 
     if use_hull:
-        _dx_body = jnp.array([0.0, half_l, half_l, -half_l, -half_l])
-        _dy_body = jnp.array([0.0, half_w, -half_w, half_w, -half_w])
+        _dx_body = jnp.array([0.0, half_l, half_l, -half_l, -half_l], dtype=jnp.float32)
+        _dy_body = jnp.array([0.0, half_w, -half_w, half_w, -half_w], dtype=jnp.float32)
 
         def _point_cost(point):
             c, s = jnp.cos(point[2]), jnp.sin(point[2])
@@ -286,6 +287,61 @@ def make_cost_fn(
     return cost_fn
 
 
+def make_cost_components_fn(
+    grid: jnp.ndarray,
+    meta: dict,
+    goal_world,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    ship_length: float = 0.0,
+    ship_beam: float = 0.0,
+):
+    """
+    Like make_cost_fn but returns individual (unweighted) cost components.
+
+    Returns a function components_fn(u_norm) -> jnp.array([costmap, length, goal, jerk])
+    so callers can apply weights and compute percentages for diagnostics.
+    """
+    query = _make_query(grid, meta)
+    goal_xy = jnp.array(goal_world[:2], dtype=jnp.float32)
+
+    half_l = float(ship_length) / 2.0
+    half_w = float(ship_beam) / 2.0
+    use_hull = ship_length > 0 and ship_beam > 0
+
+    if use_hull:
+        _dx_body = jnp.array([0.0, half_l, half_l, -half_l, -half_l], dtype=jnp.float32)
+        _dy_body = jnp.array([0.0, half_w, -half_w, half_w, -half_w], dtype=jnp.float32)
+
+        def _point_cost(point):
+            c, s = jnp.cos(point[2]), jnp.sin(point[2])
+            wx = point[0] + c * _dx_body - s * _dy_body
+            wy = point[1] + s * _dx_body + c * _dy_body
+            return jnp.max(jax.vmap(query)(wx, wy))
+    else:
+        def _point_cost(point):
+            return query(point[0], point[1])
+
+    def components_fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)
+        diffs = jnp.diff(traj[:, :2], axis=0)
+        seg_lens = jnp.sqrt(jnp.sum(diffs ** 2, axis=1) + 1e-8)
+        wp_costs = jax.vmap(_point_cost)(traj)
+        seg_costmap = 0.5 * (wp_costs[:-1] + wp_costs[1:]) * seg_lens
+        costmap_cost = seg_costmap.sum()
+        path_length = seg_lens.sum()
+        goal_dist = jnp.sqrt(jnp.sum((traj[-1, :2] - goal_xy) ** 2) + 1e-4)
+        du = jnp.diff(u_norm, axis=0)
+        jerk = jnp.mean(du ** 2)
+        return jnp.array([costmap_cost, path_length, goal_dist, jerk])
+
+    return components_fn
+
+
 # ── MBD reverse diffusion process (action space) ─────────────────────────
 
 def run_mbd(
@@ -324,7 +380,7 @@ def run_mbd(
         Ybar_i = jnp.array(Ybar_init, dtype=jnp.float32)
         Ybar_i = jnp.clip(Ybar_i, -1.0, 1.0)
     else:
-        Ybar_i = jnp.zeros((H, 3))
+        Ybar_i = jnp.zeros((H, 3), dtype=jnp.float32)
         Ybar_i = Ybar_i.at[:, 0].set(init_surge_bias)
 
     if Ndiffuse <= 1:
@@ -332,7 +388,7 @@ def run_mbd(
 
     rng = jax.random.PRNGKey(seed)
 
-    betas = jnp.linspace(beta0, betaT, Ndiffuse)
+    betas = jnp.linspace(beta0, betaT, Ndiffuse, dtype=jnp.float32)
     alphas = 1.0 - betas
     alphas_bar = jnp.cumprod(alphas)
     sigmas = jnp.sqrt(1.0 - alphas_bar)
@@ -345,15 +401,15 @@ def run_mbd(
         Yi = Ybar_c * jnp.sqrt(alphas_bar[i])
 
         rng_c, rng_s = jax.random.split(rng_c)
-        eps = jax.random.normal(rng_s, (Nsample, H, 3))
+        eps = jax.random.normal(rng_s, (Nsample, H, 3), dtype=jnp.float32)
         Y0s = eps * sigmas[i] + Ybar_c
         Y0s = jnp.clip(Y0s, -1.0, 1.0)
 
-        costs = cost_batch(Y0s)
+        costs = cost_batch(Y0s).astype(jnp.float32)
         rews = -costs
         rew_mean = rews.mean()
-        rew_std = jnp.maximum(rews.std(), 1e-6)
-        logp0 = (rews - rew_mean) / rew_std / temperature
+        rew_std = jnp.maximum(rews.std(), jnp.float32(1e-6))
+        logp0 = (rews - rew_mean) / rew_std / jnp.float32(temperature)
         weights = jax.nn.softmax(logp0)
 
         Ybar_new = jnp.einsum("n,nij->ij", weights, Y0s)
@@ -370,7 +426,7 @@ def run_mbd(
         )
         i_prev = jnp.maximum(i - 1, 0)
         Ybar_im1 = Yim1 / jnp.sqrt(alphas_bar[i_prev])
-        Ybar_im1 = jnp.clip(Ybar_im1, -1.0, 1.0)
+        Ybar_im1 = jnp.clip(Ybar_im1, -1.0, 1.0).astype(jnp.float32)
 
         return (i - 1, rng_c, Ybar_im1), (costs.mean(), costs.min())
 
@@ -460,7 +516,7 @@ def run_mbd_with_diagnostics(
         Yi = Ybar_c * jnp.sqrt(alphas_bar[i])
 
         rng, rng_s = jax.random.split(rng)
-        eps = jax.random.normal(rng_s, (Nsample, H, 3))
+        eps = jax.random.normal(rng_s, (Nsample, H, 3), dtype=jnp.float32)
         Y0s = eps * sigmas[i] + Ybar_c
         Y0s = jnp.clip(Y0s, -1.0, 1.0)
 
@@ -507,6 +563,213 @@ def run_mbd_with_diagnostics(
     return diag
 
 
+# ── Replan visualization helpers ─────────────────────────────────────────
+
+def _sample_final_step(
+    Ybar_final: jnp.ndarray,
+    cost_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    beta0: float,
+    betaT: float,
+    Ndiffuse: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Sample Nsample trajectories around Ybar_final using the final diffusion step's noise level.
+
+    This is a single cheap batch forward pass (not a full re-run of MBD).
+    Returns:
+        trajs   : (Nsample, H+1, 3) rolled-out trajectories [x, y, psi]
+        costs   : (Nsample,) total cost per sample
+        Y0s_norm: (Nsample, H, 3) normalised action sequences
+    """
+    betas_np = np.linspace(float(beta0), float(betaT), Ndiffuse)
+    alphas_bar_np = np.cumprod(1.0 - betas_np)
+    # Use sigma at step i=1 (last reverse step) — small but non-zero
+    sigma = float(np.sqrt(max(1.0 - alphas_bar_np[1], 0.0)))
+
+    rng = jax.random.PRNGKey(seed + 9999)
+    eps = jax.random.normal(rng, (Nsample, H, 3), dtype=jnp.float32)
+    Y0s = jnp.clip(eps * sigma + Ybar_final[None], -1.0, 1.0)
+
+    cost_batch = jax.jit(jax.vmap(cost_fn))
+    costs = np.array(cost_batch(Y0s))
+
+    rollout_batch = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    u_phys = Y0s * action_scale[None] + action_center[None]
+    trajs = np.array(rollout_batch(eta0, nu0, u_phys))
+
+    return trajs, costs, np.array(Y0s)
+
+
+def _save_mbd_replan_viz(
+    viz_dir: str,
+    replan_idx: int,
+    trajs: np.ndarray,
+    costs: np.ndarray,
+    Y0s_norm: np.ndarray,
+    Ybar_final: jnp.ndarray,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    components_fn,
+    cost_map,
+    goal_world,
+    costmap_weight: float,
+    length_weight: float,
+    goal_weight: float,
+    smoothness_weight: float,
+    world_polygons=None,
+    thicknesses=None,
+    lattice_path=None,
+    n_top: int = 5,
+) -> None:
+    """
+    Generate and save three MBD debug outputs for one replan:
+      1. Density plot: all Nsample trajectories with low alpha
+      2. Top-N plot: top n_top trajectories by total cost, with score labels
+      3. Text file: cost decomposition (costmap / length / goal / jerk) for top-N paths
+
+    Axes always match the full costmap extent.  The lattice path (full A* path
+    from ship to goal, including the portion beyond the MBD horizon) is drawn
+    as a dashed background line for context.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
+    from matplotlib.collections import PatchCollection
+    import os
+
+    os.makedirs(viz_dir, exist_ok=True)
+
+    grid = cost_map.cost_map
+    extent = [
+        cost_map.x_origin, cost_map.x_origin + cost_map.width,
+        cost_map.y_origin, cost_map.y_origin + cost_map.height,
+    ]
+    vmax = float(np.percentile(grid[grid > 0], 95)) if np.any(grid > 0) else 1.0
+
+    # Full costmap domain — same as the simulation movie
+    xlim = (cost_map.x_origin, cost_map.x_origin + cost_map.width)
+    ylim = (cost_map.y_origin, cost_map.y_origin + cost_map.height)
+
+    def _draw_background(ax):
+        ax.imshow(grid, origin="lower", extent=extent, cmap="YlOrRd",
+                  alpha=0.5, vmin=0, vmax=vmax)
+        if world_polygons is not None and thicknesses is not None and len(world_polygons) > 0:
+            patches = [MplPolygon(poly, closed=True) for poly in world_polygons]
+            pc = PatchCollection(patches, cmap="Blues", edgecolor="#555555",
+                                 linewidth=0.3, alpha=0.5)
+            pc.set_array(np.array(thicknesses))
+            pc.set_clim(float(thicknesses.min()), float(thicknesses.max()))
+            ax.add_collection(pc)
+        # Full lattice path (context for what happens beyond MBD horizon)
+        if lattice_path is not None and len(lattice_path) >= 2:
+            lp = np.asarray(lattice_path)
+            ax.plot(lp[:, 0], lp[:, 1], "--", color="gray", lw=1.2, alpha=0.7,
+                    label="Lattice path (full)", zorder=3)
+
+    goal_xy = np.array(goal_world[:2])
+    ship_xy = np.array([float(eta0[0]), float(eta0[1])])
+
+    # MBD horizon coverage in metres (for title)
+    mean_traj_len = float(np.sum(np.linalg.norm(np.diff(trajs.mean(axis=0)[:, :2], axis=0), axis=1)))
+
+    sort_idx = np.argsort(costs)
+    top_idx = sort_idx[:n_top]
+
+    # ── Plot 1: Density (all Nsample samples) ─────────────────────────────
+    fig1, ax1 = plt.subplots(figsize=(12, 12))
+    _draw_background(ax1)
+    for traj in trajs:
+        ax1.plot(traj[:, 0], traj[:, 1], "b-", alpha=0.06, lw=0.7)
+    # Mean trajectory from Ybar_final
+    u_mean_phys = np.array(Ybar_final * action_scale + action_center)
+    mean_traj = np.array(jax.jit(rollout_fn)(eta0, nu0, jnp.array(u_mean_phys)))
+    ax1.plot(mean_traj[:, 0], mean_traj[:, 1], "r-", lw=2.5, label="Mean (Ybar_final)", zorder=5)
+    ax1.plot(*ship_xy, "go", ms=10, zorder=6, label="Ship")
+    ax1.plot(*goal_xy, "mx", ms=12, mew=2.5, zorder=6, label="Goal")
+    ax1.set_xlim(*xlim)
+    ax1.set_ylim(*ylim)
+    ax1.set_aspect("equal")
+    ax1.set_xlabel("X [m]")
+    ax1.set_ylabel("Y [m]")
+    ax1.set_title(
+        f"MBD Replan #{replan_idx} — {len(trajs)} samples at final denoising step\n"
+        f"MBD horizon ≈{mean_traj_len:.0f} m  |  cost range [{costs.min():.1f}, {costs.max():.1f}]"
+    )
+    ax1.legend(fontsize=9)
+    plt.tight_layout()
+    density_path = os.path.join(viz_dir, f"replan_{replan_idx:04d}_density.png")
+    fig1.savefig(density_path, dpi=120, bbox_inches="tight")
+    plt.close(fig1)
+    print(f"  [MBD viz] saved density plot → {density_path}", flush=True)
+
+    # ── Plot 2: Top-N paths ────────────────────────────────────────────────
+    fig2, ax2 = plt.subplots(figsize=(12, 12))
+    _draw_background(ax2)
+    colors = plt.cm.plasma(np.linspace(0.1, 0.85, n_top))
+    for rank, idx in enumerate(top_idx):
+        traj = trajs[idx]
+        label = f"#{rank + 1}  cost={costs[idx]:.1f}"
+        ax2.plot(traj[:, 0], traj[:, 1], color=colors[rank], lw=2.0, label=label, zorder=5)
+        ax2.plot(traj[-1, 0], traj[-1, 1], ".", color=colors[rank], ms=8, zorder=6)
+    ax2.plot(*ship_xy, "go", ms=10, zorder=7, label="Ship")
+    ax2.plot(*goal_xy, "mx", ms=12, mew=2.5, zorder=7, label="Goal")
+    ax2.set_xlim(*xlim)
+    ax2.set_ylim(*ylim)
+    ax2.set_aspect("equal")
+    ax2.set_xlabel("X [m]")
+    ax2.set_ylabel("Y [m]")
+    ax2.set_title(
+        f"MBD Replan #{replan_idx} — Top {n_top} paths by total cost\n"
+        f"MBD horizon ≈{mean_traj_len:.0f} m  (dashed = full lattice path to goal)"
+    )
+    ax2.legend(fontsize=9, loc="upper right")
+    plt.tight_layout()
+    top_path = os.path.join(viz_dir, f"replan_{replan_idx:04d}_top{n_top}.png")
+    fig2.savefig(top_path, dpi=120, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"  [MBD viz] saved top-{n_top} plot  → {top_path}", flush=True)
+
+    # ── Text: cost decomposition for top-N ────────────────────────────────
+    weights_arr = np.array([costmap_weight, length_weight, goal_weight, smoothness_weight])
+    comp_names = ["costmap", "length ", "goal   ", "jerk   "]
+    comp_jit = jax.jit(components_fn)
+
+    lines = [
+        f"MBD Replan #{replan_idx} — Top {n_top} cost breakdown",
+        f"Weights: costmap={costmap_weight:.3f}  length={length_weight:.3f}"
+        f"  goal={goal_weight:.4f}  smoothness={smoothness_weight:.5f}",
+        "=" * 72,
+    ]
+    for rank, idx in enumerate(top_idx):
+        u_norm_j = jnp.array(Y0s_norm[idx], dtype=jnp.float32)
+        raw = np.array(comp_jit(u_norm_j))          # [costmap, length, goal, jerk] unweighted
+        weighted = raw * weights_arr                  # contribution to total cost
+        total_cost = float(costs[idx])
+        lines.append(f"\nRank #{rank + 1}  total_cost = {total_cost:.3f}")
+        for name, w_val, raw_val in zip(comp_names, weighted, raw):
+            pct = 100.0 * w_val / total_cost if total_cost > 0 else 0.0
+            lines.append(
+                f"  {name}  weighted={w_val:9.3f}  ({pct:5.1f}%)  raw={raw_val:.3f}"
+            )
+
+    txt_path = os.path.join(viz_dir, f"replan_{replan_idx:04d}_costs.txt")
+    with open(txt_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    # Also echo to stdout
+    print("\n".join(lines), flush=True)
+    print(f"  [MBD viz] saved cost breakdown → {txt_path}", flush=True)
+
+
 # ── High-level entry point ────────────────────────────────────────────────
 
 def _jax_backend_info() -> str:
@@ -528,6 +791,10 @@ def jax_mbd_optimize(
     start_nu: Optional[Tuple[float, float, float]] = None,
     lattice_path: Optional[np.ndarray] = None,
     warm_start: Optional[bool] = None,
+    viz_dir: Optional[str] = None,
+    replan_idx: int = 0,
+    viz_world_polygons=None,
+    viz_thicknesses=None,
 ) -> np.ndarray:
     """
     Optimize trajectory using JAX Model-Based Diffusion with 3-DOF dynamics.
@@ -674,6 +941,41 @@ def jax_mbd_optimize(
         f"  JAX MBD done ({_elapsed:.1f}s): cost_mean={cost_mean:.1f}, cost_min={cost_min:.1f}",
         flush=True,
     )
+
+    # ── Optional: generate replan visualizations ──────────────────────
+    if viz_dir is not None:
+        components_fn = make_cost_components_fn(
+            grid, meta, goal, rollout_fn, eta0, nu0,
+            action_center, action_scale,
+            ship_length=L, ship_beam=B,
+        )
+        trajs_viz, costs_viz, Y0s_viz = _sample_final_step(
+            Ybar_final, cost_fn, rollout_fn, eta0, nu0,
+            action_center, action_scale,
+            H, Nsample, beta0, betaT, Ndiffuse, seed,
+        )
+        _save_mbd_replan_viz(
+            viz_dir=viz_dir,
+            replan_idx=replan_idx,
+            trajs=trajs_viz,
+            costs=costs_viz,
+            Y0s_norm=Y0s_viz,
+            Ybar_final=Ybar_final,
+            rollout_fn=rollout_fn,
+            eta0=eta0,
+            nu0=nu0,
+            action_center=action_center,
+            action_scale=action_scale,
+            components_fn=components_fn,
+            cost_map=cost_map,
+            goal_world=goal,
+            costmap_weight=costmap_weight,
+            length_weight=length_weight,
+            goal_weight=goal_weight,
+            smoothness_weight=smoothness_weight,
+            world_polygons=viz_world_polygons,
+            thicknesses=viz_thicknesses,
+        )
 
     # ── Roll out final trajectory ─────────────────────────────────────
     rollout_jit = jax.jit(rollout_fn)

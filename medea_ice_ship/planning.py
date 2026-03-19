@@ -224,6 +224,10 @@ def optimize_with_diffusion(
     run_cfg: RunConfig,
     start_nu: Optional[Tuple[float, float, float]] = None,
     warm_start: Optional[bool] = None,
+    viz_dir: Optional[str] = None,
+    replan_idx: int = 0,
+    viz_world_polygons=None,
+    viz_thicknesses=None,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Model-Based Diffusion (3-DOF dynamics + costmap).
@@ -262,6 +266,10 @@ def optimize_with_diffusion(
         start_nu=start_nu,
         lattice_path=continuous_path,
         warm_start=warm_start,
+        viz_dir=viz_dir,
+        replan_idx=replan_idx,
+        viz_world_polygons=viz_world_polygons,
+        viz_thicknesses=viz_thicknesses,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
