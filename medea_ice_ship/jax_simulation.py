@@ -44,7 +44,6 @@ import jax.numpy as jnp
 from functools import partial
 
 from medea_ice_ship.properties import IceProperties, R_xy, ssa
-from medea_ice_ship.bonds import find_connected_components
 from medea_ice_ship.config import SimulationConfig, get_default_simulation_config
 from medea_ice_ship.ocean_current import OceanCurrentModel, NoCurrentModel
 from medea_ice_ship.geometry import create_ship_hull_at_position_heading
@@ -285,8 +284,8 @@ def _stress_diffusion_jax(
     def diffuse_step(stress, _):
         stress_i = stress[bond_i]
         stress_j = stress[bond_j]
-        transfer_i_to_j = intact & (stress_i > stress_j)
-        transfer_j_to_i = intact & (stress_j >= stress_i)
+        transfer_i_to_j = bond_intact & (stress_i > stress_j)
+        transfer_j_to_i = bond_intact & (stress_j >= stress_i)
         new_stress = stress
         new_stress = new_stress.at[bond_j].add(
             jnp.where(transfer_i_to_j, stress_i * stress_transfer, 0.0)
@@ -296,7 +295,6 @@ def _stress_diffusion_jax(
         )
         return new_stress, None
 
-    intact = bond_intact
     stress_out, _ = jax.lax.scan(diffuse_step, element_stress, None, length=n_steps)
     return stress_out
 
@@ -867,14 +865,6 @@ def jax_simulate_ice_ship_interaction(
         else:
             setpoint = setpoint_next = ship_state.eta  # stationary
 
-        # ── BFS connected components (must stay in Python) ────────────────────
-        bond_intact_np = np.array(state.bond_intact)
-        # (components used only for kinematic drift; skip for ship-trajectory mode)
-        if ship_trajectory is None:
-            components = find_connected_components(n, bonds, bond_intact_np)
-        else:
-            components = None  # not needed
-
         # ── Sample ocean current ──────────────────────────────────────────────
         pos_np = np.array(state.positions)
         v_water_np = ocean_current.sample_batch(pos_np)  # (n, 2) NumPy
@@ -933,6 +923,710 @@ def jax_simulate_ice_ship_interaction(
         ocean_current.step()
 
     # ── Build return value matching simulate_ice_ship_interaction signature ────
+    damage_summary = {"impulse_total": J_cumul}
+
+    if return_ship_diagnostics:
+        if ship_diagnostics:
+            ship_diagnostics[-1]["damage_summary"] = damage_summary
+        return (
+            positions_history,
+            rotations_history,
+            bonds_history,
+            ship_history,
+            submergence_history,
+            ship_diagnostics,
+        )
+    else:
+        return (
+            positions_history,
+            rotations_history,
+            bonds_history,
+            ship_history,
+            submergence_history,
+            damage_summary,
+        )
+
+
+# ── Full JAX scan: entire simulation compiled into one XLA program ─────────
+
+def simulate_full_jax_scan(
+    polygons,
+    centroids,
+    bonds,
+    ship_pos,
+    ship_length,
+    ship_beam,
+    n_frames,
+    dt,
+    drift_vel,
+    thicknesses,
+    ship_props,
+    ship_trajectory=None,
+    config=None,
+    parent_ids=None,
+    v_water_all=None,
+    use_auto_icenav_ship: bool = False,
+):
+    """
+    Full JAX scan simulation: entire frame loop compiled into one XLA program.
+
+    Unlike jax_simulate_ice_ship_interaction(), this function uses
+    jax.lax.scan so the Python frame-dispatch overhead between frames is
+    eliminated.  The first call triggers a full XLA compilation (may take
+    longer than the per-frame version); subsequent calls with the same
+    shapes execute in a single GPU kernel dispatch.
+
+    Limitations vs. jax_simulate_ice_ship_interaction()
+    -------------------------------------------------------
+    * No replan_callback — ship_trajectory must be fully pre-specified.
+    * No frame_callback — real-time visualisation is not supported.
+    * No goal-based early stopping.
+    * Ocean current must be pre-computed; pass v_water_all=(n_frames, n, 2)
+      or None (defaults to zero current).
+
+    Parameters
+    ----------
+    polygons, centroids, bonds, ship_pos, ship_length, ship_beam,
+    n_frames, dt, drift_vel, thicknesses, ship_props :
+        Same as jax_simulate_ice_ship_interaction().
+    ship_trajectory : list of (pos, heading) or None
+        Pre-computed trajectory for all n_frames.
+    config : SimulationConfig or None
+    parent_ids : (n,) int array or None
+    v_water_all : (n_frames, n, 2) array or None
+        Per-frame ocean-current velocities at each ice element.
+        If None, zero current is assumed.
+    use_auto_icenav_ship : bool
+
+    Returns
+    -------
+    Same 6-tuple as jax_simulate_ice_ship_interaction() (non-diagnostics).
+    """
+    cfg = config or get_default_simulation_config()
+    n = len(polygons)
+
+    # ── Build static data ──────────────────────────────────────────────────
+    print("  [JAX-scan] Building static data...", flush=True)
+    static   = build_static_data(polygons, centroids, bonds, thicknesses, parent_ids, cfg)
+    ship_dyn = build_ship_dynamics_data(ship_props, cfg, ship_length, ship_beam)
+
+    # ── Initial state ──────────────────────────────────────────────────────
+    ship_start_pos  = np.array(ship_pos)
+    ship_start_head = 0.0
+    if ship_trajectory is not None and len(ship_trajectory) > 0:
+        ship_start_pos  = np.array(ship_trajectory[0][0])
+        ship_start_head = float(ship_trajectory[0][1])
+
+    state      = build_initial_ice_state(n, centroids, len(bonds), np.array(static.initial_floe_of))
+    ship_state = build_initial_ship_state(ship_start_pos, ship_start_head)
+
+    # ── Time stepping ──────────────────────────────────────────────────────
+    nu_r    = getattr(cfg, "poisson_ratio", 0.3)
+    E_ice   = IceProperties.YOUNGS_MODULUS
+    G_shear = E_ice / (2.0 * (1.0 + nu_r))
+    rho_ice = IceProperties.ICE_DENSITY
+    r_min   = float(np.array(static.radii).min())
+    b_safe  = getattr(cfg, "rayleigh_safety_factor", 0.1)
+    dt_rayleigh = (
+        b_safe * np.pi * r_min / (0.163 * nu_r + 0.877)
+        * np.sqrt(rho_ice / G_shear)
+    )
+    use_rayleigh_cap = getattr(cfg, "use_rayleigh_dt_cap", False)
+    dt_ice     = min(dt, dt_rayleigh) if use_rayleigh_cap else dt
+    n_ice_steps = max(1, int(round(dt / dt_ice))) if dt_ice > 0 else 1
+
+    # ── AutoIceNav thruster parameters ────────────────────────────────────
+    B_mat   = jnp.zeros((3, 6), dtype=jnp.float64)
+    T_n_val = 1.0
+    try:
+        from medea_ice_ship.auto_icenav_ship import FossenSupply3DOF
+        _s    = FossenSupply3DOF(mass=ship_props.mass, length=ship_length)
+        B_mat = jnp.array(_s.B)
+        T_n_val = _s.T_n
+    except Exception:
+        pass
+    use_auto = use_auto_icenav_ship and ship_trajectory is not None
+
+    # ── Build JIT frame step (same factory as per-frame version) ──────────
+    print("  [JAX-scan] Building frame step...", flush=True)
+    frame_step = _make_frame_step(
+        static, cfg, ship_dyn,
+        ship_length, ship_beam,
+        n_ice_steps, dt, dt_ice,
+        use_auto, B_mat, T_n_val,
+    )
+
+    # Warm-up: compile frame_step first so we can time the scan separately
+    _dummy_vw = jnp.zeros((n, 2), dtype=jnp.float64)
+    _dummy_sp = ship_state.eta
+    _ = frame_step(state, ship_state, _dummy_sp, _dummy_sp, _dummy_vw,
+                   state.dpdem_floe_eligible)
+    jax.block_until_ready(_)
+
+    # ── Pre-compute per-frame setpoints ────────────────────────────────────
+    if ship_trajectory is not None:
+        sp_rows = []
+        for frame in range(n_frames):
+            idx      = min(frame, len(ship_trajectory) - 1)
+            idx_next = min(frame + 1, len(ship_trajectory) - 1)
+            sp_pos,  sp_head  = ship_trajectory[idx]
+            sp_posn, sp_headn = ship_trajectory[idx_next]
+            sp_rows.append([
+                float(sp_pos[0]),  float(sp_pos[1]),  float(sp_head),
+                float(sp_posn[0]), float(sp_posn[1]), float(sp_headn),
+            ])
+        setpoints_all = jnp.array(sp_rows, dtype=jnp.float64)   # (n_frames, 6)
+    else:
+        eta0 = ship_state.eta
+        row  = jnp.concatenate([eta0, eta0])[None, :]            # (1, 6)
+        setpoints_all = jnp.repeat(row, n_frames, axis=0)        # (n_frames, 6)
+
+    # ── Pre-compute per-frame water velocities ─────────────────────────────
+    if v_water_all is not None:
+        v_water_jax = jnp.array(v_water_all, dtype=jnp.float64)  # (n_frames, n, 2)
+    else:
+        v_water_jax = jnp.zeros((n_frames, n, 2), dtype=jnp.float64)
+
+    # ── Capture initial arrays for history prepend ─────────────────────────
+    init_positions   = np.array(state.positions)
+    init_rotations   = np.zeros(n, dtype=np.float64)
+    init_bonds       = np.ones(len(bonds), dtype=bool)
+    init_submergence = np.zeros(n, dtype=np.float64)
+
+    # ── Define the scan body ───────────────────────────────────────────────
+    def _scan_step(carry, xs):
+        """One frame of physics: (IceState, ShipState) → updated carry + outputs."""
+        state, ship_state = carry
+        setpoint_row, v_water = xs         # (6,), (n, 2)
+
+        setpoint      = setpoint_row[:3]
+        setpoint_next = setpoint_row[3:]
+        dpdem_elig    = state.dpdem_floe_eligible
+
+        state, ship_state, diag = frame_step(
+            state, ship_state, setpoint, setpoint_next, v_water, dpdem_elig,
+        )
+
+        hist = (
+            state.positions,         # (n, 2)
+            state.rotations,         # (n,)
+            state.bond_intact,       # (n_bonds,)
+            ship_state.eta,          # (3,)
+            state.submergence,       # (n,)
+            diag["J_cumul_incr"],    # scalar
+            diag["F_ice_on_ship"],   # (2,)
+        )
+        return (state, ship_state), hist
+
+    # ── Compile + run ──────────────────────────────────────────────────────
+    print(f"  [JAX-scan] Compiling & running {n_frames}-frame scan ({n} elements)...",
+          flush=True)
+    t0 = time.perf_counter()
+
+    (final_state, final_ship), histories = jax.lax.scan(
+        _scan_step,
+        (state, ship_state),
+        (setpoints_all, v_water_jax),
+    )
+    jax.block_until_ready(final_state.positions)
+
+    t_total = time.perf_counter() - t0
+    print(f"  [JAX-scan] Done in {t_total:.1f} s", flush=True)
+
+    # ── Unpack histories ───────────────────────────────────────────────────
+    pos_all, rot_all, bond_all, eta_all, sub_all, j_all, fship_all = histories
+    # shapes: (n_frames, n, 2), (n_frames, n), (n_frames, n_bonds),
+    #         (n_frames, 3),    (n_frames, n), (n_frames,), (n_frames, 2)
+
+    pos_all   = np.array(pos_all)
+    rot_all   = np.array(rot_all)
+    bond_all  = np.array(bond_all)
+    eta_all   = np.array(eta_all)
+    sub_all   = np.array(sub_all)
+    j_all     = np.array(j_all)
+    fship_all = np.array(fship_all)
+
+    # Convert to list format matching jax_simulate_ice_ship_interaction
+    positions_history   = [init_positions]   + [pos_all[f]  for f in range(n_frames)]
+    rotations_history   = [init_rotations]   + [rot_all[f]  for f in range(n_frames)]
+    bonds_history       = [init_bonds]       + [bond_all[f] for f in range(n_frames)]
+    submergence_history = [init_submergence] + [sub_all[f]  for f in range(n_frames)]
+
+    ship_history = [
+        (eta_all[f, :2].copy(), float(eta_all[f, 2]))
+        for f in range(n_frames)
+    ]
+
+    J_cumul = float(np.sum(j_all))
+    damage_summary = {"impulse_total": J_cumul}
+
+    return (
+        positions_history,
+        rotations_history,
+        bonds_history,
+        ship_history,
+        submergence_history,
+        damage_summary,
+    )
+
+
+# ── Low-level primitives for chunked/segmented simulation ─────────────────────
+
+from typing import NamedTuple as _NamedTuple
+
+
+class JaxSimContext(_NamedTuple):
+    """
+    Compiled simulation context created once, reused across chunk calls.
+
+    Holds the JIT-compiled frame_step function (already warmed up) plus
+    a pre-compiled scan_segment function that wraps jax.lax.scan so the
+    XLA program is compiled once and reused on every chunk call.
+    """
+    frame_step: object          # JIT-compiled frame step callable
+    scan_segment: object        # Compiled segment runner: (state, ship, sp_K6, vw_Kn2) -> (state, ship, hist)
+    static: IceStaticData       # Immutable static data (geometry, masses, bonds)
+    ship_dyn: object            # ShipDynamicsData
+    n: int                      # Number of ice elements
+    n_bonds: int                # Number of bonds
+    dt: float
+    chunk_size: int             # Canonical chunk length (frames per segment)
+
+
+def build_jax_sim_context(
+    polygons,
+    centroids,
+    bonds,
+    ship_pos,
+    ship_length,
+    ship_beam,
+    n_frames,
+    dt,
+    drift_vel,
+    thicknesses,
+    ship_props,
+    config=None,
+    parent_ids=None,
+    use_auto_icenav_ship: bool = False,
+    chunk_size: int = 50,
+    verbose: bool = True,
+) -> "JaxSimContext":
+    """
+    One-time setup: build static data, compile frame_step, warm up JIT.
+
+    Returns a JaxSimContext that can be passed to _run_jax_segment() and
+    simulate_jax_chunked_replan() without re-compiling on each call.
+
+    Parameters
+    ----------
+    chunk_size : int
+        The fixed scan length used by _run_jax_segment.  All segment calls
+        must use arrays of exactly this length so XLA re-uses cached kernels.
+        Pass ``replan_every_n_frames`` here.
+    """
+    cfg = config or get_default_simulation_config()
+    n = len(polygons)
+
+    if verbose:
+        print("  [JAX-ctx] Building static data...", flush=True)
+    static = build_static_data(polygons, centroids, bonds, thicknesses, parent_ids, cfg)
+    ship_dyn = build_ship_dynamics_data(ship_props, cfg, ship_length, ship_beam)
+
+    # Time-stepping parameters
+    nu_r = getattr(cfg, "poisson_ratio", 0.3)
+    E_ice = IceProperties.YOUNGS_MODULUS
+    G_shear = E_ice / (2.0 * (1.0 + nu_r))
+    rho_ice = IceProperties.ICE_DENSITY
+    r_min = float(np.array(static.radii).min())
+    b_safe = getattr(cfg, "rayleigh_safety_factor", 0.1)
+    dt_rayleigh = (
+        b_safe * np.pi * r_min / (0.163 * nu_r + 0.877)
+        * np.sqrt(rho_ice / G_shear)
+    )
+    use_rayleigh_cap = getattr(cfg, "use_rayleigh_dt_cap", False)
+    dt_ice = min(dt, dt_rayleigh) if use_rayleigh_cap else dt
+    n_ice_steps = max(1, int(round(dt / dt_ice))) if dt_ice > 0 else 1
+
+    # AutoIceNav thruster config
+    B_mat = jnp.zeros((3, 6), dtype=jnp.float64)
+    T_n_val = 1.0
+    try:
+        from medea_ice_ship.auto_icenav_ship import FossenSupply3DOF
+        _s = FossenSupply3DOF(mass=ship_props.mass, length=ship_length)
+        B_mat = jnp.array(_s.B)
+        T_n_val = _s.T_n
+    except Exception:
+        pass
+    use_auto = use_auto_icenav_ship
+
+    if verbose:
+        print("  [JAX-ctx] Compiling frame_step...", flush=True)
+    t0 = time.perf_counter()
+    frame_step = _make_frame_step(
+        static, cfg, ship_dyn,
+        ship_length, ship_beam,
+        n_ice_steps, dt, dt_ice,
+        use_auto, B_mat, T_n_val,
+    )
+
+    # Build scan_segment once so the closure is stable across all chunk calls.
+    # Defining _scan_step here (not inside _run_jax_segment) ensures JAX sees
+    # the same Python function object every time → no recompilation per chunk.
+    def _scan_step(carry, xs):
+        _state, _ship = carry
+        setpoint_row, v_water = xs          # (6,), (n, 2)
+        setpoint      = setpoint_row[:3]
+        setpoint_next = setpoint_row[3:]
+        dpdem_elig    = _state.dpdem_floe_eligible
+        _state, _ship, diag = frame_step(
+            _state, _ship, setpoint, setpoint_next, v_water, dpdem_elig,
+        )
+        hist = (
+            _state.positions,
+            _state.rotations,
+            _state.bond_intact,
+            _ship.eta,
+            _state.submergence,
+            diag["J_cumul_incr"],
+            diag["F_ice_on_ship"],
+        )
+        return (_state, _ship), hist
+
+    def scan_segment(state, ship_state, setpoints_K6, v_water_Kn2):
+        (final_state, final_ship), histories = jax.lax.scan(
+            _scan_step,
+            (state, ship_state),
+            (setpoints_K6, v_water_Kn2),
+        )
+        jax.block_until_ready(final_state.positions)
+        return final_state, final_ship, histories
+
+    # Warm-up: compile frame_step and the full scan_segment with chunk-sized data
+    _dummy_state = build_initial_ice_state(n, centroids, len(bonds), np.array(static.initial_floe_of))
+    _dummy_ship  = build_initial_ship_state(np.array(ship_pos), 0.0)
+    _dummy_vw_K  = jnp.zeros((chunk_size, n, 2), dtype=jnp.float64)
+    _dummy_eta   = _dummy_ship.eta
+    _dummy_sp_K  = jnp.tile(jnp.concatenate([_dummy_eta, _dummy_eta])[None, :], (chunk_size, 1))
+    _ = scan_segment(_dummy_state, _dummy_ship, _dummy_sp_K, _dummy_vw_K)
+    jax.block_until_ready(_[0].positions)
+    if verbose:
+        print(f"  [JAX-ctx] Compilation done in {time.perf_counter() - t0:.1f} s", flush=True)
+
+    return JaxSimContext(
+        frame_step=frame_step,
+        scan_segment=scan_segment,
+        static=static,
+        ship_dyn=ship_dyn,
+        n=n,
+        n_bonds=len(bonds),
+        dt=dt,
+        chunk_size=chunk_size,
+    )
+
+
+def _run_jax_segment(
+    ctx: JaxSimContext,
+    state: "IceState",
+    ship_state: "ShipState",
+    setpoints_K6: jnp.ndarray,   # (K, 6)  [x,y,psi, x_next,y_next,psi_next]
+    v_water_Kn2: jnp.ndarray,    # (K, n, 2)
+) -> tuple:
+    """
+    Run exactly K frames via jax.lax.scan using a pre-compiled frame_step.
+
+    K must equal ctx.chunk_size so XLA can reuse cached kernels across calls.
+
+    Returns
+    -------
+    final_state  : IceState
+    final_ship   : ShipState
+    histories    : tuple of stacked arrays (K frames):
+        (positions (K,n,2), rotations (K,n), bond_intact (K,n_bonds),
+         eta (K,3), submergence (K,n), J_cumul_incr (K,), F_ice_on_ship (K,2))
+    """
+    return ctx.scan_segment(state, ship_state, setpoints_K6, v_water_Kn2)
+
+
+def _extract_world_polygons_np(state, static):
+    """
+    Convert current IceState + IceStaticData to a list of world-frame polygon arrays.
+
+    Vectorized NumPy replacement for the Python for-loop in the replan callback
+    (jax_simulate_ice_ship_interaction L833-844).  Runs ~n× faster than the loop.
+
+    Returns
+    -------
+    world_polygons : list of (nv_i, 2) ndarray, one per element
+    """
+    pos_np   = np.array(state.positions)      # (n, 2)
+    rot_np   = np.array(state.rotations)      # (n,)
+    lp_np    = np.array(static.local_polys_padded)  # (n, max_V, 2)
+    n_verts  = np.array(static.poly_n_verts)  # (n,)
+
+    c = np.cos(rot_np)   # (n,)
+    s = np.sin(rot_np)   # (n,)
+
+    # Build (n, 2, 2) rotation matrices without a Python loop
+    R = np.stack([
+        np.stack([ c, -s], axis=1),   # (n, 2) first row
+        np.stack([ s,  c], axis=1),   # (n, 2) second row
+    ], axis=1)  # (n, 2, 2)
+
+    # Rotate all padded vertices at once: (n, max_V, 2) @ (n, 2, 2)^T + (n, 1, 2)
+    world_padded = np.einsum("nvi,nji->nvj", lp_np, R) + pos_np[:, None, :]  # (n, max_V, 2)
+
+    # Slice each element to its actual vertex count
+    world_polygons = [world_padded[i, : int(n_verts[i])] for i in range(len(n_verts))]
+    return world_polygons
+
+
+def simulate_jax_chunked_replan(
+    polygons,
+    centroids,
+    bonds,
+    ship_pos,
+    ship_length,
+    ship_beam,
+    n_frames,
+    dt,
+    drift_vel,
+    thicknesses,
+    ship_props,
+    ship_trajectory=None,
+    return_ship_diagnostics: bool = False,
+    config=None,
+    replan_every_n_frames=None,
+    replan_callback=None,
+    frame_callback=None,
+    parent_ids=None,
+    ocean_current=None,
+    goal_point=None,
+    goal_y_line=None,
+    goal_tolerance: float = 15.0,
+    use_auto_icenav_ship: bool = False,
+    verbose: bool = True,
+):
+    """
+    GPU-accelerated simulation with receding-horizon replanning.
+
+    Unlike ``jax_simulate_ice_ship_interaction`` (which has an O(N_frames)
+    Python loop), this function runs the physics in fixed-length JAX scan
+    segments of ``replan_every_n_frames`` frames, so the Python loop runs
+    only O(N_frames / replan_every_n_frames) times — one iteration per replan
+    event.  All heavy computation (physics + diffusion-MPC planning) executes
+    on the JAX device.
+
+    The interface is identical to ``jax_simulate_ice_ship_interaction`` so
+    it can be used as a drop-in replacement in ``run_medea_ship_fracture.py``.
+
+    Limitations vs. ``jax_simulate_ice_ship_interaction``
+    ------------------------------------------------------
+    * Goal-based early stopping is checked at chunk boundaries only (not
+      every frame), so the ship may overshoot by up to ``replan_every_n_frames``
+      frames.
+    * ``frame_callback`` is called once per chunk (with the final frame of
+      that chunk), not once per frame.
+    * If ``replan_every_n_frames`` is None or 0, falls back to a single-chunk
+      ``simulate_full_jax_scan`` call (no replanning).
+    """
+    cfg = config or get_default_simulation_config()
+    if ocean_current is None:
+        ocean_current = NoCurrentModel()
+
+    n = len(polygons)
+    chunk = replan_every_n_frames if (replan_every_n_frames and replan_every_n_frames > 0) else n_frames
+
+    # ── One-time setup ─────────────────────────────────────────────────────────
+    ctx = build_jax_sim_context(
+        polygons, centroids, bonds, ship_pos,
+        ship_length, ship_beam, n_frames, dt, drift_vel,
+        thicknesses, ship_props,
+        config=cfg, parent_ids=parent_ids,
+        use_auto_icenav_ship=use_auto_icenav_ship,
+        chunk_size=chunk,
+        verbose=verbose,
+    )
+
+    # ── Initial state ──────────────────────────────────────────────────────────
+    ship_start_pos  = np.array(ship_pos)
+    ship_start_head = 0.0
+    if ship_trajectory is not None and len(ship_trajectory) > 0:
+        ship_start_pos  = np.array(ship_trajectory[0][0])
+        ship_start_head = float(ship_trajectory[0][1])
+
+    state      = build_initial_ice_state(n, centroids, len(bonds), np.array(ctx.static.initial_floe_of))
+    ship_state = build_initial_ship_state(ship_start_pos, ship_start_head)
+
+    # ── History buffers ────────────────────────────────────────────────────────
+    positions_history   = [np.array(state.positions)]
+    rotations_history   = [np.array(state.rotations)]
+    bonds_history       = [np.array(state.bond_intact)]
+    submergence_history = [np.array(state.submergence)]
+    ship_history        = []
+    ship_diagnostics    = [] if return_ship_diagnostics else None
+    J_cumul             = 0.0
+
+    if verbose:
+        print(f"  [JAX-chunked] Starting {n_frames}-frame simulation "
+              f"({n} elements, chunk={chunk}, "
+              f"n_chunks={int(np.ceil(n_frames / chunk))})", flush=True)
+
+    frame_start = 0
+    use_ship_dynamics = ship_trajectory is not None
+
+    while frame_start < n_frames:
+        frame_end = min(frame_start + chunk, n_frames)
+        K = frame_end - frame_start   # actual frames in this chunk
+
+        # ── Replan callback (if any) ───────────────────────────────────────────
+        # Call at every chunk boundary including frame 0, matching the
+        # per-frame loop which evaluates the callback when frame % replan_every == 0.
+        if (
+            use_ship_dynamics
+            and replan_callback is not None
+        ):
+            world_polygons = _extract_world_polygons_np(state, ctx.static)
+            pos_np         = np.array(state.positions)
+            eta_np         = np.array(ship_state.eta)
+            n_remaining    = n_frames - frame_start
+
+            new_traj = replan_callback(
+                frame_start, world_polygons, pos_np.copy(),
+                np.array(ctx.static.thicknesses),
+                eta_np[:2].copy(), float(eta_np[2]),
+                n_remaining,
+            )
+            if new_traj is not None and len(new_traj) >= 1:
+                end_slice = frame_start + len(new_traj)
+                ship_trajectory[frame_start:end_slice] = new_traj
+                if end_slice < len(ship_trajectory):
+                    ship_trajectory[end_slice:] = [new_traj[-1]] * (len(ship_trajectory) - end_slice)
+
+        # ── Build per-frame setpoints for this chunk ───────────────────────────
+        if ship_trajectory is not None:
+            traj_len = len(ship_trajectory)
+            sp_rows = []
+            for f in range(frame_start, frame_end):
+                idx      = min(f, traj_len - 1)
+                idx_next = min(f + 1, traj_len - 1)
+                sp_pos,  sp_head  = ship_trajectory[idx]
+                sp_posn, sp_headn = ship_trajectory[idx_next]
+                sp_rows.append([
+                    float(sp_pos[0]),  float(sp_pos[1]),  float(sp_head),
+                    float(sp_posn[0]), float(sp_posn[1]), float(sp_headn),
+                ])
+            setpoints_K6 = jnp.array(sp_rows, dtype=jnp.float64)
+        else:
+            eta0 = ship_state.eta
+            row  = jnp.concatenate([eta0, eta0])[None, :]
+            setpoints_K6 = jnp.repeat(row, K, axis=0)
+
+        # ── Sample ocean current for this chunk ────────────────────────────────
+        # Use GPU-native sampling when available (avoids K × GPU↔CPU transfers).
+        # sample_chunk_jax() samples once at chunk-start positions and tiles K
+        # times — exact for static fields (No/Uniform), an O(dt_chunk) approx
+        # for slowly-evolving fields (_GridCurrentModel).
+        # LearnedCurrentModel (time-varying) falls back to the NumPy loop.
+        if hasattr(ocean_current, "sample_chunk_jax"):
+            v_water_Kn2 = ocean_current.sample_chunk_jax(
+                K, ctx.n, pos_jax=state.positions, dtype=jnp.float64,
+            )
+            for _ in range(K):
+                ocean_current.step()
+        else:
+            pos_np = np.array(state.positions)
+            v_rows = []
+            for _ in range(K):
+                v_rows.append(ocean_current.sample_batch(pos_np))
+                ocean_current.step()
+            v_water_Kn2 = jnp.array(np.stack(v_rows, axis=0), dtype=jnp.float64)
+
+        # ── If K < chunk (last short chunk), pad to chunk size for scan ────────
+        pad = chunk - K
+        if pad > 0:
+            last_sp = setpoints_K6[-1:, :]
+            setpoints_K6 = jnp.concatenate([setpoints_K6, jnp.repeat(last_sp, pad, axis=0)], axis=0)
+            last_vw = v_water_Kn2[-1:, :, :]
+            v_water_Kn2  = jnp.concatenate([v_water_Kn2,  jnp.repeat(last_vw,  pad, axis=0)], axis=0)
+
+        # ── Run the JAX scan segment ───────────────────────────────────────────
+        final_state, final_ship, hist = _run_jax_segment(
+            ctx, state, ship_state, setpoints_K6, v_water_Kn2,
+        )
+
+        # Unpack histories (shape: (chunk, ...) — trim to K)
+        pos_K, rot_K, bond_K, eta_K, sub_K, j_K, fship_K = hist
+        pos_K    = np.array(pos_K[:K])
+        rot_K    = np.array(rot_K[:K])
+        bond_K   = np.array(bond_K[:K])
+        eta_K    = np.array(eta_K[:K])
+        sub_K    = np.array(sub_K[:K])
+        j_K      = np.array(j_K[:K])
+        fship_K  = np.array(fship_K[:K])
+
+        for f in range(K):
+            positions_history.append(pos_K[f])
+            rotations_history.append(rot_K[f])
+            bonds_history.append(bond_K[f])
+            submergence_history.append(sub_K[f])
+            ship_history.append((eta_K[f, :2].copy(), float(eta_K[f, 2])))
+            J_cumul += float(j_K[f])
+
+            if return_ship_diagnostics and ship_diagnostics is not None:
+                t_frame = (frame_start + f) * dt
+                ship_diagnostics.append({
+                    "t": t_frame,
+                    "F_ice_ship": fship_K[f],
+                    "ship_pos": eta_K[f, :2].copy(),
+                    "impulse_cumul": J_cumul,
+                })
+
+        # ── Frame callback (called once with final frame of chunk) ─────────────
+        if frame_callback is not None:
+            frame_callback(
+                frame_end - 1,
+                pos_K[-1],
+                rot_K[-1],
+                bond_K[-1],
+                eta_K[-1, :2],
+                float(eta_K[-1, 2]),
+            )
+
+        # ── Goal check at chunk boundary ───────────────────────────────────────
+        ship_xy = eta_K[-1, :2]
+        if goal_y_line is not None:
+            if ship_xy[1] >= goal_y_line - goal_tolerance:
+                if verbose:
+                    print(f"  [JAX-chunked] Goal y-line reached at frame {frame_end - 1}", flush=True)
+                # Trim to the actual frame where goal was first crossed
+                for _f in range(K):
+                    if eta_K[_f, 1] >= goal_y_line - goal_tolerance:
+                        _actual = frame_start + _f + 1  # keep up to this frame
+                        positions_history   = positions_history[:_actual + 1]
+                        rotations_history   = rotations_history[:_actual + 1]
+                        bonds_history       = bonds_history[:_actual + 1]
+                        submergence_history = submergence_history[:_actual + 1]
+                        ship_history        = ship_history[:_actual]
+                        if ship_diagnostics:
+                            ship_diagnostics = ship_diagnostics[:_actual]
+                        break
+                state = final_state
+                ship_state = final_ship
+                break
+        elif goal_point is not None:
+            goal_arr = np.array(goal_point)
+            if np.linalg.norm(ship_xy - goal_arr) <= goal_tolerance:
+                if verbose:
+                    print(f"  [JAX-chunked] Goal point reached at frame {frame_end - 1}", flush=True)
+                state = final_state
+                ship_state = final_ship
+                break
+
+        state      = final_state
+        ship_state = final_ship
+        frame_start = frame_end
+
+    # ── Build return value ─────────────────────────────────────────────────────
     damage_summary = {"impulse_total": J_cumul}
 
     if return_ship_diagnostics:

@@ -29,6 +29,31 @@ class OceanCurrentModel(ABC):
         """Return (n, 2) water velocities for (n, 2) world positions."""
         return np.array([self.sample(p[0], p[1]) for p in positions])
 
+    def sample_chunk_jax(self, K: int, n: int, pos_jax=None, dtype=None):
+        """Return (K, n, 2) JAX array of water velocities for a chunk of K frames.
+
+        Default: samples once at *pos_jax* positions (or zeros if None) and
+        tiles the result K times — correct for static current fields.
+        Time-varying subclasses (LearnedCurrentModel) should override if
+        per-frame accuracy is required; the base implementation is a
+        conservative-but-correct approximation for any model.
+
+        Parameters
+        ----------
+        K       : number of frames in the chunk
+        n       : number of ice elements
+        pos_jax : JAX (n, 2) array of ice positions at chunk start, or None
+        dtype   : JAX dtype (default jnp.float64)
+        """
+        import jax.numpy as jnp
+        dt = dtype if dtype is not None else jnp.float64
+        if pos_jax is not None:
+            pos_np = np.array(pos_jax)                      # one GPU→CPU transfer
+            v_np = self.sample_batch(pos_np)                # (n, 2) NumPy
+            v_jax = jnp.array(v_np, dtype=dt)               # CPU→GPU
+            return jnp.broadcast_to(v_jax[None, :, :], (K, n, 2))
+        return jnp.zeros((K, n, 2), dtype=dt)
+
     def step(self):
         """Advance internal state by one simulation frame (no-op for static models)."""
 
@@ -68,6 +93,12 @@ class NoCurrentModel(OceanCurrentModel):
     def sample_batch(self, positions: np.ndarray) -> np.ndarray:
         return np.zeros_like(positions)
 
+    def sample_chunk_jax(self, K: int, n: int, pos_jax=None, dtype=None):
+        """Return (K, n, 2) zeros on the JAX device — no host-device transfer."""
+        import jax.numpy as jnp
+        dt = dtype if dtype is not None else jnp.float64
+        return jnp.zeros((K, n, 2), dtype=dt)
+
     def get_field_for_viz(self, *args, **kwargs):
         return None
 
@@ -97,6 +128,13 @@ class UniformCurrentModel(OceanCurrentModel):
 
     def sample_batch(self, positions: np.ndarray) -> np.ndarray:
         return np.tile(self.velocity, (len(positions), 1))
+
+    def sample_chunk_jax(self, K: int, n: int, pos_jax=None, dtype=None):
+        """Return (K, n, 2) broadcast of the constant velocity — no position needed."""
+        import jax.numpy as jnp
+        dt = dtype if dtype is not None else jnp.float64
+        vel_jax = jnp.array(self.velocity, dtype=dt)   # (2,)
+        return jnp.broadcast_to(vel_jax[None, None, :], (K, n, 2))
 
 
 # ── Grid (internal, used by LearnedCurrentModel) ─────────────────────────
@@ -140,6 +178,21 @@ class _GridCurrentModel(OceanCurrentModel):
 
     def update_field(self, new_field: np.ndarray):
         self.field = np.asarray(new_field, dtype=np.float64)
+
+    def sample_chunk_jax(self, K: int, n: int, pos_jax=None, dtype=None):
+        """Sample at chunk-start positions; tile K times (static-field approximation).
+
+        Uses one GPU→CPU transfer instead of K, then broadcasts the result.
+        For LearnedCurrentModel the field evolves; see that class for overrides.
+        """
+        import jax.numpy as jnp
+        dt = dtype if dtype is not None else jnp.float64
+        if pos_jax is not None:
+            pos_np = np.array(pos_jax)                  # one GPU→CPU transfer
+            v_np = self.sample_batch(pos_np)             # (n, 2) bilinear NumPy
+            v_jax = jnp.array(v_np, dtype=dt)           # CPU→GPU (n, 2)
+            return jnp.broadcast_to(v_jax[None, :, :], (K, n, 2))
+        return jnp.zeros((K, n, 2), dtype=dt)
 
 
 # ── Learned (SeaCurrentRNN) ──────────────────────────────────────────────

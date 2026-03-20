@@ -872,39 +872,67 @@ def main():
         def _replan_callback(frame, world_polygons, centroids, thicknesses, ship_pos_f, ship_heading_f, n_remaining):
             # Rebuild costmap from current ice state (counted as additional planning time)
             t0_cost = time.time()
-            all_verts = np.vstack(world_polygons)
-            x_min_f = float(all_verts[:, 0].min())
-            x_max_f = float(all_verts[:, 0].max())
-            y_min_f = float(all_verts[:, 1].min())
-            y_max_f = float(all_verts[:, 1].max())
-            if args.full_map:
-                x_min_f = max(x_min_f, -DOMAIN_LIMIT)
-                x_max_f = min(x_max_f,  DOMAIN_LIMIT)
-                y_min_f = max(y_min_f, -DOMAIN_LIMIT)
-                y_max_f = min(y_max_f,  DOMAIN_LIMIT)
-            _wall_f = (x_min_f, x_max_f, y_min_f, y_max_f) if args.full_map else None
-            cost_map_f, _ = build_costmap_from_ice_state(
-                world_polygons, centroids, thicknesses,
-                x_min_f, x_max_f, y_min_f, y_max_f,
-                resolution=plan_cfg.planning_resolution,
-                margin=plan_cfg.planning_margin,
-                ship_mass=plan_cfg.ship_displacement,
-                collision_cost=plan_cfg.planning_ice_collision_cost,
-                damage_cost_scale=plan_cfg.planning_damage_cost_scale,
-                damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
-                wall_bounds=_wall_f,
-                ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
-                ship_length=ship_length,
-                ship_beam=ship_beam,
-                planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
-                ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
-                ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
-                use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
-                ship_speed=_ship_speed,
-                ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
-                obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
-                ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 1.0),
-            )
+            # GPU-native costmap: use JAX disk-rasterization when running --jax-sim.
+            # Avoids slow CPU OpenCV polygon rasterization; `radii` from outer scope
+            # is constant (fracture only breaks bonds, not polygon geometry).
+            # Bounds computed from centroids+radii (no need for world_polygons vstack).
+            if getattr(args, 'jax_sim', False):
+                if args.full_map:
+                    x_min_f, x_max_f = -DOMAIN_LIMIT, DOMAIN_LIMIT
+                    y_min_f, y_max_f = -DOMAIN_LIMIT, DOMAIN_LIMIT
+                else:
+                    _r_max = float(radii.max())
+                    x_min_f = float(centroids[:, 0].min()) - _r_max
+                    x_max_f = float(centroids[:, 0].max()) + _r_max
+                    y_min_f = float(centroids[:, 1].min()) - _r_max
+                    y_max_f = float(centroids[:, 1].max()) + _r_max
+                from medea_ice_ship.jax_costmap import build_costmap_jax
+                cost_map_f, _ = build_costmap_jax(
+                    centroids, thicknesses, radii,
+                    x_min_f, x_max_f, y_min_f, y_max_f,
+                    resolution=plan_cfg.planning_resolution,
+                    margin=plan_cfg.planning_margin,
+                    collision_cost=plan_cfg.planning_ice_collision_cost,
+                    ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
+                    obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
+                    ship_length=ship_length,
+                    ship_beam=ship_beam,
+                    planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
+                )
+            else:
+                all_verts = np.vstack(world_polygons)
+                x_min_f = float(all_verts[:, 0].min())
+                x_max_f = float(all_verts[:, 0].max())
+                y_min_f = float(all_verts[:, 1].min())
+                y_max_f = float(all_verts[:, 1].max())
+                if args.full_map:
+                    x_min_f = max(x_min_f, -DOMAIN_LIMIT)
+                    x_max_f = min(x_max_f,  DOMAIN_LIMIT)
+                    y_min_f = max(y_min_f, -DOMAIN_LIMIT)
+                    y_max_f = min(y_max_f,  DOMAIN_LIMIT)
+                _wall_f = (x_min_f, x_max_f, y_min_f, y_max_f) if args.full_map else None
+                cost_map_f, _ = build_costmap_from_ice_state(
+                    world_polygons, centroids, thicknesses,
+                    x_min_f, x_max_f, y_min_f, y_max_f,
+                    resolution=plan_cfg.planning_resolution,
+                    margin=plan_cfg.planning_margin,
+                    ship_mass=plan_cfg.ship_displacement,
+                    collision_cost=plan_cfg.planning_ice_collision_cost,
+                    damage_cost_scale=plan_cfg.planning_damage_cost_scale,
+                    damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
+                    wall_bounds=_wall_f,
+                    ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
+                    ship_length=ship_length,
+                    ship_beam=ship_beam,
+                    planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
+                    ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
+                    ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
+                    use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
+                    ship_speed=_ship_speed,
+                    ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
+                    obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
+                    ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 1.0),
+                )
             diag["costmap"] += time.time() - t0_cost
             costmap_snapshots.append((frame, cost_map_f))
             start_f = (float(ship_pos_f[0]), float(ship_pos_f[1]), float(ship_heading_f))
@@ -1062,9 +1090,101 @@ def main():
         use_auto_icenav_ship=getattr(args, 'auto_icenav_ship', False),
     )
     if _use_jax_sim:
-        from medea_ice_ship.jax_simulation import jax_simulate_ice_ship_interaction
-        print("  [JAX] XLA compilation on first frame — may take up to ~60s...", flush=True)
-        sim_result = jax_simulate_ice_ship_interaction(**_sim_kwargs)
+        _kinematic = _sim_kwargs.get("kinematic_ship", False)
+        _has_replan = replan_callback is not None
+        if _has_replan and not _kinematic:
+            # ── GPU-accelerated chunked replan path ────────────────────────────
+            # Runs physics in fixed-length jax.lax.scan segments between replan
+            # events, reducing Python overhead from O(N_frames) → O(N_replans).
+            from medea_ice_ship.jax_simulation import simulate_jax_chunked_replan
+            print("  [JAX-chunked] Using chunked-replan path "
+                  f"(chunk={replan_every_n_frames} frames)...", flush=True)
+            _chunked_kwargs = dict(
+                polygons=_sim_kwargs["polygons"],
+                centroids=_sim_kwargs["centroids"],
+                bonds=_sim_kwargs["bonds"],
+                ship_pos=_sim_kwargs["ship_pos"],
+                ship_length=_sim_kwargs["ship_length"],
+                ship_beam=_sim_kwargs["ship_beam"],
+                n_frames=_sim_kwargs["n_frames"],
+                dt=_sim_kwargs["dt"],
+                drift_vel=_sim_kwargs["drift_vel"],
+                thicknesses=_sim_kwargs["thicknesses"],
+                ship_props=_sim_kwargs["ship_props"],
+                ship_trajectory=_sim_kwargs["ship_trajectory"],
+                return_ship_diagnostics=_sim_kwargs.get("return_ship_diagnostics", False),
+                config=_sim_kwargs.get("config"),
+                replan_every_n_frames=replan_every_n_frames,
+                replan_callback=replan_callback,
+                frame_callback=_sim_kwargs.get("frame_callback"),
+                parent_ids=_sim_kwargs.get("parent_ids"),
+                ocean_current=_sim_kwargs.get("ocean_current"),
+                goal_point=_sim_kwargs.get("goal_point"),
+                goal_y_line=_sim_kwargs.get("goal_y_line"),
+                goal_tolerance=_sim_kwargs.get("goal_tolerance", 15.0),
+                use_auto_icenav_ship=_sim_kwargs.get("use_auto_icenav_ship", False),
+            )
+            sim_result = simulate_jax_chunked_replan(**_chunked_kwargs)
+        else:
+            # ── Full JAX scan path (no replanning or kinematic ship) ─────────
+            # Uses jax.lax.scan over ALL frames in a single XLA program,
+            # eliminating per-frame Python overhead and GPU sync entirely.
+            from medea_ice_ship.jax_simulation import simulate_full_jax_scan
+            _oc = _sim_kwargs.get("ocean_current")
+            _n_ice = len(_sim_kwargs["centroids"])
+            # Pre-compute ocean current: sample_chunk_jax(n_frames, n) gives
+            # (n_frames, n, 2). Pass None for NoCurrentModel (scan uses zeros).
+            if _oc is not None and hasattr(_oc, "sample_chunk_jax") and _oc.is_active:
+                _v_water_all = _oc.sample_chunk_jax(
+                    _sim_kwargs["n_frames"], _n_ice,
+                    pos_jax=None, dtype=None,
+                )
+            else:
+                _v_water_all = None  # simulate_full_jax_scan defaults to zeros
+            print("  [JAX-scan] Compiling full-scan program "
+                  "(first call ~30-60s, subsequent calls fast)...", flush=True)
+            sim_result = simulate_full_jax_scan(
+                polygons=_sim_kwargs["polygons"],
+                centroids=_sim_kwargs["centroids"],
+                bonds=_sim_kwargs["bonds"],
+                ship_pos=_sim_kwargs["ship_pos"],
+                ship_length=_sim_kwargs["ship_length"],
+                ship_beam=_sim_kwargs["ship_beam"],
+                n_frames=_sim_kwargs["n_frames"],
+                dt=_sim_kwargs["dt"],
+                drift_vel=_sim_kwargs["drift_vel"],
+                thicknesses=_sim_kwargs["thicknesses"],
+                ship_props=_sim_kwargs["ship_props"],
+                ship_trajectory=_sim_kwargs.get("ship_trajectory"),
+                config=_sim_kwargs.get("config"),
+                parent_ids=_sim_kwargs.get("parent_ids"),
+                v_water_all=_v_water_all,
+                use_auto_icenav_ship=_sim_kwargs.get("use_auto_icenav_ship", False),
+            )
+            # Post-process: trim to goal if early-stopping was requested
+            _goal_y  = _sim_kwargs.get("goal_y_line")
+            _goal_pt = _sim_kwargs.get("goal_point")
+            _goal_tol_val = _sim_kwargs.get("goal_tolerance", 15.0)
+            _sh_hist = sim_result[3]
+            if _goal_y is not None or _goal_pt is not None:
+                for _f, (_spos, _spsi) in enumerate(_sh_hist):
+                    _stop = False
+                    if _goal_y is not None and _spos[1] >= _goal_y - _goal_tol_val:
+                        _stop = True
+                    elif _goal_pt is not None:
+                        if np.linalg.norm(np.array(_spos) - np.array(_goal_pt)) <= _goal_tol_val:
+                            _stop = True
+                    if _stop:
+                        _trim = _f + 2   # +1 for frame index, +1 for initial entry
+                        sim_result = (
+                            sim_result[0][:_trim],
+                            sim_result[1][:_trim],
+                            sim_result[2][:_trim],
+                            sim_result[3][:_f + 1],
+                            sim_result[4][:_trim] if len(sim_result) > 4 else [],
+                            sim_result[5] if len(sim_result) > 5 else {},
+                        )
+                        break
     else:
         sim_result = simulate_ice_ship_interaction(**_sim_kwargs)
     positions_history = sim_result[0]
