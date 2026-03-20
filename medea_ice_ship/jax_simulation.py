@@ -1347,6 +1347,24 @@ def _run_jax_segment(
     return ctx.scan_segment(state, ship_state, setpoints_K6, v_water_Kn2)
 
 
+def _trajectory_list_to_arr(traj_list) -> np.ndarray:
+    """
+    Convert a ship trajectory from list-of-tuples to a (N, 3) float64 array.
+
+    Parameters
+    ----------
+    traj_list : list of (array_like position_2d, float heading)
+
+    Returns
+    -------
+    (N, 3) float64 ndarray, each row [x, y, heading].
+    """
+    return np.array(
+        [[float(p[0]), float(p[1]), float(h)] for p, h in traj_list],
+        dtype=np.float64,
+    )
+
+
 def _extract_world_polygons_np(state, static):
     """
     Convert current IceState + IceStaticData to a list of world-frame polygon arrays.
@@ -1404,6 +1422,7 @@ def simulate_jax_chunked_replan(
     goal_y_line=None,
     goal_tolerance: float = 15.0,
     use_auto_icenav_ship: bool = False,
+    skip_polygon_extraction: bool = False,
     verbose: bool = True,
 ):
     """
@@ -1447,12 +1466,22 @@ def simulate_jax_chunked_replan(
         verbose=verbose,
     )
 
+    # ── Normalize trajectory to (N, 3) float64 array ───────────────────────────
+    # Accepts either a list-of-tuples (legacy) or an ndarray.
+    # Working with an array lets us build setpoints via fancy indexing (O(1)
+    # Python overhead per chunk) rather than a K-iteration Python for-loop.
+    if ship_trajectory is not None:
+        if isinstance(ship_trajectory, (list, tuple)):
+            ship_trajectory = _trajectory_list_to_arr(ship_trajectory)
+        else:
+            ship_trajectory = np.asarray(ship_trajectory, dtype=np.float64)
+
     # ── Initial state ──────────────────────────────────────────────────────────
     ship_start_pos  = np.array(ship_pos)
     ship_start_head = 0.0
     if ship_trajectory is not None and len(ship_trajectory) > 0:
-        ship_start_pos  = np.array(ship_trajectory[0][0])
-        ship_start_head = float(ship_trajectory[0][1])
+        ship_start_pos  = ship_trajectory[0, :2].copy()
+        ship_start_head = float(ship_trajectory[0, 2])
 
     state      = build_initial_ice_state(n, centroids, len(bonds), np.array(ctx.static.initial_floe_of))
     ship_state = build_initial_ship_state(ship_start_pos, ship_start_head)
@@ -1473,6 +1502,8 @@ def simulate_jax_chunked_replan(
 
     frame_start = 0
     use_ship_dynamics = ship_trajectory is not None
+    _physics_scan_time = 0.0   # cumulative wall-clock time inside _run_jax_segment
+    _physics_scan_calls = 0    # number of scan segment calls
 
     while frame_start < n_frames:
         frame_end = min(frame_start + chunk, n_frames)
@@ -1485,10 +1516,16 @@ def simulate_jax_chunked_replan(
             use_ship_dynamics
             and replan_callback is not None
         ):
-            world_polygons = _extract_world_polygons_np(state, ctx.static)
-            pos_np         = np.array(state.positions)
-            eta_np         = np.array(ship_state.eta)
-            n_remaining    = n_frames - frame_start
+            # skip_polygon_extraction=True avoids the GPU→CPU transfer of all
+            # vertex positions; the JAX costmap path (--jax-sim) only needs
+            # centroids (state.positions), not full world-frame polygons.
+            if skip_polygon_extraction:
+                world_polygons = None
+            else:
+                world_polygons = _extract_world_polygons_np(state, ctx.static)
+            pos_np      = np.array(state.positions)
+            eta_np      = np.array(ship_state.eta)
+            n_remaining = n_frames - frame_start
 
             new_traj = replan_callback(
                 frame_start, world_polygons, pos_np.copy(),
@@ -1497,25 +1534,29 @@ def simulate_jax_chunked_replan(
                 n_remaining,
             )
             if new_traj is not None and len(new_traj) >= 1:
+                # Normalize returned trajectory to (M, 3) array
+                if isinstance(new_traj, (list, tuple)):
+                    new_traj = _trajectory_list_to_arr(new_traj)
+                else:
+                    new_traj = np.asarray(new_traj, dtype=np.float64)
                 end_slice = frame_start + len(new_traj)
                 ship_trajectory[frame_start:end_slice] = new_traj
                 if end_slice < len(ship_trajectory):
-                    ship_trajectory[end_slice:] = [new_traj[-1]] * (len(ship_trajectory) - end_slice)
+                    ship_trajectory[end_slice:] = new_traj[-1]
 
         # ── Build per-frame setpoints for this chunk ───────────────────────────
         if ship_trajectory is not None:
+            # Vectorized: fancy-index into (N, 3) trajectory array.
+            # ship_trajectory is guaranteed to be an ndarray after normalization above.
             traj_len = len(ship_trajectory)
-            sp_rows = []
-            for f in range(frame_start, frame_end):
-                idx      = min(f, traj_len - 1)
-                idx_next = min(f + 1, traj_len - 1)
-                sp_pos,  sp_head  = ship_trajectory[idx]
-                sp_posn, sp_headn = ship_trajectory[idx_next]
-                sp_rows.append([
-                    float(sp_pos[0]),  float(sp_pos[1]),  float(sp_head),
-                    float(sp_posn[0]), float(sp_posn[1]), float(sp_headn),
-                ])
-            setpoints_K6 = jnp.array(sp_rows, dtype=jnp.float64)
+            frames   = np.arange(frame_start, frame_end)
+            idx      = np.minimum(frames, traj_len - 1)
+            idx_next = np.minimum(frames + 1, traj_len - 1)
+            sp_cur   = ship_trajectory[idx]       # (K, 3): [x, y, heading]
+            sp_nxt   = ship_trajectory[idx_next]  # (K, 3)
+            setpoints_K6 = jnp.array(
+                np.concatenate([sp_cur, sp_nxt], axis=1), dtype=jnp.float64
+            )  # (K, 6)
         else:
             eta0 = ship_state.eta
             row  = jnp.concatenate([eta0, eta0])[None, :]
@@ -1550,9 +1591,12 @@ def simulate_jax_chunked_replan(
             v_water_Kn2  = jnp.concatenate([v_water_Kn2,  jnp.repeat(last_vw,  pad, axis=0)], axis=0)
 
         # ── Run the JAX scan segment ───────────────────────────────────────────
+        _t_scan = time.perf_counter()
         final_state, final_ship, hist = _run_jax_segment(
             ctx, state, ship_state, setpoints_K6, v_water_Kn2,
         )
+        _physics_scan_time += time.perf_counter() - _t_scan
+        _physics_scan_calls += 1
 
         # Unpack histories (shape: (chunk, ...) — trim to K)
         pos_K, rot_K, bond_K, eta_K, sub_K, j_K, fship_K = hist
@@ -1598,18 +1642,19 @@ def simulate_jax_chunked_replan(
             if ship_xy[1] >= goal_y_line - goal_tolerance:
                 if verbose:
                     print(f"  [JAX-chunked] Goal y-line reached at frame {frame_end - 1}", flush=True)
-                # Trim to the actual frame where goal was first crossed
-                for _f in range(K):
-                    if eta_K[_f, 1] >= goal_y_line - goal_tolerance:
-                        _actual = frame_start + _f + 1  # keep up to this frame
-                        positions_history   = positions_history[:_actual + 1]
-                        rotations_history   = rotations_history[:_actual + 1]
-                        bonds_history       = bonds_history[:_actual + 1]
-                        submergence_history = submergence_history[:_actual + 1]
-                        ship_history        = ship_history[:_actual]
-                        if ship_diagnostics:
-                            ship_diagnostics = ship_diagnostics[:_actual]
-                        break
+                # Find the first frame in this chunk where the goal was crossed.
+                # np.argmax on a boolean array returns the index of the first True
+                # (or 0 if none — guarded by the outer if-check above).
+                crossed = eta_K[:, 1] >= goal_y_line - goal_tolerance
+                _f = int(np.argmax(crossed))
+                _actual = frame_start + _f + 1  # keep up to and including this frame
+                positions_history   = positions_history[:_actual + 1]
+                rotations_history   = rotations_history[:_actual + 1]
+                bonds_history       = bonds_history[:_actual + 1]
+                submergence_history = submergence_history[:_actual + 1]
+                ship_history        = ship_history[:_actual]
+                if ship_diagnostics:
+                    ship_diagnostics = ship_diagnostics[:_actual]
                 state = final_state
                 ship_state = final_ship
                 break
@@ -1625,6 +1670,28 @@ def simulate_jax_chunked_replan(
         state      = final_state
         ship_state = final_ship
         frame_start = frame_end
+
+    # ── Physics timing report ──────────────────────────────────────────────────
+    if _physics_scan_calls > 0:
+        _total_scan_frames = _physics_scan_calls * chunk
+        _ms_per_frame = 1000.0 * _physics_scan_time / _total_scan_frames
+        print(
+            f"  [JAX-physics] {_physics_scan_calls} scan segments × {chunk} frames/segment "
+            f"= {_total_scan_frames} GPU frame-steps",
+            flush=True,
+        )
+        print(
+            f"  [JAX-physics] Total scan time: {_physics_scan_time:.3f}s  |  "
+            f"Avg per segment: {1000*_physics_scan_time/_physics_scan_calls:.1f}ms  |  "
+            f"Avg per frame: {_ms_per_frame:.3f}ms",
+            flush=True,
+        )
+        print(
+            f"  [JAX-physics] Extrapolation → 15 000 frame_step calls: "
+            f"{15000 * _ms_per_frame / 1000:.1f}s  "
+            f"(sequential, no vmap parallelism)",
+            flush=True,
+        )
 
     # ── Build return value ─────────────────────────────────────────────────────
     damage_summary = {"impulse_total": J_cumul}

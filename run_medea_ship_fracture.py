@@ -222,6 +222,7 @@ def main():
         optimize_with_gradcem,
         optimize_speed_profile,
         path_to_ship_trajectory,
+        path_to_ship_trajectory_arr,
         create_ocean_current_model,
     )
     from medea_ice_ship.config import RunConfig, get_default_run_config, get_default_simulation_config
@@ -785,8 +786,8 @@ def main():
             n_frames = max(10, int(np.ceil(total_time / run_cfg.dt)))
             avg_v = float(np.sum(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)) / total_time) if total_time > 0 else v_ref
             print(f"  Speed optimization: {len(speed_profile)} segments, total time {total_time:.1f}s, n_frames={n_frames}, avg speed {avg_v:.2f} m/s (range {speed_profile.min():.2f}-{speed_profile.max():.2f})", flush=True)
-        ship_trajectory = path_to_ship_trajectory(path, n_frames, speed_profile=speed_profile)
-        ship_pos = ship_trajectory[0][0]
+        ship_trajectory = path_to_ship_trajectory_arr(path, n_frames, speed_profile=speed_profile)
+        ship_pos = ship_trajectory[0, :2]
         planned_path = path
         planned_cost_map = cost_map
         planned_bounds = bounds
@@ -992,7 +993,7 @@ def main():
                 if T_raw > 1e-9:
                     alpha = T_raw / T_target
                     sp_f = np.maximum(sp_f * alpha, 1e-6)
-            return path_to_ship_trajectory(path_f, n_remaining, speed_profile=sp_f)
+            return path_to_ship_trajectory_arr(path_f, n_remaining, speed_profile=sp_f)
 
         if args.no_replan:
             replan_callback = None
@@ -1068,7 +1069,12 @@ def main():
           f"{' [JAX backend]' if _use_jax_sim else ''}...", flush=True)
     _goal_point = None
     if goal_y_line is None and ship_trajectory is not None and len(ship_trajectory) > 0:
-        _goal_point = tuple(ship_trajectory[-1][0])
+        # ship_trajectory may be a (N, 3) array or a list-of-tuples (legacy)
+        last = ship_trajectory[-1]
+        if isinstance(last, np.ndarray) and last.ndim == 1:
+            _goal_point = tuple(last[:2])  # array format: row [x, y, heading]
+        else:
+            _goal_point = tuple(last[0])   # list-of-tuples format: (pos_2d, heading)
     _goal_tol = 15.0  # metres for early-stop (goal reached) check
     _sim_kwargs = dict(
         polygons=polygons, centroids=centroids.copy(), bonds=bonds,
@@ -1123,6 +1129,9 @@ def main():
                 goal_y_line=_sim_kwargs.get("goal_y_line"),
                 goal_tolerance=_sim_kwargs.get("goal_tolerance", 15.0),
                 use_auto_icenav_ship=_sim_kwargs.get("use_auto_icenav_ship", False),
+                # --jax-sim uses build_costmap_jax (takes centroids directly),
+                # so world-polygon extraction is not needed — skip the GPU→CPU transfer.
+                skip_polygon_extraction=True,
             )
             sim_result = simulate_jax_chunked_replan(**_chunked_kwargs)
         else:

@@ -578,3 +578,84 @@ def path_to_ship_trajectory(
 
     return trajectory
 
+
+def path_to_ship_trajectory_arr(
+    path: np.ndarray,
+    n_frames: int,
+    speed_profile: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Vectorized version of path_to_ship_trajectory.
+
+    Returns a (n_frames + 1, 3) float64 array where each row is [x, y, heading],
+    instead of a list of (position_2d, heading) tuples.  Semantics are identical
+    to path_to_ship_trajectory; this version replaces the Python for-loop with
+    fully-vectorized NumPy operations (searchsorted + fancy indexing) which is
+    O(1) in Python overhead regardless of n_frames.
+
+    Args:
+        path: (N, 3) array [x, y, heading] in world coordinates.
+        n_frames: Number of simulation frames; output has n_frames + 1 rows.
+        speed_profile: Optional (N-1,) array of speed per segment [m/s].
+
+    Returns:
+        (n_frames + 1, 3) float64 ndarray.  Row 0 == path[0], row -1 == path[-1].
+    """
+    path = np.asarray(path, dtype=np.float64)
+    if path.ndim != 2 or path.shape[1] != 3:
+        raise ValueError(f"path must have shape (N, 3), got {path.shape}")
+    n_pts = path.shape[0]
+
+    if n_pts < 2:
+        return np.tile(path[0], (n_frames + 1, 1))
+
+    seg_lens = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)  # (n_pts-1,)
+    s = np.zeros(n_pts)
+    s[1:] = np.cumsum(seg_lens)
+    S = s[-1]
+
+    if S <= 0:
+        return np.tile(path[0], (n_frames + 1, 1))
+
+    # Build normalized parameter arrays (both in [0, 1])
+    if speed_profile is not None and len(speed_profile) == len(seg_lens):
+        v = np.maximum(speed_profile, 1e-6)
+        seg_times = seg_lens / v                     # (n_pts-1,) time per segment
+        T_total = float(np.sum(seg_times))
+        param = np.zeros(n_pts)
+        param[1:] = np.cumsum(seg_times)             # cumulative time at waypoints
+        param /= T_total                             # normalize to [0, 1]
+        seg_denom = seg_times / T_total              # normalized segment durations
+    else:
+        param = s / S                                # normalized arc length
+        seg_denom = seg_lens / S                     # normalized segment lengths
+
+    # Vectorize over k = 0 .. n_frames
+    k = np.arange(n_frames + 1, dtype=np.float64)
+    target = k / n_frames                            # normalized target in [0, 1]
+
+    # Segment index for each frame
+    i_arr = np.searchsorted(param, target, side="right") - 1
+    i_arr = np.clip(i_arr, 0, n_pts - 2)
+
+    # Fraction within the segment
+    denom = seg_denom[i_arr]
+    frac = np.where(denom > 0, (target - param[i_arr]) / denom, 1.0)
+    frac = np.clip(frac, 0.0, 1.0)
+
+    # Vectorized position interpolation
+    x = (1.0 - frac) * path[i_arr, 0] + frac * path[i_arr + 1, 0]
+    y = (1.0 - frac) * path[i_arr, 1] + frac * path[i_arr + 1, 1]
+
+    # Vectorized heading interpolation with wrapping into (-π, π]
+    da = (path[i_arr + 1, 2] - path[i_arr, 2] + np.pi) % (2.0 * np.pi) - np.pi
+    heading = (path[i_arr, 2] + frac * da + np.pi) % (2.0 * np.pi) - np.pi
+
+    result = np.stack([x, y, heading], axis=1)
+
+    # Exact endpoints (override boundary interpolation errors)
+    result[0]  = path[0]
+    result[-1] = path[-1]
+
+    return result
+

@@ -34,6 +34,7 @@ from medea_ice_ship.planning import (
     optimize_with_gradcem,
     optimize_speed_profile,
     path_to_ship_trajectory,
+    path_to_ship_trajectory_arr,
 )
 
 __all__ = [
@@ -80,5 +81,6 @@ __all__ = [
     'optimize_with_gradcem',
     'optimize_speed_profile',
     'path_to_ship_trajectory',
+    'path_to_ship_trajectory_arr',
     'create_ocean_current_model',
 ]
