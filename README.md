@@ -6,7 +6,7 @@ Implementation of ice–ship interaction simulation based on:
 
 > Wang et al. (2024) — *Interaction between ice cover and floating platform simulated by dilated-polyhedron-based DEM* — Ocean Engineering 301
 
-The main entry point is **MEDEA ship–ice fracture**: satellite-derived ice floes (MEDEA Fram Strait) with DPDEM-style bond fracture and ship–ice interaction. The run script supports several toy scenarios, two planners (lattice A* and diffusion-MPC), and multiple visualizations.
+The main entry point is **MEDEA ship–ice fracture**: satellite-derived ice floes (MEDEA Fram Strait) with DPDEM-style bond fracture and ship–ice interaction. The physics are fully **JAX-accelerated** (JIT-compiled, GPU/TPU-ready via `jax.lax.scan`). The run script supports several toy scenarios, five planners (lattice A*, diffusion-MPC, MPPI, SQP, GradCEM), and multiple visualizations.
 
 ---
 
@@ -62,7 +62,7 @@ uv sync
 # Simple synthetic ice field (3 floes, straight path, fast)
 uv run python run_medea_ship_fracture.py --simple
 
-# Same with planned path through ice (lattice A*)
+# Same with planned path through ice (diffusion-MPC, cold start)
 uv run python run_medea_ship_fracture.py --simple --plan
 ```
 
@@ -107,26 +107,30 @@ uv run python run_medea_ship_fracture.py --simple --plan --planner lattice
 - **Generated:** 2D animation, 3D animation, **lattice search movie** (A* expansion), **costmap movie** (costmap + planned path in red, actual path in blue), hull impact plot when applicable.
 - Skip lattice search movie: add `--no-lattice-search-movie`.
 
-### 4. Diffusion planner (lattice + model-based diffusion)
+### 4. Diffusion-MPC planner (default)
 
-Same scenario but refine the lattice path with **model-based diffusion** (control optimization with 3-DOF dynamics and costmap).
+Plan and optimize control sequences using **model-based diffusion** (3-DOF dynamics and costmap). This is the default planner — `--plan` alone uses it.
 
 ```bash
-uv run python run_medea_ship_fracture.py --simple --plan --planner diffusion-mpc
+# Cold start (default): diffusion runs from scratch, no A* warm-start
+uv run python run_medea_ship_fracture.py --simple --plan
+
+# Warm start: run A* first, use result to seed diffusion
+uv run python run_medea_ship_fracture.py --simple --plan --warm-start
 ```
 
-- **Planner:** Lattice A* (initial path) then model-based diffusion refinement.
-- **Generated:** Same as lattice (2D, 3D, costmap movie, hull impact) but **no** lattice search movie (search is not visualized for diffusion runs).
+- **Planner:** Model-based diffusion over control sequences (3-DOF dynamics, costmap, path/waypoint rewards). Fully JAX/GPU-accelerated.
+- **Generated:** 2D, 3D, costmap movie, hull impact plot.
 
-### 4b. MPPI planner (lattice + Model Predictive Path Integral)
+### 4b. MPPI planner (Model Predictive Path Integral)
 
-Same pipeline as diffusion-MPC but uses **MPPI** (importance-weighted sampling with fixed-variance noise) instead of diffusion annealing. Same cost function (accumulated costmap + arc length + goal).
+Same pipeline as diffusion-MPC but uses **MPPI** (importance-weighted sampling with fixed-variance noise). Same cost function (accumulated costmap + arc length + goal).
 
 ```bash
 uv run python run_medea_ship_fracture.py --simple --plan --planner mppi
 ```
 
-- **Planner:** Lattice A* (initial path) then MPPI refinement (JAX, GPU-friendly).
+- **Planner:** MPPI (JAX, GPU-friendly). Cold start by default; add `--warm-start` for A* seed.
 
 ### 5. Kinematic ship (path verification)
 
@@ -136,8 +140,8 @@ Ship is placed exactly on the planned path each frame (no dynamics). Use to chec
 # Lattice plan, kinematic execution
 uv run python run_medea_ship_fracture.py --simple --plan --planner lattice --kinematic-ship
 
-# Diffusion or MPPI plan, kinematic execution
-uv run python run_medea_ship_fracture.py --simple --plan --planner diffusion-mpc --kinematic-ship
+# Diffusion-MPC or MPPI plan, kinematic execution
+uv run python run_medea_ship_fracture.py --simple --plan --kinematic-ship
 uv run python run_medea_ship_fracture.py --simple --plan --planner mppi --kinematic-ship
 ```
 
@@ -150,7 +154,7 @@ Use the full satellite ice map; ship goes diagonal bottom-left → top-right. Re
 ```bash
 uv run python run_medea_ship_fracture.py --full-map
 uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice
-uv run python run_medea_ship_fracture.py --full-map --plan --planner diffusion-mpc
+uv run python run_medea_ship_fracture.py --full-map --plan
 uv run python run_medea_ship_fracture.py --full-map --plan --planner mppi
 ```
 
@@ -217,8 +221,8 @@ uv run python examples/benchmark_planners.py --no-sim
 # Specific planners and concentrations
 uv run python examples/benchmark_planners.py --planners lattice diffusion-mpc --concentrations 0.2 0.4
 
-# Cold start for sampling planners (no A* warm-start)
-uv run python examples/benchmark_planners.py --no-warm-start --planners diffusion-mpc mppi gradcem
+# Warm start for sampling planners (A* seeds the optimization)
+uv run python examples/benchmark_planners.py --warm-start --planners diffusion-mpc mppi gradcem
 
 # Full simulation with live 2D window (watch ship move)
 uv run python examples/benchmark_planners.py --live --planners lattice
@@ -247,7 +251,7 @@ uv run python examples/benchmark_planners.py --n-frames 200 --replan-every 150
 |------|--------|-------------|
 | `--no-sim` | off | Plan only; no simulation. Saves planned-path images only, no result images or metrics. |
 | `--planners` | all | Planners to run: `lattice`, `diffusion-mpc`, `mppi`, `sqp`, `gradcem` (space-separated). |
-| `--no-warm-start` | off | For diffusion-mpc/mppi/sqp/gradcem: do not warm-start from A* (cold start). |
+| `--warm-start` | off | For diffusion-mpc/mppi/sqp/gradcem: seed optimization from A* path (default is cold start). |
 | `--concentrations` | 0.2 0.3 0.4 0.5 | Ice concentrations to test. |
 | `--kinematic` | off | Place ship on planned path each frame (no dynamics); faster, for path-vs-reference comparison. |
 | `--live` | off | Open a real-time 2D window during each simulation; close to continue. |
@@ -286,12 +290,12 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--plan` | Plan path (costmap + planner); only with `--simple` or `--full-map`. |
 | `--plan-only` | Plan and save costmap+path to PNG, then exit (no simulation). Implies `--plan`. |
 | `--no-show` | With `--plan-only`: save to file only, do not open window (headless). |
-| `--planner lattice` | Use lattice A* (default). |
-| `--planner diffusion-mpc` | Use lattice A* then model-based diffusion. |
-| `--planner mppi` | Use lattice A* then MPPI (importance-weighted sampling). |
-| `--planner sqp` | Use lattice A* then multiple-shooting SQP (jaxproxqp). |
-| `--planner gradcem` | Use lattice A* then GradCEM (gradient + Cross-Entropy Method). |
-| `--no-warm-start` | With diffusion-mpc/mppi/sqp/gradcem: disable A* warm-start (cold start). |
+| `--planner diffusion-mpc` | **Default.** Model-based diffusion MPC (JAX/GPU). |
+| `--planner lattice` | Lattice A* on motion primitives. |
+| `--planner mppi` | MPPI (importance-weighted sampling). |
+| `--planner sqp` | Multiple-shooting SQP (jaxproxqp). |
+| `--planner gradcem` | GradCEM (gradient + Cross-Entropy Method). |
+| `--warm-start` | With diffusion-mpc/mppi/sqp/gradcem: seed from A* path before optimization (default is cold start). |
 | `--kinematic-ship` | With `--plan`: ship follows path exactly (no dynamics). |
 | `--thick-ice M` | Override ice thickness to M metres. |
 | `--no-dpdem-bonds` | Use legacy bond model (force vs strength) instead of default DPDEM-style (hybrid criterion, damage, Mohr-Coulomb). |
@@ -299,6 +303,7 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--no-3d` | Skip 3D animation. |
 | `--no-lattice-search-movie` | With `--plan --planner lattice`: skip A* search movie. |
 | `--output-dir DIR` | Write outputs to `DIR` (default `outputs/default`). |
+| `--float32` | Use float32 instead of float64 for JAX computation (faster on GPU, less accurate). |
 | `--current none\|uniform\|learned` | Ocean current mode (default `none`). See [Ocean currents](#ocean-currents). |
 | `--current-speed S` | Current speed [m/s] for uniform mode (default from config). |
 | `--current-direction D` | Current direction [degrees, 0=+x] for uniform mode. |
@@ -358,11 +363,11 @@ uv run python run_medea_ship_fracture.py --simple --current learned \
 
 With `--plan`, the run script uses **receding-horizon planning** (AUTO-IceNav style): the costmap is rebuilt from the current ice state every N frames (config `planning_replan_every_n_frames`), and the trajectory is updated from the new plan.
 
+- **Diffusion-MPC (`--planner diffusion-mpc`, default):** Model-based diffusion over control sequences with 3-DOF ship dynamics and a JAX-native GPU costmap. By default uses **cold start** (optimization runs from scratch each replan). Add `--warm-start` to seed from a lattice A* path first. Fully JAX/GPU-accelerated — the diffusion loop runs as a single JIT-compiled XLA program. See [docs/DIFFUSION_MPC.md](docs/DIFFUSION_MPC.md).
 - **Lattice (`--planner lattice`):** A* on motion primitives (Dubins-like), costmap, ship footprint and turning radius respected.
-- **Diffusion-MPC (`--planner diffusion-mpc`):** Lattice A* for an initial path, then model-based diffusion over control sequences (3-DOF dynamics, costmap, path/waypoint rewards). See [docs/DIFFUSION_MPC.md](docs/DIFFUSION_MPC.md).
-- **MPPI (`--planner mppi`):** Lattice A* for initial path, then Model Predictive Path Integral (importance-weighted sampling) with the same cost function.
-- **SQP (`--planner sqp`):** Lattice A* for initial path, then multiple-shooting Sequential Quadratic Programming (jaxproxqp) with 3-DOF dynamics and costmap.
-- **GradCEM (`--planner gradcem`):** Lattice A* for initial path, then GradCEM (gradient + Cross-Entropy Method) combining RMSprop with CEM elite selection and resampling.
+- **MPPI (`--planner mppi`):** Model Predictive Path Integral (importance-weighted sampling) with the same cost function as diffusion-MPC. Cold start by default; `--warm-start` for A* seed.
+- **SQP (`--planner sqp`):** Multiple-shooting Sequential Quadratic Programming (jaxproxqp) with 3-DOF dynamics and costmap. Cold start by default.
+- **GradCEM (`--planner gradcem`):** GradCEM (gradient + Cross-Entropy Method) combining RMSprop with CEM elite selection and resampling. Cold start by default.
 
 The `dpdem` library also provides planning and control modules used in examples:
 
@@ -378,6 +383,21 @@ uv run python examples/visualize_planned_path.py # Plan and plot path on costmap
 uv run python examples/benchmark_planners.py     # Benchmark all planners on random ice (see §9)
 uv run python examples/visualize_diffusion.py   # MBD diffusion iteration evolution
 ```
+
+---
+
+## JAX backend
+
+All physics run through a **JAX-accelerated backend** — no NumPy simulation loop. The first call JIT-compiles the physics kernel (~30–60 s); subsequent calls are fast.
+
+Two execution paths are selected automatically:
+
+| Path | When | Description |
+|------|------|-------------|
+| **Chunked-replan** | `--plan` (with replanning) | Physics runs in `jax.lax.scan` segments between replan events. Python overhead is O(n_replans), not O(n_frames). Costmap rebuilt via GPU-native disk rasterization (`build_costmap_jax`). |
+| **Full scan** | No replanning | All frames compiled into a single XLA program; zero per-frame Python overhead or GPU sync. |
+
+Use `--float32` for faster GPU execution (default is float64 for numerical accuracy).
 
 ---
 
@@ -432,12 +452,14 @@ uv run python run_medea_ship_fracture.py --full-map --plan \
 
 ## Features
 
+- **JAX-accelerated physics:** Full simulation JIT-compiled via `jax.lax.scan` for GPU/TPU execution. Physics overhead scales O(n_replans), not O(n_frames). First call triggers XLA compilation; subsequent calls are fast.
 - **Paper-accurate physics:** Full equations of motion (Eqs. 7–11) from the DPDEM papers — translational and rotational dynamics, quadratic hydrodynamic drag, buoyancy moments, rotational drag, Rayleigh time step. Active by default; no flags needed.
 - **DPDEM bond fracture (default):** Hybrid criterion (⟨σ⟩/σ̄)²+(τ/τ̄)², Mohr–Coulomb shear strength, damage variable D, Benzeggagh–Kenane mixed-mode fracture energy (Eqs. 14–19). Spatially-local crack propagation. Use `--no-dpdem-bonds` for the legacy force-vs-strength model.
 - **Voronoi ice elements:** Irregular polygon shapes (paper Fig. 2); MEDEA floes tessellated for fracture.
 - **Contact:** Hertz-like normal repulsion with Coulomb friction for ice-ice contact; penetration-based ship collision with thrust cap.
 - **3D visualization:** Ice z-offset and tilt from ship-relative position; tapered 3D hull.
 - **Ship dynamics:** Optional 3-DOF (Fossen-style M, D, Coriolis) with PD tracking; or kinematic mode for path verification.
+- **Five planners:** Lattice A*, diffusion-MPC (default), MPPI, SQP, GradCEM — all with receding-horizon replanning and GPU-native costmap.
 
 ---
 
@@ -456,7 +478,7 @@ uv run python run_medea_ship_fracture.py --simple --thick-ice 10 --output-dir ou
 uv run python run_medea_ship_fracture.py --simple --kinematic-ship --output-dir outputs/simple_straight
 
 # 4. Lattice planner (A* plans path around ice)
-uv run python run_medea_ship_fracture.py --simple --plan --output-dir outputs/simple_lattice
+uv run python run_medea_ship_fracture.py --simple --plan --planner lattice --output-dir outputs/simple_lattice
 
 # 5. Toy planner: wall with opening
 uv run python examples/toy_planner_opening.py --output-dir outputs/toy_planner
