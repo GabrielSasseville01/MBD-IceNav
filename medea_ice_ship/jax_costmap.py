@@ -7,18 +7,30 @@ OpenCV polygon rasterization + dilation), this implementation uses JAX scatter
 operations so the costmap can be built entirely on the GPU, avoiding a
 device-to-host round-trip between the simulation and the planner.
 
-Cost model
-----------
-The grid cost for a cell at world position (x, y) is:
+Cost models
+-----------
+Two cost models are supported, selected via ``use_ke_cost`` in
+``build_costmap_jax``:
 
-    cost(x, y) = base_cost
-                 + sum_i  ice_cost_i * disk_i(x, y)
+**Exponential thickness model** (default, ``use_ke_cost=False``):
 
-where the sum is over all ice elements, disk_i is 1 inside the element's
-radius (scaled by obs_cost_buffer_factor), and ice_cost_i follows the same
-exponential thickness model as the NumPy costmap:
+    cost(x, y) = base_cost + sum_i  ice_cost_i * disk_i(x, y)
+
+where disk_i is 1 inside the element's effective radius and ice_cost_i
+follows the exponential thickness model:
 
     ice_cost_i = collision_cost * exp(ice_cost_exp_scale * h_i / thickness_ref)
+
+**AUTO-IceNav KE collision model** (``use_ke_cost=True``):
+
+    cost(x, y) = max_i [ ke_i * max(0, (eff_r_i² - d²) / eff_r_i²) ]
+
+where ke_i is the per-element kinetic-energy constant based on ship speed,
+ship mass, and ice floe mass, and the parabolic falloff provides a smooth
+cost field. Overlapping elements contribute the maximum (not sum) at each
+cell. SIC modulation (``ice_resistance_weight > 0``) scales the KE cost by
+local sea-ice concentration raised to a power, matching the AUTO-IceNav
+resistance model.
 
 Ship-footprint dilation is applied via a max-pooling operation (equivalent to
 ``scipy.ndimage.maximum_filter``) so the planner keeps the ship center at
@@ -141,6 +153,50 @@ def _rasterize_elements(
     return grid
 
 
+@partial(jax.jit, static_argnames=("rows", "cols"))
+def _rasterize_elements_ke(
+    centroids:   jnp.ndarray,   # (n, 2)
+    radii:       jnp.ndarray,   # (n,)
+    ke_weights:  jnp.ndarray,   # (n,)  per-element KE constant (pre-scaled)
+    x_origin:    float,
+    y_origin:    float,
+    resolution:  float,
+    rows: int,
+    cols: int,
+    obs_cost_buffer_factor: float = 0.0,
+) -> jnp.ndarray:               # (rows, cols) float32
+    """
+    Paint KE collision cost onto a (rows, cols) grid using parabolic radial
+    falloff and element-wise maximum (AUTO-IceNav cost model).
+
+    Each element i contributes to cells within its effective radius:
+        eff_r = radii[i] * (1 + obs_cost_buffer_factor) + 0.5 * resolution
+        cost(x,y) = ke_weights[i] * max(0, (eff_r² - d²) / eff_r²)
+
+    Overlapping elements contribute the maximum (not sum) at each cell.
+    """
+    c_idx = jnp.arange(cols, dtype=jnp.float32)
+    r_idx = jnp.arange(rows, dtype=jnp.float32)
+    cell_x = x_origin + (c_idx + 0.5) * resolution   # (cols,)
+    cell_y = y_origin + (r_idx + 0.5) * resolution   # (rows,)
+    XX, YY = jnp.meshgrid(cell_x, cell_y)            # (rows, cols)
+
+    def element_contribution(centroid, radius, ke_weight):
+        eff_r   = radius * (1.0 + obs_cost_buffer_factor) + 0.5 * resolution
+        dist_sq = (XX - centroid[0]) ** 2 + (YY - centroid[1]) ** 2
+        falloff = jnp.maximum(0.0, (eff_r ** 2 - dist_sq) / (eff_r ** 2))
+        return ke_weight * falloff
+
+    # vmap over all elements → (n, rows, cols)
+    contributions = jax.vmap(element_contribution)(
+        centroids.astype(jnp.float32),
+        radii.astype(jnp.float32),
+        ke_weights.astype(jnp.float32),
+    )
+    # Maximum across elements: highest KE cost wins at each cell
+    return jnp.max(contributions, axis=0)
+
+
 def _dilate_grid_jax(
     grid: jnp.ndarray,   # (rows, cols) float32
     kernel: jnp.ndarray, # (kh, kw) binary disk kernel
@@ -198,6 +254,12 @@ def build_costmap_jax(
     ship_beam:   Optional[float] = None,
     planning_clearance_margin: float = 0.0,
     verbose: bool = False,
+    use_ke_cost: bool = False,
+    ship_speed: float = 4.0,
+    ship_mass: float = 23e6,
+    ke_cost_scale: float = 1e-6,
+    ice_resistance_weight: float = 0.0,
+    masses: Optional[np.ndarray] = None,
 ) -> Tuple["JaxCostMapResult", dict]:
     """
     Build a planning costmap from current ice element positions using JAX.
@@ -245,22 +307,76 @@ def build_costmap_jax(
         print(f"  [jax-costmap] grid: {rows}×{cols} cells "
               f"({rows * cols / 1e6:.2f} M), n_elem={len(centroids)}", flush=True)
 
-    # Per-element ice cost weights
-    ice_costs_np = collision_cost * np.exp(
-        ice_cost_exp_scale * thicknesses / thickness_ref
-    ).astype(np.float32)
+    n = len(centroids)
 
-    # Rasterize on JAX device
-    grid_jax = _rasterize_elements(
-        jnp.array(centroids,   dtype=jnp.float32),
-        jnp.array(radii,       dtype=jnp.float32),
-        jnp.array(ice_costs_np, dtype=jnp.float32),
-        float(base_cost),
-        float(x_origin), float(y_origin), float(resolution),
-        rows, cols,
-        float(obs_cost_buffer_factor),
-    )
-    jax.block_until_ready(grid_jax)
+    if use_ke_cost and n > 0:
+        # ── KE collision cost (AUTO-IceNav model) ─────────────────────────
+        # If masses not provided, approximate from circular-disk geometry
+        if masses is None:
+            masses_arr = np.pi * radii ** 2 * thicknesses * 920.0  # ICE_DENSITY
+        else:
+            masses_arr = np.asarray(masses, dtype=float)
+
+        # Per-element KE constant (computed in float64 to avoid overflow)
+        v   = max(float(ship_speed), 1e-6)
+        M_s = float(ship_mass)
+        m_i = masses_arr.astype(np.float64)
+        ke_constants = (
+            float(collision_cost)
+            * v * v
+            * m_i * M_s * (m_i + 2.0 * M_s)
+            / (2.0 * (M_s + m_i) ** 2)
+            * float(ke_cost_scale)
+        )
+        ke_constants_f32 = np.clip(ke_constants, 0.0, 1e8).astype(np.float32)
+
+        grid_jax = _rasterize_elements_ke(
+            jnp.array(centroids,        dtype=jnp.float32),
+            jnp.array(radii,            dtype=jnp.float32),
+            jnp.array(ke_constants_f32, dtype=jnp.float32),
+            float(x_origin), float(y_origin), float(resolution),
+            rows, cols,
+            float(obs_cost_buffer_factor),
+        )
+        jax.block_until_ready(grid_jax)
+        grid_np = np.array(grid_jax, dtype=np.float32)
+
+        # SIC modulation: cost *= SIC^weight (AUTO-IceNav style)
+        if ice_resistance_weight > 0.0:
+            from scipy.ndimage import uniform_filter
+            bin_occ = (grid_np > 0.0).astype(np.float64)
+            ksize = min(31, (min(rows, cols) // 4) | 1)  # odd, ≤ 31 cells
+            if ksize % 2 == 0:
+                ksize += 1
+            sic = uniform_filter(bin_occ, size=ksize, mode="reflect")
+            sic = np.clip(sic, 0.0, 1.0).astype(np.float32)
+            # Avoid raising 0^w for isolated floes (would produce 0 in sparse ice)
+            sic_safe = np.maximum(sic, 1e-6)
+            grid_np = grid_np * np.power(sic_safe, ice_resistance_weight)
+
+        # Open-water floor
+        grid_np = np.maximum(grid_np, float(base_cost))
+        grid_jax = jnp.array(grid_np, dtype=jnp.float32)
+
+    elif n > 0:
+        # ── Exponential thickness model (default) ─────────────────────────
+        ice_costs_np = collision_cost * np.exp(
+            ice_cost_exp_scale * thicknesses / thickness_ref
+        ).astype(np.float32)
+        grid_jax = _rasterize_elements(
+            jnp.array(centroids,    dtype=jnp.float32),
+            jnp.array(radii,        dtype=jnp.float32),
+            jnp.array(ice_costs_np, dtype=jnp.float32),
+            float(base_cost),
+            float(x_origin), float(y_origin), float(resolution),
+            rows, cols,
+            float(obs_cost_buffer_factor),
+        )
+        jax.block_until_ready(grid_jax)
+
+    else:
+        # Empty ice field
+        grid_jax = jnp.full((rows, cols), float(base_cost), dtype=jnp.float32)
 
     # Ship-footprint dilation
     if ship_length is not None and ship_beam is not None and ship_length > 0 and ship_beam > 0:
@@ -297,8 +413,8 @@ def build_costmap_jax(
 
 
 def build_costmap_jax_from_ice_state(
-    state,                          # IceState (JAX NamedTuple)
-    static,                         # IceStaticData
+    state,
+    static,
     x_min: float,
     x_max: float,
     y_min: float,
@@ -308,14 +424,16 @@ def build_costmap_jax_from_ice_state(
     """
     Convenience wrapper: build the costmap from a live IceState + IceStaticData.
 
-    Extracts centroids (current positions), thicknesses, and radii from the
-    state and static data, then calls build_costmap_jax.
+    Extracts centroids (current positions), thicknesses, radii, and masses from
+    the state and static data, then calls build_costmap_jax.
     """
     centroids_np   = np.array(state.positions)
     thicknesses_np = np.array(static.thicknesses)
     radii_np       = np.array(static.radii)
+    masses_np      = np.array(static.masses)      # exact masses from simulation
     return build_costmap_jax(
         centroids_np, thicknesses_np, radii_np,
         x_min, x_max, y_min, y_max,
+        masses=masses_np,
         **kwargs,
     )

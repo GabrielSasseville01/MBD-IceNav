@@ -53,16 +53,26 @@ def coriolis_3dof_jax(M3: jnp.ndarray, nu: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def ship_euler_step_jax(
-    eta: jnp.ndarray,    # (3,) [x, y, psi]
-    nu: jnp.ndarray,     # (3,) [u, v, r]
-    tau: jnp.ndarray,    # (3,) control + external forces [X, Y, N]
-    M3inv: jnp.ndarray,  # (3, 3) precomputed inverse of mass matrix
-    D3: jnp.ndarray,     # (3, 3) linear damping
+    eta: jnp.ndarray,        # (3,) [x, y, psi]
+    nu: jnp.ndarray,         # (3,) [u, v, r]
+    tau: jnp.ndarray,        # (3,) control + external forces [X, Y, N]
+    M3inv: jnp.ndarray,      # (3, 3) precomputed inverse of mass matrix
+    D3: jnp.ndarray,         # (3, 3) linear damping
     dt: float,
+    nu_c_body: jnp.ndarray,  # (3,) ocean current in body frame [u_c, v_c, 0]
 ) -> tuple:  # (eta_new (3,), nu_new (3,))
-    """Single forward-Euler step for 3-DOF Fossen vessel dynamics."""
-    C = coriolis_3dof_jax(jnp.linalg.inv(M3inv), nu)  # rebuild M3 = inv(M3inv)
-    nu_dot = M3inv @ (tau - C @ nu - D3 @ nu)
+    """Single forward-Euler step for 3-DOF Fossen vessel dynamics.
+
+    Uses the linear state-space model from AUTO-IceNav / paper:
+        nu_r   = nu - nu_c_body          (velocity relative to water)
+        nu_dot = M3inv @ (tau - D3 @ nu_r)
+    No Coriolis: the supply vessel model is intentionally linear (low-speed
+    maneuvering), matching Fossen (2021) and AUTO-IceNav's supply.py.
+
+    With nu_c_body = zeros this reduces to the no-current formulation.
+    """
+    nu_r = nu - nu_c_body   # relative velocity: what water "feels"
+    nu_dot = M3inv @ (tau - D3 @ nu_r)
     nu_new = nu + dt * nu_dot
 
     psi = eta[2]
@@ -100,9 +110,11 @@ def rollout_3dof_jax(
     -------
     trajectory : (H+1, 3) array of [x, y, psi] in world frame
     """
+    _zeros3 = jnp.zeros(3)
+
     def step(carry, tau):
         eta, nu = carry
-        eta_new, nu_new = ship_euler_step_jax(eta, nu, tau, M3inv, D3, dt)
+        eta_new, nu_new = ship_euler_step_jax(eta, nu, tau, M3inv, D3, dt, _zeros3)
         return (eta_new, nu_new), eta_new
 
     (_, _), traj = jax.lax.scan(step, (eta0, nu0), u_seq)
@@ -118,22 +130,23 @@ def dp_control_jax(
     nu: jnp.ndarray,           # (3,) [u, v, r]
     e_int: jnp.ndarray,        # (3,) integral error accumulator
     setpoint: jnp.ndarray,     # (3,) [x_d, y_d, psi_d]
-    setpoint_next: jnp.ndarray,# (3,) next trajectory waypoint [x_d_next, y_d_next, psi_d_next]
+    setpoint_next: jnp.ndarray,# (3,) reserved (unused; kept for API compatibility)
     Kp: jnp.ndarray,           # (3, 3) proportional gain
     Kd: jnp.ndarray,           # (3, 3) derivative gain
-    Ki: jnp.ndarray,           # (3, 3) integral gain (zero if unused)
+    Ki: jnp.ndarray,           # (3, 3) integral gain (zero = disabled, AUTO-IceNav default)
     dt: float,
 ) -> tuple:  # (tau (3,), e_int_new (3,))
     """
-    DP pole-placement control law matching simulation.py.
+    DP pole-placement control law matching AUTO-IceNav's DPpolePlacement.
 
-    Body-frame control law:
-        nu_des_world = (setpoint_next[:2] - setpoint[:2]) / dt
-        nu_des_body  = R^T @ nu_des_world
-        tau = R^T @ Kp @ (setpoint[:2] - eta[:2])
-            + Kd @ (nu_des_body - nu)   (feedforward + feedback)
-            + Kp_psi * e_psi - Kd[2,2] * nu[2]  (yaw)
-            - Ki @ e_int
+    Body-frame control law (Fossen 2021):
+        e     = eta - [x_d, y_d, psi_d]        (world-frame error)
+        e[2]  = ssa(e[2])                        (heading wrapped to [-pi,pi])
+        tau   = -R(psi)^T @ Kp @ e - Kd @ nu   (no integral by default)
+              - R(psi)^T @ Ki @ e_int           (if Ki != 0)
+
+    This matches AUTO-IceNav supply.py / control.py DPpolePlacement exactly.
+    No velocity feedforward (not in the reference implementation).
 
     Parameters
     ----------
@@ -141,7 +154,7 @@ def dp_control_jax(
     nu            : current body-frame velocity [u, v, r]
     e_int         : accumulated integral error (3,)
     setpoint      : desired pose [x_d, y_d, psi_d]
-    setpoint_next : next desired pose (for velocity feedforward)
+    setpoint_next : unused (kept for API compatibility)
     Kp, Kd, Ki   : controller gain matrices (3, 3)
     dt            : integration step [s]
 
@@ -156,26 +169,16 @@ def dp_control_jax(
                    [s,  c, 0.0],
                    [0., 0., 1.]])
 
-    # World-frame position error (desired - actual, same sign as NumPy)
-    e_xy_world = setpoint[:2] - eta[:2]
-    e_xy_body  = R[:2, :2].T @ e_xy_world
-    e_psi = (setpoint[2] - eta[2] + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    # World-frame error: actual - desired (sign convention matching AUTO-IceNav)
+    e_xy = eta[:2] - setpoint[:2]
+    e_psi = (eta[2] - setpoint[2] + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    e = jnp.array([e_xy[0], e_xy[1], e_psi])
 
-    # Desired body-frame velocity (feedforward from trajectory)
-    desired_vel_world = (setpoint_next[:2] - setpoint[:2]) / dt
-    nu_des_body = R[:2, :2].T @ desired_vel_world  # (2,)
-
-    # Control law matching simulation.py lines 810-813
-    tau = jnp.array([
-        Kp[0, 0] * e_xy_body[0] + Kd[0, 0] * (nu_des_body[0] - nu[0]),
-        Kp[1, 1] * e_xy_body[1] + Kd[1, 1] * (nu_des_body[1] - nu[1]),
-        Kp[2, 2] * e_psi        - Kd[2, 2] * nu[2],
-    ])
-    tau = tau - (Ki @ e_int)
+    # Control law: tau = -R^T @ Kp @ e - Kd @ nu - R^T @ Ki @ e_int
+    tau = -(R.T @ Kp @ e) - (Kd @ nu) - (R.T @ Ki @ e_int)
 
     # Update integral error (Euler)
-    e_world = jnp.array([e_xy_world[0], e_xy_world[1], e_psi])
-    e_int_new = e_int + dt * e_world
+    e_int_new = e_int + dt * e
 
     return tau, e_int_new
 
@@ -253,6 +256,7 @@ def ship_step_jax(
     B: jnp.ndarray,            # (3, 6) thruster config (needed for thrust computation)
     T_n: float,
     dt: float,
+    v_water_ship: jnp.ndarray = jnp.zeros(2),  # (2,) ocean current at ship pos, world frame [u_c, v_c]
     use_auto_icenav: bool = False,
     vc_surge: float = 15.0,    # velocity clip [m/s]
     vc_sway: float = 8.0,
@@ -274,6 +278,9 @@ def ship_step_jax(
     B                        : (3, 6) thruster config matrix (for RPM → tau conversion)
     T_n                      : propeller time constant [s]
     dt                       : timestep [s]
+    v_water_ship             : (2,) world-frame ocean current at ship position [u_c, v_c].
+                               Pass jnp.zeros(2) (default) for no current.
+                               Matches AUTO-IceNav supply.py: damping acts on nu_r = nu - R.T @ Vc.
     use_auto_icenav          : if True, use RPM-based DP; otherwise use direct tau PD
 
     Returns
@@ -285,6 +292,10 @@ def ship_step_jax(
     R_mat = jnp.array([[c, -s, 0.],
                        [s,  c, 0.],
                        [0., 0., 1.]])
+
+    # Convert ocean current from world → body frame (matching AUTO-IceNav supply.py)
+    # nu_c_body = R(psi)^T @ [u_c, v_c, 0]
+    nu_c_body = R_mat.T @ jnp.array([v_water_ship[0], v_water_ship[1], 0.0])
 
     # Convert ice forces from world → body frame
     tau_ice_body = R_mat.T @ tau_ice
@@ -312,9 +323,9 @@ def ship_step_jax(
     # Total body-frame forcing
     tau_total = tau_ctrl_actual + tau_ice_body
 
-    # Euler step
+    # Euler step (damping applied to velocity relative to water)
     eta_new, nu_new = ship_euler_step_jax(
-        eta, nu, tau_total, ship_dyn.M3inv, ship_dyn.D3, dt
+        eta, nu, tau_total, ship_dyn.M3inv, ship_dyn.D3, dt, nu_c_body
     )
     nu_new = _clip_velocity_jax(nu_new, vc_surge, vc_sway, vc_yaw)
 

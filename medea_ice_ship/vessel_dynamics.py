@@ -117,8 +117,8 @@ def rollout_3dof(
 
     for t in range(horizon):
         tau = np.array(u_seq[t], dtype=float)
-        C = coriolis_3dof(M3, nu)
-        nu_dot = np.linalg.solve(M3, tau - C @ nu - D3 @ nu)
+        # Linear model (no Coriolis) — matches AUTO-IceNav supply.py and the paper
+        nu_dot = np.linalg.solve(M3, tau - D3 @ nu)
         nu = nu + dt * nu_dot
         # Kinematics: eta_dot = R_xy(psi) @ [u, v] for position; psi_dot = r
         vel_global = R_xy(eta[2]) @ np.array([nu[0], nu[1]])

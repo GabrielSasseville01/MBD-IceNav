@@ -401,6 +401,7 @@ def _make_frame_step(
         setpoint_next: jnp.ndarray, # (3,) next waypoint for velocity feedforward
         v_water: jnp.ndarray,       # (n, 2) ocean current at ice positions
         dpdem_eligible: jnp.ndarray,# (n_floes,) bool
+        v_water_ship: jnp.ndarray = jnp.zeros(2),  # (2,) ocean current at ship position [u_c, v_c]
     ):
         """
         One complete simulation frame:
@@ -658,6 +659,7 @@ def _make_frame_step(
             ship_state.eta, ship_state.nu, ship_state.n_actual, ship_state.e_int,
             setpoint, setpoint_next, tau_ice_world,
             ship_dyn, B_mat, T_n, dt,
+            v_water_ship=v_water_ship,
             use_auto_icenav=use_auto_icenav,
             vc_surge=vc_ship[0], vc_sway=vc_ship[1], vc_yaw=vc_ship[2],
         )
@@ -870,9 +872,15 @@ def jax_simulate_ice_ship_interaction(
         v_water_np = ocean_current.sample_batch(pos_np)  # (n, 2) NumPy
         v_water = jnp.array(v_water_np)
 
+        # Sample current at ship position (for ship dynamics relative velocity)
+        _ship_pos_np = np.array([[float(ship_state.eta[0]), float(ship_state.eta[1])]])
+        v_water_ship = jnp.array(ocean_current.sample_batch(_ship_pos_np)[0])  # (2,)
+
         # ── ONE JIT frame step ────────────────────────────────────────────────
         dpdem_elig = state.dpdem_floe_eligible
-        state, ship_state, diag = frame_step(state, ship_state, setpoint, setpoint_next, v_water, dpdem_elig)
+        state, ship_state, diag = frame_step(
+            state, ship_state, setpoint, setpoint_next, v_water, dpdem_elig, v_water_ship,
+        )
         jax.block_until_ready(state.positions)
 
         # ── Diagnostics and history (Python) ─────────────────────────────────
@@ -965,6 +973,7 @@ def simulate_full_jax_scan(
     config=None,
     parent_ids=None,
     v_water_all=None,
+    v_water_ship_all=None,
     use_auto_icenav_ship: bool = False,
 ):
     """
@@ -1087,6 +1096,12 @@ def simulate_full_jax_scan(
     else:
         v_water_jax = jnp.zeros((n_frames, n, 2), dtype=jnp.float64)
 
+    # Per-frame current at ship position (for ship dynamics relative velocity)
+    if v_water_ship_all is not None:
+        v_water_ship_jax = jnp.array(v_water_ship_all, dtype=jnp.float64)  # (n_frames, 2)
+    else:
+        v_water_ship_jax = jnp.zeros((n_frames, 2), dtype=jnp.float64)
+
     # ── Capture initial arrays for history prepend ─────────────────────────
     init_positions   = np.array(state.positions)
     init_rotations   = np.zeros(n, dtype=np.float64)
@@ -1097,14 +1112,14 @@ def simulate_full_jax_scan(
     def _scan_step(carry, xs):
         """One frame of physics: (IceState, ShipState) → updated carry + outputs."""
         state, ship_state = carry
-        setpoint_row, v_water = xs         # (6,), (n, 2)
+        setpoint_row, v_water, v_water_ship_frame = xs  # (6,), (n, 2), (2,)
 
         setpoint      = setpoint_row[:3]
         setpoint_next = setpoint_row[3:]
         dpdem_elig    = state.dpdem_floe_eligible
 
         state, ship_state, diag = frame_step(
-            state, ship_state, setpoint, setpoint_next, v_water, dpdem_elig,
+            state, ship_state, setpoint, setpoint_next, v_water, dpdem_elig, v_water_ship_frame,
         )
 
         hist = (
@@ -1126,7 +1141,7 @@ def simulate_full_jax_scan(
     (final_state, final_ship), histories = jax.lax.scan(
         _scan_step,
         (state, ship_state),
-        (setpoints_all, v_water_jax),
+        (setpoints_all, v_water_jax, v_water_ship_jax),
     )
     jax.block_until_ready(final_state.positions)
 
@@ -1274,12 +1289,12 @@ def build_jax_sim_context(
     # the same Python function object every time → no recompilation per chunk.
     def _scan_step(carry, xs):
         _state, _ship = carry
-        setpoint_row, v_water = xs          # (6,), (n, 2)
+        setpoint_row, v_water, v_water_ship_frame = xs  # (6,), (n, 2), (2,)
         setpoint      = setpoint_row[:3]
         setpoint_next = setpoint_row[3:]
         dpdem_elig    = _state.dpdem_floe_eligible
         _state, _ship, diag = frame_step(
-            _state, _ship, setpoint, setpoint_next, v_water, dpdem_elig,
+            _state, _ship, setpoint, setpoint_next, v_water, dpdem_elig, v_water_ship_frame,
         )
         hist = (
             _state.positions,
@@ -1292,11 +1307,11 @@ def build_jax_sim_context(
         )
         return (_state, _ship), hist
 
-    def scan_segment(state, ship_state, setpoints_K6, v_water_Kn2):
+    def scan_segment(state, ship_state, setpoints_K6, v_water_Kn2, v_water_ship_K2):
         (final_state, final_ship), histories = jax.lax.scan(
             _scan_step,
             (state, ship_state),
-            (setpoints_K6, v_water_Kn2),
+            (setpoints_K6, v_water_Kn2, v_water_ship_K2),
         )
         jax.block_until_ready(final_state.positions)
         return final_state, final_ship, histories
@@ -1305,9 +1320,10 @@ def build_jax_sim_context(
     _dummy_state = build_initial_ice_state(n, centroids, len(bonds), np.array(static.initial_floe_of))
     _dummy_ship  = build_initial_ship_state(np.array(ship_pos), 0.0)
     _dummy_vw_K  = jnp.zeros((chunk_size, n, 2), dtype=jnp.float64)
+    _dummy_vws_K = jnp.zeros((chunk_size, 2),    dtype=jnp.float64)
     _dummy_eta   = _dummy_ship.eta
     _dummy_sp_K  = jnp.tile(jnp.concatenate([_dummy_eta, _dummy_eta])[None, :], (chunk_size, 1))
-    _ = scan_segment(_dummy_state, _dummy_ship, _dummy_sp_K, _dummy_vw_K)
+    _ = scan_segment(_dummy_state, _dummy_ship, _dummy_sp_K, _dummy_vw_K, _dummy_vws_K)
     jax.block_until_ready(_[0].positions)
     if verbose:
         print(f"  [JAX-ctx] Compilation done in {time.perf_counter() - t0:.1f} s", flush=True)
@@ -1328,8 +1344,9 @@ def _run_jax_segment(
     ctx: JaxSimContext,
     state: "IceState",
     ship_state: "ShipState",
-    setpoints_K6: jnp.ndarray,   # (K, 6)  [x,y,psi, x_next,y_next,psi_next]
-    v_water_Kn2: jnp.ndarray,    # (K, n, 2)
+    setpoints_K6: jnp.ndarray,        # (K, 6)  [x,y,psi, x_next,y_next,psi_next]
+    v_water_Kn2: jnp.ndarray,         # (K, n, 2)
+    v_water_ship_K2: jnp.ndarray = None,  # (K, 2) ocean current at ship position
 ) -> tuple:
     """
     Run exactly K frames via jax.lax.scan using a pre-compiled frame_step.
@@ -1344,7 +1361,9 @@ def _run_jax_segment(
         (positions (K,n,2), rotations (K,n), bond_intact (K,n_bonds),
          eta (K,3), submergence (K,n), J_cumul_incr (K,), F_ice_on_ship (K,2))
     """
-    return ctx.scan_segment(state, ship_state, setpoints_K6, v_water_Kn2)
+    if v_water_ship_K2 is None:
+        v_water_ship_K2 = jnp.zeros((setpoints_K6.shape[0], 2), dtype=v_water_Kn2.dtype)
+    return ctx.scan_segment(state, ship_state, setpoints_K6, v_water_Kn2, v_water_ship_K2)
 
 
 def _trajectory_list_to_arr(traj_list) -> np.ndarray:
@@ -1568,32 +1587,44 @@ def simulate_jax_chunked_replan(
         # times — exact for static fields (No/Uniform), an O(dt_chunk) approx
         # for slowly-evolving fields (_GridCurrentModel).
         # LearnedCurrentModel (time-varying) falls back to the NumPy loop.
+        _ship_pos_np = np.array([[float(ship_state.eta[0]), float(ship_state.eta[1])]])
         if hasattr(ocean_current, "sample_chunk_jax"):
             v_water_Kn2 = ocean_current.sample_chunk_jax(
                 K, ctx.n, pos_jax=state.positions, dtype=jnp.float64,
+            )
+            # Ship current: sample at ship position, tile K times (exact for
+            # static/uniform fields; approximate for spatially-varying).
+            _v_ship_1 = ocean_current.sample_batch(_ship_pos_np)[0]  # (2,)
+            v_water_ship_K2 = jnp.tile(
+                jnp.array(_v_ship_1, dtype=jnp.float64), (K, 1)
             )
             for _ in range(K):
                 ocean_current.step()
         else:
             pos_np = np.array(state.positions)
             v_rows = []
+            v_ship_rows = []
             for _ in range(K):
                 v_rows.append(ocean_current.sample_batch(pos_np))
+                v_ship_rows.append(ocean_current.sample_batch(_ship_pos_np)[0])
                 ocean_current.step()
-            v_water_Kn2 = jnp.array(np.stack(v_rows, axis=0), dtype=jnp.float64)
+            v_water_Kn2     = jnp.array(np.stack(v_rows,      axis=0), dtype=jnp.float64)
+            v_water_ship_K2 = jnp.array(np.stack(v_ship_rows, axis=0), dtype=jnp.float64)
 
         # ── If K < chunk (last short chunk), pad to chunk size for scan ────────
         pad = chunk - K
         if pad > 0:
-            last_sp = setpoints_K6[-1:, :]
-            setpoints_K6 = jnp.concatenate([setpoints_K6, jnp.repeat(last_sp, pad, axis=0)], axis=0)
-            last_vw = v_water_Kn2[-1:, :, :]
-            v_water_Kn2  = jnp.concatenate([v_water_Kn2,  jnp.repeat(last_vw,  pad, axis=0)], axis=0)
+            last_sp  = setpoints_K6[-1:, :]
+            setpoints_K6    = jnp.concatenate([setpoints_K6,    jnp.repeat(last_sp,             pad, axis=0)], axis=0)
+            last_vw  = v_water_Kn2[-1:, :, :]
+            v_water_Kn2     = jnp.concatenate([v_water_Kn2,     jnp.repeat(last_vw,             pad, axis=0)], axis=0)
+            last_vws = v_water_ship_K2[-1:, :]
+            v_water_ship_K2 = jnp.concatenate([v_water_ship_K2, jnp.repeat(last_vws,            pad, axis=0)], axis=0)
 
         # ── Run the JAX scan segment ───────────────────────────────────────────
         _t_scan = time.perf_counter()
         final_state, final_ship, hist = _run_jax_segment(
-            ctx, state, ship_state, setpoints_K6, v_water_Kn2,
+            ctx, state, ship_state, setpoints_K6, v_water_Kn2, v_water_ship_K2,
         )
         _physics_scan_time += time.perf_counter() - _t_scan
         _physics_scan_calls += 1

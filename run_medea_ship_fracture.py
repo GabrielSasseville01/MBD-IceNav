@@ -127,8 +127,8 @@ def main():
                         help='With --plan-only: run both lattice A* and diffusion-mpc, plot both paths for comparison')
     parser.add_argument('--no-show', action='store_true',
                         help='With --plan-only: save to file only, do not open matplotlib window (headless)')
-    parser.add_argument('--replan-every', type=int, metavar='N', default=None,
-                        help='With --plan: replan every N simulation frames (override config; larger = fewer replans, faster run)')
+    parser.add_argument('--replan-every', type=float, metavar='SECS', default=None,
+                        help='With --plan: replan every SECS simulated seconds (override config default of 30 s; larger = fewer replans, faster run)')
     parser.add_argument('--ridge-costmap', type=str, metavar='FILE', default=None,
                         help='Ridge costmap pickle for ridge-aware planning (from generate_ridge_costmap.py)')
     parser.add_argument('--ridge-weight', type=float, default=None, metavar='W',
@@ -156,12 +156,8 @@ def main():
                         help='Number of simulation frames to run. With --simple or --full-map, sets trajectory length to N; otherwise overrides config n_frames. Simulated time = N × dt.')
     parser.add_argument('--target-speed', type=float, default=None, metavar='M/S',
                         help='Target ship speed [m/s] when --plan. Derives n_frames so path is traversed at this speed. Also used in KE collision cost. Default 4.0 (realistic icebreaker).')
-    parser.add_argument('--no-target-speed', action='store_true',
-                        help='Disable target-speed mode: use fixed n_frames from config (legacy, ship may be unrealistically fast).')
     parser.add_argument('--optimize-speed', action='store_true',
                         help='Optimize speed per path segment: slower in thick ice, faster in open water. Balances impact (KE ∝ v²) vs time.')
-    parser.add_argument('--auto-icenav-ship', action='store_true',
-                        help='Use AUTO-IceNav Fossen_supply 3-DOF vessel dynamics and DP controller (thruster-level), feeding DPDEM ice loads as environmental forces.')
     parser.add_argument('--float32', action='store_true',
                         help='Use float32 instead of float64 for JAX computation (faster on GPU, less accurate). '
                              'Default is float64 for numerical accuracy.')
@@ -257,6 +253,7 @@ def main():
             state['centroids'], state['thicknesses'],
             output_file=out_2d, fps=run_cfg.fps_2d, frame_skip=run_cfg.frame_skip_2d,
             n_workers=run_cfg.n_workers,
+            dt=state.get('dt', run_cfg.dt),
         )
         if not args.no_3d:
             print("\nGenerating 3D animation (replay)...", flush=True)
@@ -269,6 +266,7 @@ def main():
                 submergence_history=state.get('submergence_history'),
                 figsize=run_cfg.figsize_3d,
                 n_workers=run_cfg.n_workers,
+                dt=state.get('dt', run_cfg.dt),
             )
         print(f"\nReplay complete. Output: {out_2d}" + (f", {out_3d}" if not args.no_3d else ""))
         return
@@ -305,9 +303,9 @@ def main():
     ship_draft = run_cfg.ship_draft
     ship_displacement = run_cfg.ship_displacement
 
-    # When using AUTO-IceNav ship, use that vessel's geometry everywhere so DPDEM ice forces
-    # and moments (hull, lever arms) match the simulated dynamics (Fossen supply 76.2 m, 6 kt).
-    if getattr(args, 'auto_icenav_ship', False):
+    # Use AUTO-IceNav vessel geometry by default so DPDEM ice forces and moments (hull, lever arms)
+    # match the simulated dynamics (Fossen supply 76.2 m, 6 kt). Override if --ice-tank-psv was set.
+    if not getattr(args, 'ice_tank_psv', False):
         ship_length = 76.2
         ship_beam = 17.0
         ship_draft = 7.0
@@ -529,7 +527,6 @@ def main():
     # Skip when --frames is set (user requested exact frame count).
     use_target_speed = (
         args.plan and (synthetic_mode or args.full_map)
-        and not getattr(args, 'no_target_speed', False)
         and getattr(run_cfg, 'planning_use_target_speed', True)
         and getattr(args, 'frames', None) is None
     )
@@ -887,6 +884,11 @@ def main():
                 ship_length=ship_length,
                 ship_beam=ship_beam,
                 planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
+                use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", False),
+                ship_speed=getattr(plan_cfg, "planning_ship_speed", 4.0),
+                ship_mass=float(ship_displacement),
+                ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
+                ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 0.0),
             )
             diag["costmap"] += time.time() - t0_cost
             costmap_snapshots.append((frame, cost_map_f))
@@ -955,12 +957,13 @@ def main():
             print("  Receding horizon: disabled (single initial plan)", flush=True)
         else:
             replan_callback = _replan_callback
-            replan_every_n_frames = (
+            replan_every_n_seconds = (
                 args.replan_every
                 if args.replan_every is not None
-                else run_cfg.planning_replan_every_n_frames
+                else run_cfg.planning_replan_every_n_seconds
             )
-            print(f"  Receding horizon: replan every {replan_every_n_frames} frames", flush=True)
+            replan_every_n_frames = max(1, round(replan_every_n_seconds / run_cfg.dt))
+            print(f"  Receding horizon: replan every {replan_every_n_seconds:.1f} s ({replan_every_n_frames} frames at dt={run_cfg.dt} s)", flush=True)
 
     sim_cfg = get_default_simulation_config()
     if args.no_mss_dynamics:
@@ -990,6 +993,7 @@ def main():
         extent_live = (float(x_min) - margin, float(x_max) + margin, float(y_min) - margin, float(y_max) + margin)
         _fig_live, _ax_live, frame_callback = make_live_2d_callback(
             bonds, local_polys_live, ship_length, ship_beam, thicknesses, extent_live, run_n_frames,
+            dt=run_cfg.dt,
         )
         print("  Live 2D view: window will update each frame", flush=True)
     # ── Ocean current model ──
@@ -1052,7 +1056,7 @@ def main():
             goal_point=_goal_point,
             goal_y_line=goal_y_line,
             goal_tolerance=_goal_tol,
-            use_auto_icenav_ship=getattr(args, 'auto_icenav_ship', False),
+            use_auto_icenav_ship=True,
             # build_costmap_jax takes centroids directly (no world-polygon extraction needed)
             skip_polygon_extraction=True,
         )
@@ -1067,8 +1071,15 @@ def main():
             _v_water_all = ocean_current_model.sample_chunk_jax(
                 run_n_frames, _n_ice, pos_jax=None, dtype=None,
             )
+            # Ship-position current: sample at ship's initial position (exact for
+            # uniform current; approximate for spatially-varying fields).
+            import numpy as _np
+            _ship_pos_np = _np.array([[float(ship_pos[0]), float(ship_pos[1])]])
+            _v_ship_1    = ocean_current_model.sample_batch(_ship_pos_np)[0]  # (2,)
+            _v_water_ship_all = _np.tile(_v_ship_1, (run_n_frames, 1))        # (n_frames, 2)
         else:
-            _v_water_all = None  # simulate_full_jax_scan defaults to zeros
+            _v_water_all      = None  # simulate_full_jax_scan defaults to zeros
+            _v_water_ship_all = None
         print("  [JAX-scan] Compiling full-scan program "
               "(first call ~30-60s, subsequent calls fast)...", flush=True)
         sim_result = simulate_full_jax_scan(
@@ -1087,7 +1098,8 @@ def main():
             config=sim_cfg,
             parent_ids=parent_floe_ids,
             v_water_all=_v_water_all,
-            use_auto_icenav_ship=getattr(args, 'auto_icenav_ship', False),
+            v_water_ship_all=_v_water_ship_all,
+            use_auto_icenav_ship=True,
         )
         # Post-process: trim to goal if early-stopping was requested
         if goal_y_line is not None or _goal_point is not None:
@@ -1232,6 +1244,7 @@ def main():
         goal_y_line=goal_y_line,
         max_fracture_thickness=getattr(sim_cfg, "max_fracture_thickness", 15.0),
         initial_floe_of=parent_floe_ids,
+        dt=run_cfg.dt,
     )
     diag["anim_2d"] = time.time() - t0
     print(f"  2D animation time: {diag['anim_2d']:.1f}s", flush=True)
@@ -1248,6 +1261,7 @@ def main():
             path_snapshots=path_snapshots if (args.plan and planned_path is not None) else None,
             max_fracture_thickness=getattr(sim_cfg, "max_fracture_thickness", 15.0),
             initial_floe_of=parent_floe_ids,
+            dt=run_cfg.dt,
         )
         diag["anim_3d"] = time.time() - t0
         print(f"  3D animation time: {diag['anim_3d']:.1f}s", flush=True)
@@ -1272,6 +1286,7 @@ def main():
             ship_length=ship_length, ship_beam=ship_beam,
             output_file=out_costmap, fps=run_cfg.fps_2d, frame_skip=run_cfg.frame_skip_2d,
             n_workers=run_cfg.n_workers,
+            dt=run_cfg.dt,
         )
         diag["anim_costmap"] = time.time() - t0
         print(f"  Costmap movie time: {diag['anim_costmap']:.1f}s", flush=True)

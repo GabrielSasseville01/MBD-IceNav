@@ -276,57 +276,35 @@ def build_ship_dynamics_data(
     """
     Build ShipDynamicsData from ship properties and config.
 
-    Pre-computes M3inv, D3, and DP controller gains so that the JAX
-    simulation loop only needs to do fast linear algebra.
+    Uses the Fossen bis-scaled supply vessel model (matching AUTO-IceNav / paper):
+      M3 = mass * Tbis_inv @ Mbis @ Tbis_inv
+      D3 = mass * sqrt(g/L) * Tbis_inv @ Dbis @ Tbis_inv
+    Controller gains from pole placement:
+      Kp = wn^2 @ diag(M3),  Kd = 2*zeta*wn @ diag(M3) - diag(D3)
+    Integral term disabled (Ki = 0) to match AUTO-IceNav default.
     """
-    from medea_ice_ship.vessel_dynamics import get_mss_style_3dof
+    from medea_ice_ship.auto_icenav_ship import FossenSupply3DOF
 
     m = ship_props.mass
     Izz = (1.0 / 12.0) * m * (ship_length ** 2 + ship_beam ** 2)
 
-    if getattr(cfg, "use_mss_style_dynamics", False):
-        M3, D3 = get_mss_style_3dof(
-            m, Izz,
-            ship_damping_xy=cfg.ship_damping_xy,
-            ship_damping_psi=cfg.ship_damping_psi,
-            added_mass_surge_frac=cfg.mss_added_mass_surge_frac,
-            added_mass_sway_frac=cfg.mss_added_mass_sway_frac,
-            added_mass_yaw_frac=cfg.mss_added_mass_yaw_frac,
-        )
-    else:
-        M3 = np.diag([m, m, Izz])
-        D3 = np.diag([
-            m * cfg.ship_damping_xy,
-            m * cfg.ship_damping_xy,
-            Izz * cfg.ship_damping_psi,
-        ])
+    # Fossen bis-scaled matrices — matches AUTO-IceNav Supply exactly
+    _ship = FossenSupply3DOF(mass=m, length=ship_length)
+    M3    = _ship.M3
+    D3    = _ship.D3
+    M3inv = _ship.M3inv
 
-    M3inv = np.linalg.inv(M3)
+    # Pole-placement gains (matching AUTO-IceNav DPpolePlacement)
+    M3_diag = np.diag(np.diag(M3))
+    D3_diag = np.diag(np.diag(D3))
+    Kp = _ship.wn @ _ship.wn @ M3_diag
+    Kd = 2.0 * _ship.zeta @ _ship.wn @ M3_diag - D3_diag
+    Ki = np.zeros((3, 3))  # integral disabled (commented out in AUTO-IceNav)
 
-    # DP controller gains (pole-placement style, diagonal)
-    Kp_xy = m * getattr(cfg, "Kp_xy_scale", 0.03)
-    Kp_psi = getattr(cfg, "Kp_psi", 5e6)
-    Kd_val = getattr(cfg, "Kd_ship", 0.8)
-    Kp = np.diag([Kp_xy, Kp_xy, Kp_psi])
-    Kd = np.diag([Kd_val, Kd_val, Kd_val])
-    Ki = np.zeros((3, 3))  # integral gain (unused by default)
-
-    # Thruster config (AutoIceNav style: 6 thrusters)
-    # Default: pseudo-inverse of a simple symmetric arrangement
-    try:
-        from medea_ice_ship.auto_icenav_ship import FossenSupply3DOF
-        _ship = FossenSupply3DOF(
-            eta0=[0., 0., 0.], nu0=[0., 0., 0.],
-            ship_length=ship_length, ship_beam=ship_beam,
-            mass=m, Izz=Izz,
-        )
-        B = _ship.B  # (3, 6)
-        B_pinv = np.linalg.pinv(B)  # (6, 3)
-        n_max = _ship.n_max  # (6,)
-    except Exception:
-        B = np.zeros((3, 6))
-        B_pinv = np.zeros((6, 3))
-        n_max = np.ones(6) * 100.0
+    # Thruster config from FossenSupply3DOF
+    B      = _ship.B                                    # (3, 6)
+    B_pinv = _ship.B.T @ np.linalg.inv(_ship.B @ _ship.B.T)  # (6, 3)
+    n_max  = _ship.n_max                                # (6,)
 
     # Build ship hull polygon in local frame (for PIP tests)
     n_pts = 30
@@ -352,7 +330,7 @@ def build_ship_dynamics_data(
     return ShipDynamicsData(
         M3inv=jnp.array(M3inv),
         D3=jnp.array(D3),
-        mass=float(m),
+        mass=float(_ship.mass),
         Izz=float(Izz),
         Kp=jnp.array(Kp),
         Kd=jnp.array(Kd),

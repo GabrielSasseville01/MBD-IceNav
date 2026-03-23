@@ -285,8 +285,8 @@ class RunConfig:
     # If True, use greedy best-first search (f = h) instead of weighted A*.
     # Much faster (DFS-like depth-first toward goal) but paths may be suboptimal.
     planning_greedy: bool = False
-    # Receding horizon (AUTO-IceNav style): replan every this many simulation frames (e.g. 60 ≈ 3 s at 0.05 s dt).
-    planning_replan_every_n_frames: int = 120
+    # Receding horizon (AUTO-IceNav style): replan every this many simulated seconds (converted to frames at runtime via dt).
+    planning_replan_every_n_seconds: float = 30.0
     # If True, refine A* path with NLP (path length + costmap integral + curvature); requires casadi.
     planning_use_path_optimizer: bool = False
     # Path optimizer: number of waypoints (including start/goal).

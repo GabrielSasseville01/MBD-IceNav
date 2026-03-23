@@ -156,6 +156,7 @@ def make_live_2d_callback(
     extent,
     n_frames,
     figsize=(12, 8),
+    dt=0.05,
 ):
     """
     Create (fig, ax, callback) for real-time 2D view during simulation.
@@ -221,7 +222,7 @@ def make_live_2d_callback(
         ax.add_patch(ship_patch)
         n_broken = np.sum(~bond_intact)
         ax.set_title(
-            f"DPDEM Ice-Ship (live)\nFrame {frame}/{n_frames - 1} | Bonds: {n_broken}/{len(bonds)} broken",
+            f"DPDEM Ice-Ship (live)\nTime: {frame * dt:.1f} s | Bonds: {n_broken}/{len(bonds)} broken",
             fontsize=12,
         )
         ax.set_xlabel("X [m]")
@@ -976,7 +977,7 @@ def _draw_2d_frame_to_array(data, frame_idx):
     if goal_y_line is not None:
         ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
     n_broken = np.sum(~intact)
-    ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nFrame {frame}/{data['n_frames']-1} | Bonds: {n_broken}/{len(bonds)} broken", fontsize=14)
+    ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nTime: {frame * data['dt']:.1f} s | Bonds: {n_broken}/{len(bonds)} broken", fontsize=14)
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     fig.canvas.draw()
@@ -1126,7 +1127,7 @@ def _draw_3d_frame_to_array(data, frame_idx):
     ax.set_ylabel("Y [m]")
     ax.set_zlabel("Z [m]")
     n_broken = np.sum(~intact)
-    title = f"DPDEM 3D Ice-Ship Simulation (MEDEA)\nFrame {frame}/{data['n_frames']-1} | Bonds: {n_broken}/{len(bonds)} broken"
+    title = f"DPDEM 3D Ice-Ship Simulation (MEDEA)\nTime: {frame * data['dt']:.1f} s | Bonds: {n_broken}/{len(bonds)} broken"
     if data["color_by_submergence"]:
         title += "\nBlue = submerged | Light = at surface"
     ax.set_title(title)
@@ -1302,7 +1303,7 @@ def _draw_costmap_frame_to_array(data, frame_idx):
     ax.set_ylabel("Y [m]")
     ax.set_aspect("equal")
     ax.legend(loc="upper right", fontsize=9)
-    ax.set_title(f"Costmap + ship trajectory\nFrame {k}/{data['n_frames']-1}")
+    ax.set_title(f"Costmap + ship trajectory\nTime: {k * data['dt']:.1f} s")
     fig.canvas.draw()
     buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
     plt.close(fig)
@@ -1340,6 +1341,7 @@ def animate_costmap_movie(
     frame_skip=1,
     n_workers=1,
     figsize=(12, 12),
+    dt=0.05,
 ):
     """
     Generate a costmap movie (plan-only style): costmap (YlOrRd) as background, ice polygons
@@ -1422,6 +1424,7 @@ def animate_costmap_movie(
         "y_min_ax": y_min_ax, "y_max_ax": y_max_ax,
         "figsize": figsize,
         "dpi": _RENDER_DPI,
+        "dt": dt,
     }
     writer, out_path = _animation_writer(output_file, fps)
     use_mp4 = str(output_file).lower().endswith(".mp4") and out_path.lower().endswith(".mp4")
@@ -1575,7 +1578,7 @@ def animate_costmap_movie(
         ax.set_ylabel("Y [m]")
         ax.set_aspect("equal")
         ax.legend(loc="upper right", fontsize=9)
-        ax.set_title(f"Costmap + ship trajectory\nFrame {k}/{n_frames-1}")
+        ax.set_title(f"Costmap + ship trajectory\nTime: {k * dt:.1f} s")
         return []
 
     anim = FuncAnimation(fig, update, frames=n_render, blit=False)
@@ -1596,6 +1599,7 @@ def animate_ice_ship_2d(
     goal_y_line=None,
     max_fracture_thickness=15.0,
     initial_floe_of=None,
+    dt=0.05,
 ):
     """Animate ice-ship interaction in 2D. n_workers>1 uses parallel rendering (faster). frame_skip>1 renders every Nth frame.
     view_bounds: optional (x_min, x_max, y_min, y_max) to fix the visible domain (e.g. show full grid); if None, auto from ship + ice.
@@ -1688,6 +1692,7 @@ def animate_ice_ship_2d(
             "goal_y_line": goal_y_line,
             "thicknesses": np.asarray(thicknesses) if thicknesses is not None and len(thicknesses) == n_elements else None,
             "max_fracture_thickness": max_fracture_thickness,
+            "dt": dt,
         }
         if merged_floe_display_per_frame is not None:
             data["merged_floe_display_per_frame"] = merged_floe_display_per_frame
@@ -1801,7 +1806,7 @@ def animate_ice_ship_2d(
             ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
         n_broken = np.sum(~intact)
         ax.set_title(f'DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\n'
-                     f'Frame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken', fontsize=14)
+                     f'Time: {frame * dt:.1f} s | Bonds: {n_broken}/{len(bonds)} broken', fontsize=14)
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')
         return []
@@ -1903,6 +1908,7 @@ def animate_ice_ship_3d(
     path_snapshots=None,
     max_fracture_thickness=15.0,
     initial_floe_of=None,
+    dt=0.05,
 ):
     """3D animation with z from submergence. n_workers>1 uses parallel rendering (faster).
     path_snapshots: optional list of (frame_idx, path Nx3); when set, draws remaining planned path at z=0."""
@@ -1983,6 +1989,7 @@ def animate_ice_ship_3d(
             "dpi": _RENDER_DPI,
             "path_snapshots": list(path_snapshots) if path_snapshots else None,
             "max_fracture_thickness": max_fracture_thickness,
+            "dt": dt,
         }
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             tmp_path = f.name
@@ -2121,7 +2128,7 @@ def animate_ice_ship_3d(
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')
         ax.set_zlabel('Z [m]')
-        title = f'DPDEM 3D Ice-Ship Simulation (MEDEA)\nFrame {frame}/{n_frames-1} | Bonds: {n_broken}/{len(bonds)} broken'
+        title = f'DPDEM 3D Ice-Ship Simulation (MEDEA)\nTime: {frame * dt:.1f} s | Bonds: {n_broken}/{len(bonds)} broken'
         if color_by_submergence:
             title += '\nBlue = submerged | Light = at surface'
         ax.set_title(title)
