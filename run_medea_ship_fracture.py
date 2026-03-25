@@ -135,6 +135,10 @@ def main():
                         help='Ridge cost weight (default 2.0 when --ridge-costmap set)')
     parser.add_argument('--no-ke-cost', action='store_true',
                         help='Use thickness-based cost instead of AUTO-IceNav KE cost')
+    parser.add_argument('--ice-brake-force', type=float, default=None, metavar='N',
+                        help='Ice brake threshold [N]: when surge ice force exceeds this, '
+                             'setpoint is blended toward ship position to reduce DP thrust in ice. '
+                             'Default: disabled (0). Example: 1e6 (1 MN)')
     parser.add_argument('--no-replan', action='store_true',
                         help='With --plan: use single initial plan for whole run (no receding-horizon replanning)')
     parser.add_argument('--output-dir', type=str, default='outputs/default',
@@ -153,7 +157,7 @@ def main():
     parser.add_argument('--current-only', action='store_true',
                         help='With --simple: ship stays far left (no collision). Use to verify ice drifts from current alone.')
     parser.add_argument('--frames', type=int, default=None, metavar='N',
-                        help='Number of simulation frames to run. With --simple or --full-map, sets trajectory length to N; otherwise overrides config n_frames. Simulated time = N × dt.')
+                        help='Early-stop: run only the first N frames of the simulation. Does not affect ship speed, trajectory interpolation, or planning. Simulated time = N × dt.')
     parser.add_argument('--target-speed', type=float, default=None, metavar='M/S',
                         help='Target ship speed [m/s] when --plan. Derives n_frames so path is traversed at this speed. Also used in KE collision cost. Default 4.0 (realistic icebreaker).')
     parser.add_argument('--optimize-speed', action='store_true',
@@ -486,12 +490,7 @@ def main():
         ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), ship_heading) for frame in range(n_frames + 1)]
         ship_pos = ship_trajectory[0][0]
         drift_vel = 0.0
-        if getattr(args, 'frames', None) is not None:
-            n_frames = args.frames
-            ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), ship_heading) for frame in range(n_frames + 1)]
-            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames (--frames)", flush=True)
-        else:
-            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames", flush=True)
+        print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> ({ship_end[0]:.0f}, {ship_end[1]:.0f}), {n_frames} frames", flush=True)
     elif args.full_map:
         inset = ship_length / 2 + run_cfg.path_margin
         # Original full-map setup: start near bottom-left, goal near top edge (y=600)
@@ -503,12 +502,7 @@ def main():
         ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
         ship_pos = ship_trajectory[0][0]
         drift_vel = 0.0
-        if getattr(args, 'frames', None) is not None:
-            n_frames = args.frames
-            ship_trajectory = [(ship_start + (frame / n_frames) * (ship_end - ship_start), diagonal_heading) for frame in range(n_frames + 1)]
-            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°, {n_frames} frames (--frames)", flush=True)
-        else:
-            print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°, {n_frames} frames", flush=True)
+        print(f"  Ship path: ({ship_start[0]:.0f}, {ship_start[1]:.0f}) -> top edge (y={goal_y_line:.0f}), heading {np.degrees(diagonal_heading):.0f}°, {n_frames} frames", flush=True)
     else:
         rightmost_edge = max(centroids[i, 0] + radii[i] for i in range(len(centroids)))
         ship_bow_x = rightmost_edge + 5
@@ -528,7 +522,6 @@ def main():
     use_target_speed = (
         args.plan and (synthetic_mode or args.full_map)
         and getattr(run_cfg, 'planning_use_target_speed', True)
-        and getattr(args, 'frames', None) is None
     )
     if use_target_speed:
         target_speed = getattr(args, 'target_speed', None) or getattr(run_cfg, 'planning_target_speed', 4.0)
@@ -616,7 +609,7 @@ def main():
             plan_x_min, plan_x_max, plan_y_min, plan_y_max,
             resolution=plan_cfg.planning_resolution,
             margin=plan_cfg.planning_margin,
-            ship_mass=plan_cfg.ship_displacement,
+            ship_mass=ship_displacement,
             collision_cost=plan_cfg.planning_ice_collision_cost,
             damage_cost_scale=plan_cfg.planning_damage_cost_scale,
             damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
@@ -760,13 +753,25 @@ def main():
             # Clip/extend the optimized path to end at the goal (MBD/etc may overshoot).
             if path is not None and len(path) > 0:
                 path = _clip_path_to_goal(path, goal, goal_y_line_val=goal_y_line)
-        use_speed_opt = getattr(args, 'optimize_speed', False) or getattr(plan_cfg, 'planning_optimize_speed', False)
+        # Speed optimization: explicit flag or config flag only (not auto-enabled with KE cost).
+        # The KE cost scale and time_weight=1.0 together push v_opt to v_min for most ice
+        # conditions, causing n_frames to balloon and the ship to barely move.
+        use_speed_opt = (
+            getattr(args, 'optimize_speed', False)
+            or getattr(plan_cfg, 'planning_optimize_speed', False)
+        )
         speed_profile = None
         if use_speed_opt:
             v_ref = _ship_speed
             v_min = getattr(plan_cfg, 'planning_speed_optimize_v_min', 1.0)
             v_max = getattr(plan_cfg, 'planning_speed_optimize_v_max', 8.0)
-            tw = getattr(plan_cfg, 'planning_speed_optimize_time_weight', 1.0)
+            # Auto-calibrate time_weight so that v_opt = v_ref in open water (c = base_cost).
+            # From v_ref = (lam * v_ref^2 / (2 * c_open))^(1/3) → lam = 2 * c_open * v_ref.
+            # planning_speed_optimize_time_weight is a unit-free scale factor (1.0 = open-water
+            # speed equals target speed; >1 = faster overall; <1 = more conservative).
+            c_open = getattr(cost_map, 'base_cost', 0.1)
+            tw_scale = getattr(plan_cfg, 'planning_speed_optimize_time_weight', 1.0)
+            tw = tw_scale * 2.0 * c_open * v_ref
             speed_profile, total_time = optimize_speed_profile(
                 path, cost_map, v_ref=v_ref, v_min=v_min, v_max=v_max,
                 time_weight=tw, ship_length=ship_length, ship_beam=ship_beam,
@@ -937,19 +942,25 @@ def main():
                 path_f = _clip_path_to_goal(path_f, goal, goal_y_line_val=goal_y_line)
             path_snapshots.append((frame, path_f.copy()))  # for costmap movie: show this plan from this frame on
             sp_f = None
+            T_raw = None
             if use_speed_opt and path_f is not None and len(path_f) >= 2:
                 sp_f, T_raw = optimize_speed_profile(
                     path_f, cost_map_f, v_ref=_ship_speed,
                     v_min=getattr(plan_cfg, 'planning_speed_optimize_v_min', 1.0),
                     v_max=getattr(plan_cfg, 'planning_speed_optimize_v_max', 8.0),
-                    time_weight=getattr(plan_cfg, 'planning_speed_optimize_time_weight', 1.0),
+                    time_weight=getattr(plan_cfg, 'planning_speed_optimize_time_weight', 1.0) * 2.0 * getattr(cost_map_f, 'base_cost', 0.1) * _ship_speed,
                     ship_length=ship_length, ship_beam=ship_beam,
                 )
-                T_target = n_remaining * run_cfg.dt
-                if T_raw > 1e-9:
-                    alpha = T_raw / T_target
-                    sp_f = np.maximum(sp_f * alpha, 1e-6)
-            return path_to_ship_trajectory_arr(path_f, n_remaining, speed_profile=sp_f)
+            # Determine n_frames for the replanned trajectory:
+            # - With speed optimization: use ceil(T_raw / dt) so each sim frame advances by exactly
+            #   one dt of traversal time, matching the speed profile calibration.
+            # - Without speed optimization: use n_frames - frame (natural remaining budget from the
+            #   initial target-speed computation) so ship speed is consistent regardless of --frames.
+            if use_speed_opt and T_raw is not None:
+                n_frames_f = max(1, int(np.ceil(T_raw / run_cfg.dt)))
+            else:
+                n_frames_f = max(1, n_frames - frame)
+            return path_to_ship_trajectory_arr(path_f, n_frames_f, speed_profile=sp_f)
 
         if args.no_replan:
             replan_callback = None
@@ -977,14 +988,18 @@ def main():
         from dataclasses import replace
         sim_cfg = replace(sim_cfg, max_ship_ice_force=args.thrust_cap)
         print(f"  Thrust cap: {args.thrust_cap/1e6:.1f} MN", flush=True)
+    if getattr(args, 'ice_brake_force', None) is not None:
+        sim_cfg = replace_config(sim_cfg, ice_brake_threshold=float(args.ice_brake_force))
+        print(f"  Ice brake: threshold {args.ice_brake_force/1e6:.2f} MN "
+              f"(setpoint blended toward ship pos when ice surge force exceeds threshold)", flush=True)
     if args.no_dpdem_bonds:
         sim_cfg = replace_config(sim_cfg, use_dpdem_style_bonds=False)
         print("  Bond model: legacy (force vs strength)", flush=True)
-    # --frames: run only the first N frames (trajectory stays at realistic speed; we just truncate execution)
+    # --frames: run only the first N frames (early stop only; trajectory kept at full length so
+    # replanning can write new segments beyond run_n_frames without shape errors).
     _n_frames_arg = getattr(args, 'frames', None)
     run_n_frames = min(n_frames, _n_frames_arg) if _n_frames_arg is not None else n_frames
-    if ship_trajectory is not None and run_n_frames < n_frames:
-        ship_trajectory = ship_trajectory[: run_n_frames + 1]
+    if _n_frames_arg is not None and run_n_frames < n_frames:
         print(f"  Running first {run_n_frames} of {n_frames} frames (--frames {_n_frames_arg}); ship speed unchanged.", flush=True)
     frame_callback = None
     if args.live:

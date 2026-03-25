@@ -130,7 +130,7 @@ def dp_control_jax(
     nu: jnp.ndarray,           # (3,) [u, v, r]
     e_int: jnp.ndarray,        # (3,) integral error accumulator
     setpoint: jnp.ndarray,     # (3,) [x_d, y_d, psi_d]
-    setpoint_next: jnp.ndarray,# (3,) reserved (unused; kept for API compatibility)
+    setpoint_next: jnp.ndarray,# (3,) unused here; velocity feedforward is in ship_step_jax
     Kp: jnp.ndarray,           # (3, 3) proportional gain
     Kd: jnp.ndarray,           # (3, 3) derivative gain
     Ki: jnp.ndarray,           # (3, 3) integral gain (zero = disabled, AUTO-IceNav default)
@@ -139,14 +139,15 @@ def dp_control_jax(
     """
     DP pole-placement control law matching AUTO-IceNav's DPpolePlacement.
 
+    Feedback-only term; velocity feedforward (D3 @ nu_d) is added by the
+    caller (ship_step_jax) so that this function stays identical to the
+    AUTO-IceNav reference implementation.
+
     Body-frame control law (Fossen 2021):
         e     = eta - [x_d, y_d, psi_d]        (world-frame error)
         e[2]  = ssa(e[2])                        (heading wrapped to [-pi,pi])
         tau   = -R(psi)^T @ Kp @ e - Kd @ nu   (no integral by default)
               - R(psi)^T @ Ki @ e_int           (if Ki != 0)
-
-    This matches AUTO-IceNav supply.py / control.py DPpolePlacement exactly.
-    No velocity feedforward (not in the reference implementation).
 
     Parameters
     ----------
@@ -154,7 +155,7 @@ def dp_control_jax(
     nu            : current body-frame velocity [u, v, r]
     e_int         : accumulated integral error (3,)
     setpoint      : desired pose [x_d, y_d, psi_d]
-    setpoint_next : unused (kept for API compatibility)
+    setpoint_next : passed through for API compatibility; not used here
     Kp, Kd, Ki   : controller gain matrices (3, 3)
     dt            : integration step [s]
 
@@ -300,24 +301,39 @@ def ship_step_jax(
     # Convert ice forces from world → body frame
     tau_ice_body = R_mat.T @ tau_ice
 
+    # Velocity feedforward: steady-state force to sustain desired trajectory velocity.
+    # Derived from D3 @ nu_d where nu_d = R^T @ v_d_world and
+    # v_d_world = (setpoint_next - setpoint) / dt (one-step finite difference).
+    # This cancels the damping term for the desired velocity so the controller
+    # does not have to "fight" the trajectory motion with feedback alone.
+    dpsi_d = (setpoint_next[2] - setpoint[2] + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    v_d_world = jnp.array([
+        (setpoint_next[0] - setpoint[0]) / dt,
+        (setpoint_next[1] - setpoint[1]) / dt,
+        dpsi_d / dt,
+    ])
+    nu_d   = R_mat.T @ v_d_world   # desired velocity in body frame
+    tau_ff = (ship_dyn.D3 + ship_dyn.Kd) @ nu_d    # feedforward: cancel D3 damping + Kd controller term → zero steady-state lag
+
     if use_auto_icenav:
-        # DP controller → desired tau3
+        # DP controller → desired tau3 (feedback only)
         tau_ctrl, e_int_new = dp_control_jax(
             eta, nu, e_int, setpoint, setpoint_next,
             ship_dyn.Kp, ship_dyn.Kd, ship_dyn.Ki, dt,
         )
-        # Thrust allocation → RPM command
-        n_cmd = control_alloc_jax(tau_ctrl, ship_dyn.B_pinv, ship_dyn.n_max)
+        # Thrust allocation with feedforward included
+        n_cmd = control_alloc_jax(tau_ctrl + tau_ff, ship_dyn.B_pinv, ship_dyn.n_max)
         # Propeller dynamics
         n_actual_new = propeller_dynamics_jax(n_actual, n_cmd, T_n, dt)
         # Actual thrust produced
         tau_ctrl_actual = thruster_forces_jax(n_actual_new, B)
     else:
-        # Simple PD with velocity feedforward (matches simulation.py control law)
+        # DP feedback + velocity feedforward
         tau_ctrl_actual, e_int_new = dp_control_jax(
             eta, nu, e_int, setpoint, setpoint_next,
             ship_dyn.Kp, ship_dyn.Kd, ship_dyn.Ki, dt,
         )
+        tau_ctrl_actual = tau_ctrl_actual + tau_ff
         n_actual_new = n_actual  # unchanged
 
     # Total body-frame forcing

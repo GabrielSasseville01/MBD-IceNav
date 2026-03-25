@@ -204,6 +204,13 @@ class SimulationConfig:
     ship_velocity_clip: Tuple[float, float, float] = (15.0, 8.0, 0.15)
     # N — cap on magnitude of ice-on-ship force from collision (thrust limit). Default 25 MN is order-of-magnitude for typical icebreaker bollard pull / installed thrust (e.g. 1–50 MN range); set to None to disable (unlimited thrust).
     max_ship_ice_force: Optional[float] = 25e6
+    # N — ice brake threshold for setpoint blending.  When the surge ice reaction force exceeds
+    # this value the DP setpoint is blended back toward the current ship position, reducing the
+    # position error that drives the controller and preventing the ship from over-thrusting
+    # against heavy ice.  Formula: brake_factor = clip(threshold / F_surge, 0.1, 1.0),
+    # effective_setpoint = ship_pos + brake_factor * (setpoint - ship_pos).
+    # Set to 0.0 (default) to disable — existing behaviour is unchanged.
+    ice_brake_threshold: float = 0.0
     # If True, cap ice-on-ship impulse so the ship loses kinetic energy (stops) but does not bounce (no elastic pushback beyond full stop).
     collision_impulse_dissipation_cap: bool = True
     # When collision_impulse_dissipation_cap: cap impulse at this fraction of ship momentum along collision direction (1.0 = at most full stop, no reversal).
@@ -324,7 +331,9 @@ class RunConfig:
     # If True and --plan, optimize speed per segment: slower in thick ice, faster in open water.
     # Balances impact cost (KE ∝ v²) vs time. Overrides fixed target speed when enabled.
     planning_optimize_speed: bool = False
-    # Speed optimization: weight for time in objective (higher = prefer faster).
+    # Speed optimization: unit-free scale factor for the auto-calibrated time weight.
+    # Effective λ = planning_speed_optimize_time_weight × 2 × base_cost × v_ref, which
+    # gives v_opt = v_ref in open water when scale=1.0. >1 biases toward higher speeds; <1 is more conservative.
     planning_speed_optimize_time_weight: float = 1.0
     # Speed optimization: min/max speed [m/s].
     planning_speed_optimize_v_min: float = 1.0

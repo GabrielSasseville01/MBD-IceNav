@@ -353,6 +353,7 @@ def _make_frame_step(
     effective_strength_collision = cfg.effective_strength_collision
     max_fracture_thickness = getattr(cfg, "max_fracture_thickness", 15.0)
     max_ship_ice_force = cfg.max_ship_ice_force  # None or float (N)
+    ice_brake_threshold = float(getattr(cfg, 'ice_brake_threshold', 0.0))  # N; 0 = disabled
     bond_cohesion   = cfg.bond_cohesion
     bond_internal_friction = cfg.bond_internal_friction
     bond_G_c_I      = cfg.bond_G_c_I
@@ -655,9 +656,26 @@ def _make_frame_step(
         state = state._replace(dpdem_floe_eligible=new_dpdem_eligible)
 
         # ── 8. Ship dynamics update ────────────────────────────────────────────
+        # Ice brake: blend setpoint toward current position when surge ice force is
+        # large, reducing DP position error and preventing over-thrusting in ice.
+        # Activated only when ice_brake_threshold > 0 (disabled by default).
+        if ice_brake_threshold > 0.0:
+            ice_surge = jnp.abs(tau_ice_world[0])
+            brake_factor = jnp.clip(
+                ice_brake_threshold / jnp.maximum(ice_surge, ice_brake_threshold),
+                0.1, 1.0,
+            )
+            eff_setpoint = jnp.array([
+                ship_state.eta[0] + brake_factor * (setpoint[0] - ship_state.eta[0]),
+                ship_state.eta[1] + brake_factor * (setpoint[1] - ship_state.eta[1]),
+                setpoint[2],  # heading target unchanged
+            ])
+        else:
+            eff_setpoint = setpoint
+
         eta_new, nu_new, n_actual_new, e_int_new = ship_step_jax(
             ship_state.eta, ship_state.nu, ship_state.n_actual, ship_state.e_int,
-            setpoint, setpoint_next, tau_ice_world,
+            eff_setpoint, setpoint_next, tau_ice_world,
             ship_dyn, B_mat, T_n, dt,
             v_water_ship=v_water_ship,
             use_auto_icenav=use_auto_icenav,
@@ -1558,6 +1576,12 @@ def simulate_jax_chunked_replan(
                     new_traj = _trajectory_list_to_arr(new_traj)
                 else:
                     new_traj = np.asarray(new_traj, dtype=np.float64)
+                # Clip new_traj to what fits in the pre-allocated buffer.
+                # The replanned path may take longer than the original plan's remaining
+                # time (e.g. when using speed optimization with a longer detour), so
+                # new_traj can exceed the buffer without this guard.
+                max_len = len(ship_trajectory) - frame_start
+                new_traj = new_traj[:max_len]
                 end_slice = frame_start + len(new_traj)
                 ship_trajectory[frame_start:end_slice] = new_traj
                 if end_slice < len(ship_trajectory):

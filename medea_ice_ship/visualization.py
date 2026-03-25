@@ -977,7 +977,10 @@ def _draw_2d_frame_to_array(data, frame_idx):
     if goal_y_line is not None:
         ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
     n_broken = np.sum(~intact)
-    ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nTime: {frame * data['dt']:.1f} s | Bonds: {n_broken}/{len(bonds)} broken", fontsize=14)
+    _spd_hist = data.get("ship_speed_history")
+    _spd = _spd_hist[frame] if (_spd_hist is not None and frame < len(_spd_hist)) else None
+    _spd_str = f" | Speed: {_spd:.2f} m/s" if _spd is not None else ""
+    ax.set_title(f"DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\nTime: {frame * data['dt']:.1f} s | Bonds: {n_broken}/{len(bonds)} broken{_spd_str}", fontsize=14)
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     fig.canvas.draw()
@@ -1667,6 +1670,19 @@ def animate_ice_ship_2d(
     if ocean_current is not None and getattr(ocean_current, 'is_active', False):
         _current_viz_data = ocean_current.get_field_for_viz(x_min, x_max, y_min, y_max, nx=18, ny=18)
 
+    # Pre-compute ship speed [m/s] at each frame from consecutive positions
+    _ship_speed_history = []
+    for _fi in range(n_frames):
+        if _fi < len(ship_history) - 1:
+            _p0 = np.asarray(ship_history[_fi][0])
+            _p1 = np.asarray(ship_history[_fi + 1][0])
+            _spd = float(np.linalg.norm(_p1 - _p0) / dt)
+        elif len(ship_history) > 0:
+            _spd = _ship_speed_history[-1] if _ship_speed_history else 0.0
+        else:
+            _spd = 0.0
+        _ship_speed_history.append(_spd)
+
     if n_workers > 1 and use_mp4 and n_render > 0:
         print(f"Creating 2D animation with {n_render} frames (parallel, n_workers={n_workers})...", flush=True)
         data = {
@@ -1693,6 +1709,7 @@ def animate_ice_ship_2d(
             "thicknesses": np.asarray(thicknesses) if thicknesses is not None and len(thicknesses) == n_elements else None,
             "max_fracture_thickness": max_fracture_thickness,
             "dt": dt,
+            "ship_speed_history": _ship_speed_history,
         }
         if merged_floe_display_per_frame is not None:
             data["merged_floe_display_per_frame"] = merged_floe_display_per_frame
@@ -1805,8 +1822,10 @@ def animate_ice_ship_2d(
         if goal_y_line is not None:
             ax.axhline(goal_y_line, color="lime", ls="--", lw=2, label=f"Goal line y={goal_y_line:.0f}", zorder=4)
         n_broken = np.sum(~intact)
+        _spd = _ship_speed_history[frame] if frame < len(_ship_speed_history) else None
+        _spd_str = f" | Speed: {_spd:.2f} m/s" if _spd is not None else ""
         ax.set_title(f'DPDEM Ice-Ship Simulation (MEDEA Satellite Floes)\n'
-                     f'Time: {frame * dt:.1f} s | Bonds: {n_broken}/{len(bonds)} broken', fontsize=14)
+                     f'Time: {frame * dt:.1f} s | Bonds: {n_broken}/{len(bonds)} broken{_spd_str}', fontsize=14)
         ax.set_xlabel('X [m]')
         ax.set_ylabel('Y [m]')
         return []

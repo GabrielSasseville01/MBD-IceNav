@@ -60,7 +60,8 @@ from functools import partial
 class JaxCostMapResult:
     """
     Thin wrapper around a (rows, cols) numpy cost array with CostMap-compatible
-    attributes so it can be passed directly to ``jax_mbd_planner.jax_mbd_optimize``.
+    attributes so it can be passed directly to ``jax_mbd_planner.jax_mbd_optimize``
+    and ``optimize_speed_profile``.
 
     Attributes
     ----------
@@ -72,6 +73,7 @@ class JaxCostMapResult:
     cols       : int
     width      : float — world width  (cols * resolution)
     height     : float — world height (rows * resolution)
+    base_cost  : float — open-water traversal cost (same value passed to build_costmap_jax)
     """
     cost_map:   np.ndarray
     x_origin:   float
@@ -81,6 +83,20 @@ class JaxCostMapResult:
     cols:       int
     width:      float
     height:     float
+    base_cost:  float = 0.1
+
+    def get_cost_world(self, x: float, y: float) -> float:
+        """Sample costmap at world coordinates (x, y).
+
+        Returns the cell value if inside the grid, or ``base_cost`` for
+        out-of-bounds queries — matching the CostMap interface used by
+        ``optimize_speed_profile``.
+        """
+        col = int((x - self.x_origin) / self.resolution)
+        row = int((y - self.y_origin) / self.resolution)
+        if 0 <= row < self.rows and 0 <= col < self.cols:
+            return float(self.cost_map[row, col])
+        return float(self.base_cost)
 
 
 # ── Disk-based JAX rasterizer ──────────────────────────────────────────────────
@@ -397,6 +413,7 @@ def build_costmap_jax(
         cols=int(cols),
         width=float(width),
         height=float(height),
+        base_cost=float(base_cost),
     )
 
     bounds = {
