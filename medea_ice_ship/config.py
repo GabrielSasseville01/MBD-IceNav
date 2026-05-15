@@ -304,22 +304,13 @@ class RunConfig:
     planning_optimizer_curvature_weight: float = 10.0
     # Path optimizer: max Ipopt iterations.
     planning_optimizer_max_iter: int = 500
-    # Damage-aware cost (legacy power-law model): if > 0, costmap includes thickness-based damage potential.
-    planning_damage_cost_scale: float = 0.0
-    planning_damage_thickness_exponent: float = 0.5
-    # Exponential thickness cost model: cost = collision_cost * exp(scale * h / h_ref).
-    # Gives thin ice (~0.5m) moderate cost (~60) and thick ice (~2.5m) near-impassable cost (~9000).
-    # Open water stays at base_cost (1.0). Set to 0 to disable and use legacy flat model.
-    planning_ice_cost_exp_scale: float = 3.0
-    # Base cost multiplier for ice cells (coefficient in front of the exponential).
+    # KE cost weight (collision_cost_weight in AUTO-IceNav model).
     planning_ice_collision_cost: float = 5.0
     # Ridge costmap (AUTO-IceNav): path to pickle from generate_ridge_costmap.py; None = disabled.
     planning_ridge_costmap_file: Optional[str] = None
     # Ridge cost weight (additive; 0 = disabled). Higher = planner avoids ridges more.
     planning_ridge_cost_weight: float = 0.0
-    # Cost model: True = AUTO-IceNav KE-based (speed, mass, radial, SIC); False = thickness-based.
-    planning_use_ke_cost: bool = True
-    # Ship speed [m/s] for KE cost (when planning_use_ke_cost).
+    # Ship speed [m/s] for KE cost.
     planning_ship_speed: float = 4.0
     # Target ship speed [m/s] when planning. If planning_use_target_speed, n_frames is derived so
     # path is traversed at this speed (realistic icebreaker ~4 m/s). Also used in KE collision cost.
@@ -366,25 +357,35 @@ class RunConfig:
     # Planning horizon (number of action steps; trajectory length = horizon+1).
     # With dt_action = dt_substep × n_substeps, total trajectory covers H × dt_action × speed.
     # At 4 m/s with dt_action=1s, H=300 covers ~1200 m (enough for a 1400 m map).
-    planning_jax_mbd_horizon: int = 300
+    planning_jax_mbd_horizon: int = 700
     # Monte Carlo samples per diffusion step (higher = better coverage of action space).
     planning_jax_mbd_nsample: int = 2048
     # Number of reverse diffusion steps.
     planning_jax_mbd_ndiffuse: int = 50
     # Softmax temperature for importance weighting (lower = greedier).
-    planning_jax_mbd_temperature: float = 0.5
+    planning_jax_mbd_temperature: float = 0.01
     # Noise schedule endpoints.
-    planning_jax_mbd_beta0: float = 1e-4
+    planning_jax_mbd_beta0: float = 1e-5
     planning_jax_mbd_betaT: float = 0.05
     # Cost weight: accumulated costmap traversal (hull-aware, segment-length weighted).
     # Mirrors the A* lattice planner's costmap integral.
     planning_jax_mbd_costmap_weight: float = 1.0
     # Cost weight: goal-reaching (small nudge; replaces A*'s heuristic guidance).
-    planning_jax_mbd_goal_weight: float = 0.1
+    planning_jax_mbd_goal_weight: float = 0.0#0.1
     # Cost weight: total arc length (matches A*'s base distance cost).
-    planning_jax_mbd_length_weight: float = 1.0
+    planning_jax_mbd_length_weight: float = 0.0#1.0
     # Cost weight: control smoothness (penalise sudden changes).
-    planning_jax_mbd_smoothness_weight: float = 0.005
+    planning_jax_mbd_smoothness_weight: float = 0#20268.0
+    # Cost weight: x-deviation at goal-line crossing (soft goal x alignment).
+    planning_jax_mbd_goal_x_weight: float = 0.0
+    # Normalises the raw costmap-traversal cost before applying costmap_weight.
+    # The costmap integral (sum of KE cell values × segment lengths) is divided
+    # by this value so that costmap_weight=1.0 gives equal importance to the
+    # costmap and path-length terms at the reference ice density.
+    # Use calibration/calibrate_from_mbd_debug.py to compute the right value
+    # for your scenario (≈ mean_costmap_integral / mean_path_length).
+    # Default 1.0 = no normalisation (backward-compatible).
+    planning_jax_mbd_costmap_normalizer: float = 1.0#108.2
     # Max surge force [N].
     planning_jax_mbd_surge_max: float = 2e6
     # Max sway force [N].
@@ -401,6 +402,34 @@ class RunConfig:
     # Warm-start MBD from the lattice A* path (seeds initial actions from path headings).
     # When False, MBD starts from a constant forward-surge bias (pure diffusion, no A* prior).
     planning_jax_mbd_warm_start: bool = True
+    # When True, the plan output is the best individual sample action sequence seen across
+    # ALL denoising steps (lowest cost_fn(Y0) encountered), rather than the iterated
+    # weighted-mean Ybar_final.  Useful for diagnosing mean-aggregation failures in
+    # non-convex cost landscapes.
+    planning_jax_mbd_use_best_sample: bool = False
+    # --- Homotopy-class MBD seeding and classification ---
+    # When True, each homotopy class is warm-started from a geometric path that routes
+    # through that class's passage sequence (Hernandez et al. reference-frame seeding).
+    # Fixes exploration failure for topologically complex classes (e.g. sequential gates).
+    planning_jax_mbd_homotopy_per_class_seeds: bool = True
+    # When True, use the Hernandez reference-frame classifier (ray cross-product side test)
+    # instead of the default mean-x proximity classifier.
+    planning_jax_mbd_use_rf_classifier: bool = False
+    # --- EB-MBD (Emerging-Barrier MBD): constraint enforcement via log-barrier ---
+    # When True, replaces big-M OOB/goal penalties with an emerging log-barrier.
+    # See: Mishra & Manchester (2026) "EB-MBD: Emerging-Barrier Model-Based Diffusion".
+    planning_jax_mbd_use_eb_mbd: bool = False
+    # Barrier offset at the start of reverse diffusion (c_S = c_max, relaxed).
+    # Should be ≥ max expected constraint violation in metres.
+    # For the toy bimodal scenario: goal miss ~1350 m, so c_max ≥ 1500.
+    planning_jax_mbd_eb_c_max: float = 1500.0
+    # Barrier hardness in cost units.  Must be on the same scale as J(x).
+    # With J(x) ~ 1e4–1e5 and log(c_max) ~ 7, mu ~ 1e4 puts the barrier
+    # at ~10–30% of J to guide without dominating.  Tune via the alive-fraction
+    # diagnostic: at s=S it should be ≈ 1.0; at s=0 it should be < 0.5.
+    planning_jax_mbd_eb_mu: float = 50000.0
+    # Barrier schedule shape.  κ=1 → linear; κ>1 → slow then fast tightening.
+    planning_jax_mbd_eb_kappa: float = 1.0
     # --- JAX MPPI (used when --planner mppi) ---
     planning_mppi_horizon: int = 300
     # More samples than MBD because MPPI relies on breadth per iteration.
@@ -423,6 +452,19 @@ class RunConfig:
     planning_sqp_warm_start: bool = True
     planning_sqp_dt_substep: float = 1.0
     planning_sqp_n_substeps: int = 5
+    # --- JAX Random Single Shooting (used when --planner random-shooting) ---
+    planning_rss_horizon: int = 300
+    planning_rss_nsample: int = 4096
+    planning_rss_warm_start: bool = True
+    # --- JAX Box-iLQR (used when --planner ilqr) ---
+    planning_ilqr_horizon: int = 150
+    planning_ilqr_max_iters: int = 30
+    planning_ilqr_reg: float = 1e-4
+    planning_ilqr_sigma0: float = 0.1
+    planning_ilqr_barrier_tol: float = 1e-4
+    planning_ilqr_barrier_reduction: float = 0.1
+    planning_ilqr_armijo_c: float = 1e-4
+    planning_ilqr_warm_start: bool = True
     # --- JAX GradCEM (used when --planner gradcem) ---
     planning_gradcem_horizon: int = 300
     planning_gradcem_nsample: int = 512

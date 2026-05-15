@@ -2,26 +2,10 @@
 JAX-native costmap builder for the ice-ship simulation.
 
 Replaces ``medea_ice_ship.costmap_build.build_costmap_from_ice_state`` for the
-receding-horizon diffusion-MPC pipeline.  Unlike the NumPy version (which uses
-OpenCV polygon rasterization + dilation), this implementation uses JAX scatter
-operations so the costmap can be built entirely on the GPU, avoiding a
-device-to-host round-trip between the simulation and the planner.
+receding-horizon diffusion-MPC pipeline.  Uses JAX scatter operations so the
+costmap can be built entirely on the GPU, avoiding a device-to-host round-trip.
 
-Cost models
------------
-Two cost models are supported, selected via ``use_ke_cost`` in
-``build_costmap_jax``:
-
-**Exponential thickness model** (default, ``use_ke_cost=False``):
-
-    cost(x, y) = base_cost + sum_i  ice_cost_i * disk_i(x, y)
-
-where disk_i is 1 inside the element's effective radius and ice_cost_i
-follows the exponential thickness model:
-
-    ice_cost_i = collision_cost * exp(ice_cost_exp_scale * h_i / thickness_ref)
-
-**AUTO-IceNav KE collision model** (``use_ke_cost=True``):
+Uses the AUTO-IceNav KE collision cost model:
 
     cost(x, y) = max_i [ ke_i * max(0, (eff_r_i² - d²) / eff_r_i²) ]
 
@@ -29,8 +13,7 @@ where ke_i is the per-element kinetic-energy constant based on ship speed,
 ship mass, and ice floe mass, and the parabolic falloff provides a smooth
 cost field. Overlapping elements contribute the maximum (not sum) at each
 cell. SIC modulation (``ice_resistance_weight > 0``) scales the KE cost by
-local sea-ice concentration raised to a power, matching the AUTO-IceNav
-resistance model.
+local sea-ice concentration raised to a power.
 
 Ship-footprint dilation is applied via a max-pooling operation (equivalent to
 ``scipy.ndimage.maximum_filter``) so the planner keeps the ship center at
@@ -110,63 +93,6 @@ def _make_disk_kernel(inflation_r: float, resolution: float) -> jnp.ndarray:
     RR, CC = jnp.meshgrid(r_idx, c_idx, indexing="ij")
     dist = jnp.sqrt((RR * resolution) ** 2 + (CC * resolution) ** 2)
     return (dist <= inflation_r).astype(jnp.float32)
-
-
-@partial(jax.jit, static_argnames=("rows", "cols"))
-def _rasterize_elements(
-    centroids: jnp.ndarray,    # (n, 2)
-    radii:     jnp.ndarray,    # (n,)
-    ice_costs: jnp.ndarray,    # (n,)  per-element cost weight
-    base_cost: float,
-    x_origin:  float,
-    y_origin:  float,
-    resolution: float,
-    rows: int,
-    cols: int,
-    radius_buffer: float = 0.0,  # extra radius multiplier (obs_cost_buffer_factor)
-) -> jnp.ndarray:               # (rows, cols) float32
-    """
-    Paint ice elements as filled disks onto a (rows, cols) cost grid.
-
-    Each element contributes ``ice_costs[i]`` to all cells whose center lies
-    within ``radii[i] * (1 + radius_buffer)`` metres of ``centroids[i]``.
-
-    Multiple overlapping elements have their costs summed.
-
-    Parameters
-    ----------
-    centroids, radii, ice_costs : (n,) or (n, 2)
-        Per-element geometry and cost.
-    base_cost : float
-        Background cost for open water.
-    x_origin, y_origin, resolution, rows, cols : grid metadata
-    radius_buffer : float
-        Extra fractional radius (like ``obs_cost_buffer_factor``).
-        Effective radius = radii[i] * (1 + radius_buffer).
-    """
-    # Cell-centre world coordinates: (rows, cols)
-    c_idx = jnp.arange(cols, dtype=jnp.float32)
-    r_idx = jnp.arange(rows, dtype=jnp.float32)
-    cell_x = x_origin + (c_idx + 0.5) * resolution          # (cols,)
-    cell_y = y_origin + (r_idx + 0.5) * resolution          # (rows,)
-    XX, YY = jnp.meshgrid(cell_x, cell_y)                   # (rows, cols)
-
-    def element_contribution(centroid, radius, cost):
-        """Single element: returns (rows, cols) contribution array."""
-        eff_r = radius * (1.0 + radius_buffer)
-        dist2 = (XX - centroid[0]) ** 2 + (YY - centroid[1]) ** 2
-        inside = dist2 <= eff_r ** 2
-        return inside.astype(jnp.float32) * cost
-
-    # vmap over all elements: (n, rows, cols)
-    contributions = jax.vmap(element_contribution)(
-        centroids.astype(jnp.float32),
-        radii.astype(jnp.float32),
-        ice_costs.astype(jnp.float32),
-    )
-    # Sum + base cost
-    grid = base_cost + jnp.sum(contributions, axis=0)
-    return grid
 
 
 @partial(jax.jit, static_argnames=("rows", "cols"))
@@ -263,14 +189,11 @@ def build_costmap_jax(
     margin: float = 20.0,
     base_cost: float = 0.1,
     collision_cost: float = 5.0,
-    ice_cost_exp_scale: float = 3.0,
-    thickness_ref: float = 1.0,
     obs_cost_buffer_factor: float = 0.1,
     ship_length: Optional[float] = None,
     ship_beam:   Optional[float] = None,
     planning_clearance_margin: float = 0.0,
     verbose: bool = False,
-    use_ke_cost: bool = False,
     ship_speed: float = 4.0,
     ship_mass: float = 23e6,
     ke_cost_scale: float = 1e-6,
@@ -280,9 +203,8 @@ def build_costmap_jax(
     """
     Build a planning costmap from current ice element positions using JAX.
 
-    Stays entirely on the JAX device, avoiding a GPU→CPU→GPU round-trip.
-    The cost model matches ``costmap_build.build_costmap_from_ice_state``
-    closely enough to guide the diffusion-MPC planner correctly.
+    Uses the AUTO-IceNav KE collision cost model. Stays entirely on the JAX
+    device, avoiding a GPU→CPU→GPU round-trip.
 
     Parameters
     ----------
@@ -293,9 +215,7 @@ def build_costmap_jax(
     resolution : grid cell size [m/cell]
     margin : extra margin around domain [m]
     base_cost : open-water traversal cost
-    collision_cost : ice-cell base cost multiplier
-    ice_cost_exp_scale : exponential growth rate for thickness-based cost
-    thickness_ref : reference thickness [m]
+    collision_cost : KE cost weight (collision_cost_weight in AUTO-IceNav model)
     obs_cost_buffer_factor : extra fractional radius painted per element
     ship_length, ship_beam : if provided, inflate ice by half-beam +
         planning_clearance_margin for ship-footprint clearance
@@ -325,8 +245,7 @@ def build_costmap_jax(
 
     n = len(centroids)
 
-    if use_ke_cost and n > 0:
-        # ── KE collision cost (AUTO-IceNav model) ─────────────────────────
+    if n > 0:
         # If masses not provided, approximate from circular-disk geometry
         if masses is None:
             masses_arr = np.pi * radii ** 2 * thicknesses * 920.0  # ICE_DENSITY
@@ -366,29 +285,12 @@ def build_costmap_jax(
                 ksize += 1
             sic = uniform_filter(bin_occ, size=ksize, mode="reflect")
             sic = np.clip(sic, 0.0, 1.0).astype(np.float32)
-            # Avoid raising 0^w for isolated floes (would produce 0 in sparse ice)
             sic_safe = np.maximum(sic, 1e-6)
             grid_np = grid_np * np.power(sic_safe, ice_resistance_weight)
 
         # Open-water floor
         grid_np = np.maximum(grid_np, float(base_cost))
         grid_jax = jnp.array(grid_np, dtype=jnp.float32)
-
-    elif n > 0:
-        # ── Exponential thickness model (default) ─────────────────────────
-        ice_costs_np = collision_cost * np.exp(
-            ice_cost_exp_scale * thicknesses / thickness_ref
-        ).astype(np.float32)
-        grid_jax = _rasterize_elements(
-            jnp.array(centroids,    dtype=jnp.float32),
-            jnp.array(radii,        dtype=jnp.float32),
-            jnp.array(ice_costs_np, dtype=jnp.float32),
-            float(base_cost),
-            float(x_origin), float(y_origin), float(resolution),
-            rows, cols,
-            float(obs_cost_buffer_factor),
-        )
-        jax.block_until_ready(grid_jax)
 
     else:
         # Empty ice field

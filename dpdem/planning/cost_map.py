@@ -1,8 +1,8 @@
 """
 Cost map for path planning.
 
-Converts ice field state to a cost map for the lattice planner.
-Supports thickness-based cost (DPDEM legacy) and KE-based cost (AUTO-IceNav).
+Converts ice field state to a cost map for the lattice planner using the
+AUTO-IceNav KE collision cost model.
 """
 
 import numpy as np
@@ -51,12 +51,6 @@ class CostMap:
         ship_mass: float = 1e6,
         base_cost: float = 1.0,
         collision_cost: float = 100.0,
-        mass_cost_scale: float = 1e-5,
-        damage_cost_scale: float = 0.0,
-        damage_thickness_exponent: float = 0.5,
-        thickness_ref: float = 1.0,
-        ice_cost_exp_scale: float = 0.0,
-        use_ke_cost: bool = False,
         ship_speed: float = 4.0,
         ke_cost_scale: float = 1e-6,
         obs_cost_buffer_factor: float = 0.0,
@@ -78,15 +72,8 @@ class CostMap:
             y_origin: World y of grid row 0 [m]
             ship_mass: Ship mass for relative cost calculation [kg]
             base_cost: Base traversal cost per cell (open water)
-            collision_cost: Base cost multiplier for ice cells (thickness model) or
-                collision_cost_weight (KE model).
-            mass_cost_scale: Scaling factor for mass-based costs (legacy flat model)
-            damage_cost_scale: Legacy power-law damage cost (kept for backward compat).
-            damage_thickness_exponent: Legacy exponent for power-law damage cost.
-            thickness_ref: Reference thickness [m] for cost scaling.
-            ice_cost_exp_scale: Exponential growth rate for thickness-based cost.
-            use_ke_cost: If True, use AUTO-IceNav KE-based cost (speed, mass, radial falloff).
-            ship_speed: Ship speed [m/s] for KE cost (when use_ke_cost).
+            collision_cost: KE cost weight (collision_cost_weight in AUTO-IceNav model).
+            ship_speed: Ship speed [m/s] for KE cost.
             ke_cost_scale: Scale KE [J] to planning units (default 1e-6 for cell-level mass).
             obs_cost_buffer_factor: Polygon swell factor for collision cost (0 = no swell).
             ice_resistance_weight: SIC exponent; cost *= SIC^weight (0 = no SIC).
@@ -100,12 +87,6 @@ class CostMap:
         self.ship_mass = ship_mass
         self.base_cost = base_cost
         self.collision_cost = collision_cost
-        self.mass_cost_scale = mass_cost_scale
-        self.damage_cost_scale = damage_cost_scale
-        self.damage_thickness_exponent = damage_thickness_exponent
-        self.thickness_ref = thickness_ref
-        self.ice_cost_exp_scale = ice_cost_exp_scale
-        self.use_ke_cost = use_ke_cost
         self.ship_speed = ship_speed
         self.ke_cost_scale = ke_cost_scale
         self.obs_cost_buffer_factor = obs_cost_buffer_factor
@@ -164,12 +145,8 @@ class CostMap:
             angles: N array of floe orientations (optional)
             thicknesses: N array of ice thicknesses [m] (optional)
         """
-        # Reset cost map (KE mode: start from 0; thickness mode: base_cost)
-        if self.use_ke_cost:
-            self.cost_map.fill(0.0)
-            self.bin_occ_map = np.zeros((self.rows, self.cols), dtype=bool)
-        else:
-            self.cost_map.fill(self.base_cost)
+        self.cost_map.fill(0.0)
+        self.bin_occ_map = np.zeros((self.rows, self.cols), dtype=bool)
         self.obstacles.clear()
 
         n_floes = len(positions)
@@ -181,7 +158,6 @@ class CostMap:
             poly_local = polygons[i]
             mass = masses[i]
             angle = angles[i]
-            thick = float(thicknesses[i]) if thicknesses is not None and i < len(thicknesses) else None
 
             # Transform polygon to world coordinates
             c, s = np.cos(angle), np.sin(angle)
@@ -199,18 +175,14 @@ class CostMap:
                 area=area,
             ))
 
-            if self.use_ke_cost:
-                self._rasterize_polygon_ke(poly_world, mass)
-            else:
-                self._rasterize_polygon(poly_world, mass, thickness=thick)
+            self._rasterize_polygon_ke(poly_world, mass)
 
-        # KE mode: apply SIC and set base_cost for open water
-        if self.use_ke_cost:
-            if self.ice_resistance_weight > 0 and self.sic_kernel is not None:
-                sic = _compute_sic(self.bin_occ_map, self.sic_kernel)
-                self.cost_map *= np.power(np.maximum(sic, 1e-6), self.ice_resistance_weight)
-            # Open water cells: set to base_cost (avoid 0 for path-cost accumulation)
-            self.cost_map[self.cost_map < self.base_cost] = self.base_cost
+        # Apply SIC and set base_cost for open water
+        if self.ice_resistance_weight > 0 and self.sic_kernel is not None:
+            sic = _compute_sic(self.bin_occ_map, self.sic_kernel)
+            self.cost_map *= np.power(np.maximum(sic, 1e-6), self.ice_resistance_weight)
+        # Open water cells: set to base_cost (avoid 0 for path-cost accumulation)
+        self.cost_map[self.cost_map < self.base_cost] = self.base_cost
     
     def _polygon_area(self, vertices: np.ndarray) -> float:
         """Compute polygon area using shoelace formula."""
@@ -323,32 +295,6 @@ class CostMap:
                 if self._point_in_polygon(x, y, v_orig):
                     self.bin_occ_map[row, col] = True
 
-    def _rasterize_polygon(self, vertices: np.ndarray, mass: float, thickness: Optional[float] = None):
-        """Rasterize polygon to grid cells with thickness-dependent cost."""
-        min_x, min_y = vertices.min(axis=0)
-        max_x, max_y = vertices.max(axis=0)
-
-        min_row, min_col = self.world_to_grid(min_x, min_y)
-        max_row, max_col = self.world_to_grid(max_x, max_y)
-
-        min_row = max(0, min_row)
-        min_col = max(0, min_col)
-        max_row = min(self.rows - 1, max_row)
-        max_col = min(self.cols - 1, max_col)
-
-        if self.ice_cost_exp_scale > 0 and thickness is not None and thickness > 0:
-            t_ratio = thickness / max(self.thickness_ref, 1e-6)
-            cell_cost = self.collision_cost * np.exp(self.ice_cost_exp_scale * t_ratio)
-        else:
-            relative_mass = mass / self.ship_mass
-            cell_cost = self.collision_cost * (1.0 + relative_mass * self.mass_cost_scale)
-
-        for row in range(min_row, max_row + 1):
-            for col in range(min_col, max_col + 1):
-                x, y = self.grid_to_world(row, col)
-                if self._point_in_polygon(x, y, vertices):
-                    self.cost_map[row, col] = max(self.cost_map[row, col], cell_cost)
-    
     def _point_in_polygon(self, x: float, y: float, vertices: np.ndarray) -> bool:
         """Check if point is inside polygon (ray casting)."""
         n = len(vertices)
