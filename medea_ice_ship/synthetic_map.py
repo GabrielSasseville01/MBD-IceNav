@@ -2,10 +2,10 @@
 Synthetic rectangular ice field for the experiment suite.
 
 Map geometry (fixed):
-    300 m wide (x) × 700 m long (y)
-    x ∈ [-150, 150],  y ∈ [0, 700]
-    Ship start : (0, 50),  heading = +y (π/2 rad)
-    Goal line  : y = 650
+    300 m wide (x) × 750 m long (y)
+    x ∈ [0, 300],  y ∈ [0, 750]
+    Ship start : (150, 50),  heading = +y (π/2 rad)
+    Goal line  : y = 700
 
 Block A — full factorial (no currents and with currents):
     concentrations : [0.05, 0.10, 0.20, 0.30, 0.40, 0.50]
@@ -29,17 +29,17 @@ from medea_ice_ship.ice_field_generator import generate_ice_field
 from medea_ice_ship.ocean_current import NoCurrentModel, OceanCurrentModel, UniformCurrentModel
 
 # ── Fixed map geometry ─────────────────────────────────────────────────────
-MAP_LENGTH: float = 700.0   # m  (y-axis, direction of travel)
+MAP_LENGTH: float = 750.0   # m  (y-axis, direction of travel)
 MAP_WIDTH:  float = 300.0   # m  (x-axis)
 
-X_LO: float = -MAP_WIDTH  / 2   # -150
-X_HI: float =  MAP_WIDTH  / 2   #  150
+X_LO: float = 0.0
+X_HI: float = MAP_WIDTH          #  300
 Y_LO: float = 0.0
-Y_HI: float = MAP_LENGTH        #  700
+Y_HI: float = MAP_LENGTH         #  750
 
-SHIP_START = np.array([0.0, 50.0])
-GOAL_Y_LINE: float = 650.0
-GOAL_POINT  = (0.0, GOAL_Y_LINE)
+SHIP_START = np.array([MAP_WIDTH / 2, 50.0])   # (150, 50) — centre of map
+GOAL_Y_LINE: float = 700.0
+GOAL_POINT  = (MAP_WIDTH / 2, GOAL_Y_LINE)      # (150, 700)
 START_HEADING: float = np.pi / 2   # pointing along +y
 
 FLOE_RADIUS_MIN: float = 3.0

@@ -10,11 +10,11 @@ Infrastructure lives in `run_experiment_trial.py`, `submit_experiments.py`,
 
 | Parameter | Value |
 |-----------|-------|
-| Domain | 300 m wide (x) × 700 m long (y) |
-| x bounds | [−150, 150] m |
-| y bounds | [0, 700] m |
-| Ship start | (0, 50) m, heading +y (π/2 rad) |
-| Goal line | y = 650 m (any x within 15 m counts as success) |
+| Domain | 300 m wide (x) × 750 m long (y) |
+| x bounds | [0, 300] m |
+| y bounds | [0, 750] m |
+| Ship start | (150, 50) m — centre of map, heading +y (π/2 rad) |
+| Goal line | y = 700 m (any x within 15 m counts as success) |
 | Floe radii | 3–25 m (uniform random) |
 
 The ship navigates from near the southern edge to the goal line in the +y direction,
