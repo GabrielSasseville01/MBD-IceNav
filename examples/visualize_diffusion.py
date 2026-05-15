@@ -135,7 +135,6 @@ def main():
         margin=run_cfg.planning_margin,
         ship_mass=run_cfg.ship_displacement,
         collision_cost=run_cfg.planning_ice_collision_cost,
-        ice_cost_exp_scale=run_cfg.planning_ice_cost_exp_scale,
         wall_bounds=wall_bounds,
     )
     print("  Costmap built.", flush=True)

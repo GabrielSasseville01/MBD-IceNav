@@ -55,6 +55,8 @@ from medea_ice_ship import (
     optimize_with_mppi,
     optimize_with_sqp,
     optimize_with_gradcem,
+    optimize_with_rss,
+    optimize_with_ilqr,
     path_to_ship_trajectory,
     simulate_ice_ship_interaction,
     make_live_2d_callback,
@@ -62,7 +64,7 @@ from medea_ice_ship import (
 from medea_ice_ship.config import get_default_run_config, get_default_simulation_config
 from medea_ice_ship.ice_field_generator import generate_ice_field
 
-ALL_PLANNERS = ["lattice", "diffusion-mpc", "mppi", "sqp", "gradcem"]
+ALL_PLANNERS = ["lattice", "diffusion-mpc", "mppi", "sqp", "gradcem", "random-shooting", "ilqr"]
 
 
 # ── metrics ─────────────────────────────────────────────────────────────────
@@ -269,12 +271,14 @@ def run_planner(
     goal_y_line=None,
 ):
     """Run a single planner, return path (Nx3 array) or None."""
-    use_sampling = planner_name in ("diffusion-mpc", "mppi", "sqp", "gradcem")
+    use_sampling = planner_name in ("diffusion-mpc", "mppi", "sqp", "gradcem", "random-shooting", "ilqr")
     warm_start_flags = {
         "diffusion-mpc": "planning_jax_mbd_warm_start",
         "mppi": "planning_mppi_warm_start",
         "sqp": "planning_sqp_warm_start",
         "gradcem": "planning_gradcem_warm_start",
+        "random-shooting": "planning_rss_warm_start",
+        "ilqr": "planning_ilqr_warm_start",
     }
     if use_sampling:
         ws_attr = warm_start_flags[planner_name]
@@ -306,6 +310,8 @@ def run_planner(
             "mppi": optimize_with_mppi,
             "sqp": optimize_with_sqp,
             "gradcem": optimize_with_gradcem,
+            "random-shooting": optimize_with_rss,
+            "ilqr": optimize_with_ilqr,
         }[planner_name]
         path = opt_fn(path, start, goal, cost_map, run_cfg, start_nu=(2.0, 0.0, 0.0))
 
@@ -378,7 +384,6 @@ def run_benchmark_for_field(
         margin=run_cfg.planning_margin,
         ship_mass=run_cfg.ship_displacement,
         collision_cost=run_cfg.planning_ice_collision_cost,
-        ice_cost_exp_scale=run_cfg.planning_ice_cost_exp_scale,
         wall_bounds=wall_bounds,
     )
 
@@ -455,8 +460,7 @@ def run_benchmark_for_field(
                         margin=run_cfg.planning_margin,
                         ship_mass=run_cfg.ship_displacement,
                         collision_cost=run_cfg.planning_ice_collision_cost,
-                        ice_cost_exp_scale=run_cfg.planning_ice_cost_exp_scale,
-                        wall_bounds=wall_bounds,
+                                        wall_bounds=wall_bounds,
                     )
                     st = (float(spos[0]), float(spos[1]), float(shead))
                     try:

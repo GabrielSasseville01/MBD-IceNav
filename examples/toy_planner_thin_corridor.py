@@ -228,15 +228,6 @@ def main():
             planning_sqp_warm_start=False,
             planning_gradcem_warm_start=False,
         )
-    if not args.no_damage_cost:
-        run_cfg = replace(
-            run_cfg,
-            planning_damage_cost_scale=float(args.damage_cost_scale),
-        )
-        print("Damage-aware cost enabled (scale={})".format(run_cfg.planning_damage_cost_scale), flush=True)
-    else:
-        print("Damage-aware cost disabled (baseline).", flush=True)
-
     print("Tessellating ice into cells...", flush=True)
     polygons, centroids, parent_floe_ids = tessellate_all_floes(
         sat_polygons, sat_centroids,
@@ -268,8 +259,6 @@ def main():
         resolution=run_cfg.planning_resolution,
         margin=run_cfg.planning_margin,
         ship_mass=run_cfg.ship_displacement,
-        damage_cost_scale=run_cfg.planning_damage_cost_scale,
-        damage_thickness_exponent=run_cfg.planning_damage_thickness_exponent,
     )
 
     use_diffusion = (args.planner == "diffusion-mpc")
@@ -363,8 +352,7 @@ def main():
                 resolution=run_cfg.planning_resolution,
                 margin=run_cfg.planning_margin,
                 ship_mass=run_cfg.ship_displacement,
-                damage_cost_scale=run_cfg.planning_damage_cost_scale,
-                damage_thickness_exponent=run_cfg.planning_damage_thickness_exponent,
+
             )
             costmap_snapshots.append((frame, cost_map_f))
             start_f = (float(ship_pos_f[0]), float(ship_pos_f[1]), float(ship_heading_f))
@@ -400,9 +388,9 @@ def main():
                     )
             return path_to_ship_trajectory(path_f, n_remaining)
 
-        replan_every_n_frames = run_cfg.planning_replan_every_n_frames
+        replan_every_n_frames = max(1, round(run_cfg.planning_replan_every_n_seconds / run_cfg.dt))
         replan_callback = _replan_callback
-        print(f"  Receding horizon: replan every {replan_every_n_frames} frames", flush=True)
+        print(f"  Receding horizon: replan every {run_cfg.planning_replan_every_n_seconds:.1f} s ({replan_every_n_frames} frames at dt={run_cfg.dt} s)", flush=True)
 
     frame_callback = None
     if args.live:

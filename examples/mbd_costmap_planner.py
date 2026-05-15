@@ -610,8 +610,6 @@ def main():
         x_min, max(x_max, 830.0), y_min, y_max,
         resolution=4.0, margin=planning_margin,
         ship_mass=run_cfg.ship_displacement,
-        damage_cost_scale=args.damage_cost_scale,
-        damage_thickness_exponent=0.5,
     )
     print(
         f"  Costmap: {cost_map.rows} x {cost_map.cols} cells, "
