@@ -228,6 +228,22 @@ def optimize_with_diffusion(
     replan_idx: int = 0,
     viz_world_polygons=None,
     viz_thicknesses=None,
+    return_diagnostics: bool = False,
+    return_cost_components: bool = False,
+    goal_y_line: Optional[float] = None,
+    goal_y_line_penalty: float = 1e6,
+    denoising_movie_dir: Optional[str] = None,
+    cost_truncate_y: Optional[float] = None,
+    sample_filter_fn=None,
+    max_resample_iters=None,
+    use_eb_mbd: bool = False,
+    eb_x_min: Optional[float] = None,
+    eb_x_max: Optional[float] = None,
+    eb_y_min: Optional[float] = None,
+    eb_c_max: Optional[float] = None,
+    eb_mu: Optional[float] = None,
+    eb_kappa: Optional[float] = None,
+    eb_oob_as_constraint: bool = False,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Model-Based Diffusion (3-DOF dynamics + costmap).
@@ -248,17 +264,23 @@ def optimize_with_diffusion(
         start_nu: Optional (u, v, r) initial velocities; default (2, 0, 0).
         warm_start: If True, seed MBD from the A* path; if False, cold start.
             Defaults to run_cfg.planning_jax_mbd_warm_start.
+        return_cost_components: If True, also return a dict with raw (unweighted)
+            cost component values for the optimized trajectory. Used for weight
+            calibration. Mutually exclusive with return_diagnostics.
 
     Returns:
-        Optimized path (K, 3) [x, y, heading] in world coordinates.
+        Optimized path (K, 3) [x, y, heading] in world coordinates, or
+        (path, cost_components_dict) if return_cost_components=True.
     """
     from medea_ice_ship.jax_mbd_planner import jax_mbd_optimize
 
     continuous_path = np.asarray(continuous_path, dtype=float)
     if continuous_path.shape[0] < 2:
+        if return_cost_components:
+            return continuous_path, None
         return continuous_path
 
-    optimized_traj = jax_mbd_optimize(
+    result = jax_mbd_optimize(
         cost_map=cost_map,
         start_pose=start_pose,
         goal=goal,
@@ -270,7 +292,34 @@ def optimize_with_diffusion(
         replan_idx=replan_idx,
         viz_world_polygons=viz_world_polygons,
         viz_thicknesses=viz_thicknesses,
+        return_diagnostics=return_diagnostics,
+        return_cost_components=return_cost_components,
+        goal_y_line=goal_y_line,
+        goal_y_line_penalty=goal_y_line_penalty,
+        denoising_movie_dir=denoising_movie_dir,
+        cost_truncate_y=cost_truncate_y,
+        sample_filter_fn=sample_filter_fn,
+        max_resample_iters=max_resample_iters,
+        use_eb_mbd=use_eb_mbd,
+        eb_x_min=eb_x_min,
+        eb_x_max=eb_x_max,
+        eb_y_min=eb_y_min,
+        eb_c_max=eb_c_max,
+        eb_mu=eb_mu,
+        eb_kappa=eb_kappa,
+        eb_oob_as_constraint=eb_oob_as_constraint,
     )
+
+    if return_diagnostics:
+        optimized_traj, diagnostics = result
+        cost_components = None
+    elif return_cost_components:
+        optimized_traj, cost_components = result
+        diagnostics = None
+    else:
+        optimized_traj = result
+        diagnostics = None
+        cost_components = None
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
 
@@ -281,6 +330,10 @@ def optimize_with_diffusion(
     if nearest_idx < len(continuous_path) - 1:
         optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
 
+    if return_diagnostics:
+        return optimized_traj, diagnostics
+    if return_cost_components:
+        return optimized_traj, cost_components
     return optimized_traj
 
 
@@ -391,6 +444,92 @@ def optimize_with_gradcem(
         return continuous_path
 
     optimized_traj = jax_gradcem_optimize(
+        cost_map=cost_map,
+        start_pose=start_pose,
+        goal=goal,
+        run_cfg=run_cfg,
+        start_nu=start_nu,
+        lattice_path=continuous_path,
+        warm_start=warm_start,
+    )
+
+    optimized_traj = _align_headings_to_path_direction(optimized_traj)
+
+    end_pos = optimized_traj[-1, :2]
+    dists = np.linalg.norm(continuous_path[:, :2] - end_pos, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    if nearest_idx < len(continuous_path) - 1:
+        optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
+
+    return optimized_traj
+
+
+def optimize_with_rss(
+    continuous_path: np.ndarray,
+    start_pose: Tuple[float, float, float],
+    goal: Tuple[float, float],
+    cost_map: CostMap,
+    run_cfg: RunConfig,
+    start_nu: Optional[Tuple[float, float, float]] = None,
+    warm_start: Optional[bool] = None,
+) -> np.ndarray:
+    """
+    Optimize a path using JAX Random Single Shooting.
+
+    Same interface as optimize_with_diffusion/optimize_with_mppi but uses
+    single-shot random sampling. No iterative updates — evaluates Nsample
+    random trajectories in parallel and returns the minimum-cost one.
+    """
+    from medea_ice_ship.jax_rss_planner import jax_rss_optimize
+
+    continuous_path = np.asarray(continuous_path, dtype=float)
+    if continuous_path.shape[0] < 2:
+        return continuous_path
+
+    optimized_traj = jax_rss_optimize(
+        cost_map=cost_map,
+        start_pose=start_pose,
+        goal=goal,
+        run_cfg=run_cfg,
+        start_nu=start_nu,
+        lattice_path=continuous_path,
+        warm_start=warm_start,
+    )
+
+    optimized_traj = _align_headings_to_path_direction(optimized_traj)
+
+    end_pos = optimized_traj[-1, :2]
+    dists = np.linalg.norm(continuous_path[:, :2] - end_pos, axis=1)
+    nearest_idx = int(np.argmin(dists))
+    if nearest_idx < len(continuous_path) - 1:
+        optimized_traj = np.vstack([optimized_traj, continuous_path[nearest_idx + 1:]])
+
+    return optimized_traj
+
+
+def optimize_with_ilqr(
+    continuous_path: np.ndarray,
+    start_pose: Tuple[float, float, float],
+    goal: Tuple[float, float],
+    cost_map: CostMap,
+    run_cfg: RunConfig,
+    start_nu: Optional[Tuple[float, float, float]] = None,
+    warm_start: Optional[bool] = None,
+) -> np.ndarray:
+    """
+    Optimize a path using JAX Box-iLQR (3-DOF dynamics + costmap).
+
+    Same interface as optimize_with_diffusion/optimize_with_mppi but uses
+    iterative LQR with log-barrier control constraints. Requires differentiable
+    dynamics and cost — uses JAX autodiff for Jacobians/Hessians.
+    """
+    from medea_ice_ship.jax_ilqr_planner import jax_ilqr_optimize
+
+    continuous_path = np.asarray(continuous_path, dtype=float)
+    if continuous_path.shape[0] < 2:
+        return continuous_path
+
+    optimized_traj = jax_ilqr_optimize(
         cost_map=cost_map,
         start_pose=start_pose,
         goal=goal,

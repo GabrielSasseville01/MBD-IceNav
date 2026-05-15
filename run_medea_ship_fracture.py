@@ -71,6 +71,200 @@ def _clip_path_to_goal(path_arr, goal_pt, goal_y_line_val=None):
         return path_arr
 
 
+def _make_rejection_sample_filter(cost_map, ship_length, ship_beam, goal_y_line=None, goal=None):
+    """Build a sample_filter_fn for reject-sampling in jax_mbd_optimize.
+
+    Mirrors the toy_mbd_bimodal logic: rejects samples whose hull corners exit
+    the costmap x-extent or whose centre dips below the y floor, and (when
+    goal_y_line is set) that never reach the goal line on the last waypoint.
+    """
+    _x_lo = float(cost_map.x_origin)
+    _x_hi = float(cost_map.x_origin) + float(cost_map.cols) * float(cost_map.resolution)
+    _y_lo = float(cost_map.y_origin)
+
+    _half_l = ship_length / 2.0
+    _half_w = ship_beam   / 2.0
+    _dx = np.array([0.0,  _half_l,  _half_l, -_half_l, -_half_l], dtype=np.float32)
+    _dy = np.array([0.0,  _half_w, -_half_w,  _half_w, -_half_w], dtype=np.float32)
+
+    _goal_y = float(goal_y_line) if goal_y_line is not None else None
+    _goal_pt = (float(goal[0]), float(goal[1])) if goal is not None else None
+
+    def _filter(Y0s_norm: np.ndarray, trajs: np.ndarray) -> np.ndarray:
+        xs  = trajs[:, :, 0]   # (N, H+1)
+        ys  = trajs[:, :, 1]
+        psi = trajs[:, :, 2]
+
+        c = np.cos(psi)
+        s = np.sin(psi)
+        hull_x = (xs[:, :, None]
+                  + c[:, :, None] * _dx[None, None, :]
+                  - s[:, :, None] * _dy[None, None, :])
+
+        oob = (
+            ((hull_x < _x_lo) | (hull_x > _x_hi)).any(axis=(1, 2))
+            | (ys < _y_lo).any(axis=1)
+        )
+
+        if _goal_y is not None:
+            reaches = ys[:, -1] >= _goal_y
+        elif _goal_pt is not None:
+            dist = np.hypot(xs[:, -1] - _goal_pt[0], ys[:, -1] - _goal_pt[1])
+            reaches = dist < 50.0  # within 50 m of goal
+        else:
+            reaches = np.ones(trajs.shape[0], dtype=bool)
+
+        return (~oob) & reaches
+
+    return _filter
+
+
+def _generate_diffusion_denoising_movie(
+    diag: dict,
+    cost_map,
+    polygons,
+    thicknesses,
+    start,
+    goal,
+    goal_y_line,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    output_path: str,
+    fps: int = 10,
+    no_show: bool = True,
+):
+    """
+    Generate an MP4 animation of the diffusion denoising process.
+
+    Each frame shows the distribution of sampled trajectories (top-K by cost)
+    overlaid on the costmap, evolving from the initial noisy state to the
+    refined final trajectory across Ndiffuse denoising steps.
+
+    Args:
+        diag: Diagnostics dict from run_mbd_with_diagnostics (via optimize_with_diffusion
+              with return_diagnostics=True). Keys: mean_trajectories, sample_trajectories,
+              sample_costs, cost_means, cost_mins, weights.
+        cost_map: CostMap used for planning.
+        polygons: List of ice polygon vertex arrays [(N,2), ...].
+        thicknesses: Array of ice thickness values aligned with polygons.
+        start: (x, y, psi) start pose.
+        goal: (gx, gy) goal position.
+        goal_y_line: If not None, draw a horizontal goal line at this y.
+        x_min, x_max, y_min, y_max: World bounds for axis limits.
+        output_path: Path to save the MP4 file.
+        fps: Frames per second for the movie (default 10).
+        no_show: If True, close the figure without displaying.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    from matplotlib.patches import Polygon as MplPolygon
+    from matplotlib.collections import PatchCollection, LineCollection
+    from matplotlib import animation
+
+    mean_trajs = diag["mean_trajectories"]   # list of (H+1, 3), length Ndiffuse
+    sample_trajs = diag["sample_trajectories"]  # list of (Nsample, H+1, 3), length Ndiffuse-1
+    cost_mins = diag.get("cost_mins", [])
+    cost_means = diag.get("cost_means", [])
+
+    # Frame k shows mean_trajs[k] alongside sample_trajs[k] (aligned: same iteration).
+    # sample_trajs has Ndiffuse-1 entries (no samples for the last frame).
+    n_frames = len(mean_trajs)  # = Ndiffuse
+    n_samples = len(sample_trajs[0]) if sample_trajs else 0
+
+    print(
+        f"  Generating diffusion movie: {n_frames} frames, {n_samples} samples/frame -> {output_path}",
+        flush=True,
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    # ── Static background ──────────────────────────────────────────────
+    grid = cost_map.cost_map
+    extent = [
+        cost_map.x_origin, cost_map.x_origin + cost_map.width,
+        cost_map.y_origin, cost_map.y_origin + cost_map.height,
+    ]
+    vmax_grid = float(np.percentile(grid[grid > 0], 95)) if np.any(grid > 0) else 1.0
+    ax.imshow(grid, origin='lower', extent=extent, cmap='YlOrRd', alpha=0.5,
+              vmin=0, vmax=vmax_grid)
+
+    patches = []
+    colors_th = []
+    for poly, th in zip(polygons, thicknesses):
+        patches.append(MplPolygon(poly, closed=True))
+        colors_th.append(th)
+    if patches:
+        pc = PatchCollection(patches, cmap='Blues', edgecolor='#555555', linewidth=0.3, alpha=0.6)
+        pc.set_array(np.array(colors_th))
+        pc.set_clim(float(thicknesses.min()), float(thicknesses.max()))
+        ax.add_collection(pc)
+
+    if goal_y_line is not None:
+        ax.axhline(goal_y_line, color='lime', ls='--', lw=2, zorder=4, label=f'Goal y={goal_y_line:.0f}')
+    else:
+        ax.plot(goal[0], goal[1], 'mx', ms=14, mew=3, zorder=6, label='Goal')
+    ax.plot(start[0], start[1], 'go', ms=12, zorder=6, label='Start')
+
+    pad = 30.0
+    ax.set_xlim(x_min - pad, x_max + pad)
+    ax.set_ylim(y_min - pad, y_max + pad)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X [m]')
+    ax.set_ylabel('Y [m]')
+
+    # ── Dynamic artists (updated each frame) ──────────────────────────
+    # All sample trajectories via LineCollection (efficient for large Nsample).
+    # Sorted best→worst by cost; colored blue (best) → magenta (worst).
+    sample_norm = plt.Normalize(vmin=0, vmax=1)
+    sample_lc = LineCollection([], cmap='cool', norm=sample_norm,
+                                linewidths=0.6, alpha=0.25, zorder=4)
+    ax.add_collection(sample_lc)
+
+    # Mean trajectory: bold white outline + colored line
+    mean_outline, = ax.plot([], [], 'w-', lw=4, zorder=5)
+    mean_line, = ax.plot([], [], '-', color='tomato', lw=2, zorder=5, label='Mean trajectory')
+
+    title_obj = ax.set_title('Diffusion denoising — step 0 / ?')
+    ax.legend(loc='upper right', fontsize=8)
+
+    def _update(frame):
+        # Mean trajectory for this frame
+        mt = mean_trajs[frame]
+        mean_outline.set_data(mt[:, 0], mt[:, 1])
+        mean_line.set_data(mt[:, 0], mt[:, 1])
+
+        # Sample trajectories: frame k → sample_trajs[k] (same iteration as mean)
+        if frame < len(sample_trajs) and sample_trajs:
+            st = sample_trajs[frame]  # (Nsample, H+1, 3), sorted best→worst
+            segments = [st[k, :, :2] for k in range(len(st))]
+            colors = np.linspace(0, 1, len(st))
+            sample_lc.set_segments(segments)
+            sample_lc.set_array(colors)
+        else:
+            sample_lc.set_segments([])
+
+        # Title with cost info
+        cost_str = ""
+        if frame < len(cost_mins):
+            cost_str = f"  |  cost_min={cost_mins[frame]:.1f}, cost_mean={cost_means[frame]:.1f}"
+        title_obj.set_text(
+            f"Diffusion denoising — step {frame} / {n_frames - 1}{cost_str}"
+        )
+
+    ani = animation.FuncAnimation(fig, _update, frames=n_frames, interval=1000 // fps)
+
+    from medea_ice_ship.visualization import _animation_writer
+    writer, output_path = _animation_writer(output_path, fps)
+    ani.save(output_path, writer=writer, dpi=120)
+
+    if not no_show:
+        plt.show()
+    plt.close(fig)
+    return output_path
+
+
 def main():
     parser = argparse.ArgumentParser(description='MEDEA Ice Ship Fracture Simulation')
     parser.add_argument('--live', action='store_true',
@@ -98,7 +292,9 @@ def main():
     parser.add_argument('--no-thrust-cap', action='store_true',
                         help='Disable thrust cap (unlimited ship thrust)')
     parser.add_argument('--ice-tank-psv', action='store_true',
-                        help='Use AUTO-IceNav ice-tank PSV-scale vessel (L≈83 m, B≈17 m, displacement≈8 kt) instead of default 158 m icebreaker')
+                        help='Use AUTO-IceNav ice-tank PSV-scale vessel (L≈83 m, B≈17 m, displacement≈8 kt) instead of default Fossen supply vessel (L=76.2 m, B=17 m, 6 kt)')
+    parser.add_argument('--icebreaker', action='store_true',
+                        help='Use the large icebreaker vessel (L=158 m, B=28 m, displacement≈23 kt) from config instead of default Fossen supply vessel (L=76.2 m, B=17 m, 6 kt)')
     parser.add_argument('--gif', action='store_true',
                         help='Output GIF instead of MP4 (slower, larger files)')
     parser.add_argument('--plan', action='store_true',
@@ -127,14 +323,14 @@ def main():
                         help='With --plan-only: run both lattice A* and diffusion-mpc, plot both paths for comparison')
     parser.add_argument('--no-show', action='store_true',
                         help='With --plan-only: save to file only, do not open matplotlib window (headless)')
+    parser.add_argument('--diffusion-movie', action='store_true',
+                        help='With --plan-only and diffusion-mpc planner: also generate an MP4 movie of the denoising distribution evolving across diffusion steps')
     parser.add_argument('--replan-every', type=float, metavar='SECS', default=None,
                         help='With --plan: replan every SECS simulated seconds (override config default of 30 s; larger = fewer replans, faster run)')
     parser.add_argument('--ridge-costmap', type=str, metavar='FILE', default=None,
                         help='Ridge costmap pickle for ridge-aware planning (from generate_ridge_costmap.py)')
     parser.add_argument('--ridge-weight', type=float, default=None, metavar='W',
                         help='Ridge cost weight (default 2.0 when --ridge-costmap set)')
-    parser.add_argument('--no-ke-cost', action='store_true',
-                        help='Use thickness-based cost instead of AUTO-IceNav KE cost')
     parser.add_argument('--ice-brake-force', type=float, default=None, metavar='N',
                         help='Ice brake threshold [N]: when surge ice force exceeds this, '
                              'setpoint is blended toward ship position to reduce DP thrust in ice. '
@@ -167,6 +363,35 @@ def main():
                              'Default is float64 for numerical accuracy.')
     parser.add_argument('--mbd-viz-dir', type=str, default=None, metavar='DIR',
                         help='With --planner diffusion-mpc: save per-replan debug plots (density, top-5, cost breakdown) to DIR.')
+    parser.add_argument('--mbd-goal-line', type=float, default=None, metavar='Y',
+                        help='With --planner diffusion-mpc: replace soft goal cost with a big-M penalty for trajectories that never reach y >= Y. Sets goal_weight=0.')
+    parser.add_argument('--polygon-replan', action='store_true',
+                        help='Use polygon-based costmap (same as initial plan) for replanning instead of JAX disk approximation. Slower but matches AUTO-IceNav exactly.')
+    parser.add_argument('--mbd-denoising-movie', action='store_true',
+                        help='With --mbd-viz-dir: also save a denoising-evolution MP4 (replan_XXXX_denoising.mp4) for each replan step.')
+    # ── Reject-sampling filter ────────────────────────────────────────────
+    parser.add_argument('--reject-sampling', action='store_true',
+                        help='With diffusion-mpc: at each denoising step resample until all Nsample trajectories are non-OOB and reach the goal. '
+                             'Uses hull-corner OOB check (matching costmap query) and goal-line check.')
+    parser.add_argument('--max-resample-iters', type=int, default=None, metavar='N',
+                        help='Maximum resampling rounds per denoising step (only with --reject-sampling). Default: unlimited.')
+    # ── EB-MBD args ───────────────────────────────────────────────────────
+    parser.add_argument('--eb-mbd', action='store_true',
+                        help='Enable Emerging-Barrier MBD (EB-MBD): replaces big-M OOB/goal penalties with a '
+                             'progressively tightening log-barrier over the reverse diffusion.')
+    parser.add_argument('--eb-c-max', type=float, default=1500.0, metavar='M',
+                        help='EB-MBD barrier offset at the start of reverse diffusion [m]. '
+                             'Should be >= max expected constraint violation. Default: 1500.')
+    parser.add_argument('--eb-mu', type=float, default=50000.0, metavar='F',
+                        help='EB-MBD barrier hardness (cost units). Default: 50000.')
+    parser.add_argument('--eb-kappa', type=float, default=1.0, metavar='K',
+                        help='EB-MBD barrier schedule shape: kappa=1 -> linear, kappa>1 -> slow then fast. Default: 1.0.')
+    parser.add_argument('--eb-goal-x-weight', type=float, default=0.0, metavar='W',
+                        help='EB-MBD soft cost weight for x-deviation at goal-line crossing. Default: 0 (disabled).')
+    parser.add_argument('--eb-oob-constraint', action='store_true',
+                        help='EB-MBD: enforce OOB as a hard barrier constraint instead of the default linear soft cost.')
+    parser.add_argument('--eb-length-weight', type=float, default=0.0, metavar='W',
+                        help='EB-MBD soft path-length cost weight. Default: 0 (disabled).')
     args = parser.parse_args()
 
     if args.plan_only:
@@ -308,8 +533,10 @@ def main():
     ship_displacement = run_cfg.ship_displacement
 
     # Use AUTO-IceNav vessel geometry by default so DPDEM ice forces and moments (hull, lever arms)
-    # match the simulated dynamics (Fossen supply 76.2 m, 6 kt). Override if --ice-tank-psv was set.
-    if not getattr(args, 'ice_tank_psv', False):
+    # match the simulated dynamics (Fossen supply 76.2 m, 6 kt). Override if --ice-tank-psv or --icebreaker was set.
+    if getattr(args, 'icebreaker', False):
+        print(f"  [Vessel] Large icebreaker: L={ship_length:.1f} m, B={ship_beam:.1f} m, mass={ship_displacement/1e6:.0f} kt", flush=True)
+    elif not getattr(args, 'ice_tank_psv', False):
         ship_length = 76.2
         ship_beam = 17.0
         ship_draft = 7.0
@@ -572,8 +799,6 @@ def main():
                 planning_ridge_costmap_file=args.ridge_costmap,
                 planning_ridge_cost_weight=args.ridge_weight if args.ridge_weight is not None else 2.0,
             )
-        if args.no_ke_cost:
-            plan_cfg = replace_config(plan_cfg, planning_use_ke_cost=False)
         # Toy-sparse has thick (10 m) ice → very high cost; use shorter primitives so first step stays in open water
         if args.toy_sparse:
             plan_cfg = replace_config(plan_cfg, planning_turning_radius=25.0)
@@ -611,16 +836,12 @@ def main():
             margin=plan_cfg.planning_margin,
             ship_mass=ship_displacement,
             collision_cost=plan_cfg.planning_ice_collision_cost,
-            damage_cost_scale=plan_cfg.planning_damage_cost_scale,
-            damage_thickness_exponent=plan_cfg.planning_damage_thickness_exponent,
             wall_bounds=_wall,
-            ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
             ship_length=ship_length,
             ship_beam=ship_beam,
             planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
             ridge_costmap_file=plan_cfg.planning_ridge_costmap_file,
             ridge_cost_weight=plan_cfg.planning_ridge_cost_weight,
-            use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", True),
             ship_speed=_ship_speed,
             ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
             obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
@@ -727,13 +948,65 @@ def main():
         path_lattice = path.copy() if (args.plan_only and getattr(args, 'compare_planners', False)) else None
 
         run_diffusion_for_compare = args.plan_only and getattr(args, 'compare_planners', False)
+        _diffusion_diag = None
         if use_sampling_mpc or run_diffusion_for_compare:
             t0 = time.time()
             if use_diffusion_mpc or run_diffusion_for_compare:
                 print("  Running model-based diffusion optimization...", flush=True)
-                path = optimize_with_diffusion(
-                    path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0)
+                _want_diag = (args.plan_only and getattr(args, 'diffusion_movie', False)
+                              and (use_diffusion_mpc or run_diffusion_for_compare))
+                _init_filter = (
+                    _make_rejection_sample_filter(
+                        cost_map, ship_length, ship_beam,
+                        goal_y_line=goal_y_line, goal=goal,
+                    )
+                    if getattr(args, 'reject_sampling', False)
+                    else None
                 )
+                _eb_kwargs = {}
+                if getattr(args, 'eb_mbd', False):
+                    # Mirror examples/toy_mbd_bimodal.py: hard EB log-barrier on
+                    # goal-line reaching + linear soft OOB cost on x∈[x_min,x_max]
+                    # and y≥y_min.  cost_truncate_y is set above the goal line to
+                    # the costmap's top edge so cost/OOB beyond the map are zero
+                    # (matches Y_MAX truncation in the toy).
+                    _eb_kwargs = dict(
+                        use_eb_mbd=True,
+                        eb_x_min=float(cost_map.x_origin),
+                        eb_x_max=float(cost_map.x_origin + cost_map.width),
+                        eb_y_min=float(cost_map.y_origin),
+                        eb_c_max=args.eb_c_max,
+                        eb_mu=args.eb_mu,
+                        eb_kappa=args.eb_kappa,
+                        eb_oob_as_constraint=getattr(args, 'eb_oob_constraint', False),
+                        goal_y_line=goal_y_line,
+                        cost_truncate_y=float(cost_map.y_origin + cost_map.height),
+                    )
+                _init_viz_kwargs = dict(
+                    viz_dir=getattr(args, 'mbd_viz_dir', None),
+                    replan_idx=0,
+                    viz_world_polygons=polygons,
+                    viz_thicknesses=thicknesses,
+                    denoising_movie_dir=(getattr(args, 'mbd_viz_dir', None)
+                                         if getattr(args, 'mbd_denoising_movie', False) else None),
+                )
+                if _want_diag:
+                    path, _diffusion_diag = optimize_with_diffusion(
+                        path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0),
+                        return_diagnostics=True,
+                        sample_filter_fn=_init_filter,
+                        max_resample_iters=getattr(args, 'max_resample_iters', None),
+                        **_init_viz_kwargs,
+                        **_eb_kwargs,
+                    )
+                else:
+                    path = optimize_with_diffusion(
+                        path, start, goal, cost_map, plan_cfg, start_nu=(2.0, 0.0, 0.0),
+                        sample_filter_fn=_init_filter,
+                        max_resample_iters=getattr(args, 'max_resample_iters', None),
+                        **_init_viz_kwargs,
+                        **_eb_kwargs,
+                    )
             elif use_mppi:
                 print("  Running MPPI optimization...", flush=True)
                 path = optimize_with_mppi(
@@ -857,17 +1130,42 @@ def main():
                 plt.show()
             else:
                 plt.close()
+
+            # ── Optional: diffusion denoising movie ───────────────────
+            if _diffusion_diag is not None:
+                _movie_name = plan_only_name.replace('_comparison', '') + '_diffusion_denoising.mp4'
+                _movie_out = str(out_dir / _movie_name)
+                _movie_out = _generate_diffusion_denoising_movie(
+                    diag=_diffusion_diag,
+                    cost_map=cost_map,
+                    polygons=polygons,
+                    thicknesses=thicknesses,
+                    start=start,
+                    goal=goal,
+                    goal_y_line=goal_y_line,
+                    x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max,
+                    output_path=_movie_out,
+                    no_show=getattr(args, 'no_show', False),
+                )
+                print(f"  Diffusion movie saved to {_movie_out}", flush=True)
             return
 
         # Receding-horizon callback (AUTO-IceNav style): rebuild costmap from current ice state and replan
         _mbd_viz_dir = getattr(args, 'mbd_viz_dir', None)
+        _mbd_goal_line = getattr(args, 'mbd_goal_line', None)
+        if _mbd_goal_line is not None:
+            plan_cfg = replace_config(plan_cfg, planning_jax_mbd_goal_weight=0.0)
+        if getattr(args, 'eb_mbd', False):
+            plan_cfg = replace_config(
+                plan_cfg,
+                planning_jax_mbd_goal_x_weight=args.eb_goal_x_weight,
+                planning_jax_mbd_length_weight=args.eb_length_weight,
+            )
         _mbd_replan_counter = [0]  # mutable counter accessible inside closure
 
         def _replan_callback(frame, world_polygons, centroids, thicknesses, ship_pos_f, ship_heading_f, n_remaining):
             # Rebuild costmap from current ice state (counted as additional planning time)
             t0_cost = time.time()
-            # GPU-native costmap: JAX disk-rasterization directly from centroids+radii.
-            # `radii` from outer scope is constant (fracture only breaks bonds, not geometry).
             if args.full_map:
                 x_min_f, x_max_f = -DOMAIN_LIMIT, DOMAIN_LIMIT
                 y_min_f, y_max_f = -DOMAIN_LIMIT, DOMAIN_LIMIT
@@ -877,24 +1175,44 @@ def main():
                 x_max_f = float(centroids[:, 0].max()) + _r_max
                 y_min_f = float(centroids[:, 1].min()) - _r_max
                 y_max_f = float(centroids[:, 1].max()) + _r_max
-            from medea_ice_ship.jax_costmap import build_costmap_jax
-            cost_map_f, _ = build_costmap_jax(
-                centroids, thicknesses, radii,
-                x_min_f, x_max_f, y_min_f, y_max_f,
-                resolution=plan_cfg.planning_resolution,
-                margin=plan_cfg.planning_margin,
-                collision_cost=plan_cfg.planning_ice_collision_cost,
-                ice_cost_exp_scale=plan_cfg.planning_ice_cost_exp_scale,
-                obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
-                ship_length=ship_length,
-                ship_beam=ship_beam,
-                planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
-                use_ke_cost=getattr(plan_cfg, "planning_use_ke_cost", False),
-                ship_speed=getattr(plan_cfg, "planning_ship_speed", 4.0),
-                ship_mass=float(ship_displacement),
-                ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
-                ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 0.0),
-            )
+            if getattr(args, 'polygon_replan', False) and world_polygons is not None:
+                # Polygon-based costmap: same method as initial plan (matches AUTO-IceNav exactly).
+                from medea_ice_ship.costmap_build import build_costmap_from_ice_state
+                cost_map_f, _ = build_costmap_from_ice_state(
+                    world_polygons, centroids, thicknesses,
+                    x_min_f, x_max_f, y_min_f, y_max_f,
+                    resolution=plan_cfg.planning_resolution,
+                    margin=plan_cfg.planning_margin,
+                    ship_mass=float(ship_displacement),
+                    collision_cost=plan_cfg.planning_ice_collision_cost,
+                    wall_bounds=(x_min_f, x_max_f, y_min_f, y_max_f) if args.full_map else None,
+                    ship_length=ship_length,
+                    ship_beam=ship_beam,
+                    planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
+                    ship_speed=getattr(plan_cfg, "planning_ship_speed", 4.0),
+                    ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
+                    obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
+                    ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 1.0),
+                )
+            else:
+                # GPU-native costmap: JAX disk-rasterization directly from centroids+radii.
+                # `radii` from outer scope is constant (fracture only breaks bonds, not geometry).
+                from medea_ice_ship.jax_costmap import build_costmap_jax
+                cost_map_f, _ = build_costmap_jax(
+                    centroids, thicknesses, radii,
+                    x_min_f, x_max_f, y_min_f, y_max_f,
+                    resolution=plan_cfg.planning_resolution,
+                    margin=plan_cfg.planning_margin,
+                    collision_cost=plan_cfg.planning_ice_collision_cost,
+                    obs_cost_buffer_factor=getattr(plan_cfg, "planning_obs_cost_buffer_factor", 0.1),
+                    ship_length=ship_length,
+                    ship_beam=ship_beam,
+                    planning_clearance_margin=getattr(plan_cfg, "planning_clearance_margin", 15.0),
+                    ship_speed=getattr(plan_cfg, "planning_ship_speed", 4.0),
+                    ship_mass=float(ship_displacement),
+                    ke_cost_scale=getattr(plan_cfg, "planning_ke_cost_scale", 1e-6),
+                    ice_resistance_weight=getattr(plan_cfg, "planning_ice_resistance_weight", 0.0),
+                )
             diag["costmap"] += time.time() - t0_cost
             costmap_snapshots.append((frame, cost_map_f))
             start_f = (float(ship_pos_f[0]), float(ship_pos_f[1]), float(ship_heading_f))
@@ -917,12 +1235,45 @@ def main():
             diag["astar"] += time.time() - t0_plan
             if use_sampling_mpc:
                 if use_diffusion_mpc:
+                    _replan_filter = (
+                        _make_rejection_sample_filter(
+                            cost_map_f, ship_length, ship_beam,
+                            goal_y_line=_mbd_goal_line or goal_y_line, goal=goal,
+                        )
+                        if getattr(args, 'reject_sampling', False)
+                        else None
+                    )
+                    _replan_eb_kwargs = {}
+                    _replan_goal_line = _mbd_goal_line
+                    if getattr(args, 'eb_mbd', False):
+                        # Mirror examples/toy_mbd_bimodal.py: hard EB log-barrier
+                        # on goal-line reaching + linear soft OOB cost.  Override
+                        # any --mbd-goal-line by the scenario's goal_y_line so
+                        # the EB barrier targets the full-map's goal.
+                        _replan_eb_kwargs = dict(
+                            use_eb_mbd=True,
+                            eb_x_min=float(cost_map_f.x_origin),
+                            eb_x_max=float(cost_map_f.x_origin + cost_map_f.width),
+                            eb_y_min=float(cost_map_f.y_origin),
+                            eb_c_max=args.eb_c_max,
+                            eb_mu=args.eb_mu,
+                            eb_kappa=args.eb_kappa,
+                            eb_oob_as_constraint=getattr(args, 'eb_oob_constraint', False),
+                            cost_truncate_y=float(cost_map_f.y_origin + cost_map_f.height),
+                        )
+                        if goal_y_line is not None:
+                            _replan_goal_line = goal_y_line
                     path_f = optimize_with_diffusion(
                         path_f, start_f, goal, cost_map_f, plan_cfg, start_nu=(2.0, 0.0, 0.0),
                         viz_dir=_mbd_viz_dir,
                         replan_idx=_mbd_replan_counter[0],
                         viz_world_polygons=world_polygons,
                         viz_thicknesses=thicknesses,
+                        goal_y_line=_replan_goal_line,
+                        denoising_movie_dir=_mbd_viz_dir if getattr(args, 'mbd_denoising_movie', False) else None,
+                        sample_filter_fn=_replan_filter,
+                        max_resample_iters=getattr(args, 'max_resample_iters', None),
+                        **_replan_eb_kwargs,
                     )
                     _mbd_replan_counter[0] += 1
                 elif use_mppi:
@@ -1072,8 +1423,8 @@ def main():
             goal_y_line=goal_y_line,
             goal_tolerance=_goal_tol,
             use_auto_icenav_ship=True,
-            # build_costmap_jax takes centroids directly (no world-polygon extraction needed)
-            skip_polygon_extraction=True,
+            # --polygon-replan needs world polygons; disk-based JAX path only needs centroids
+            skip_polygon_extraction=not getattr(args, 'polygon_replan', False),
         )
     else:
         # ── Full JAX scan path (no replanning or kinematic ship) ─────────

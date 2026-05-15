@@ -179,6 +179,36 @@ uv run python run_medea_ship_fracture.py --full-map --plan-only --no-show \
 - **Output:** `plan_only_medea.png` (or `plan_only_simple` / `plan_only_toy_sparse` for other modes).
 - **Options:** `--no-lattice-search-movie` to skip A* search movie when running with `--plan` (plan-only implies `--plan`).
 
+### 6c. Full MEDEA map with EB-MBD (Emerging-Barrier MBD)
+
+Replicates the constraint + cost structure of `examples/toy_mbd_bimodal.py` on the full MEDEA map: the goal-line (`y = 600 m`) is enforced as a progressively tightening log-barrier instead of a big-M penalty, OOB is a linear soft cost on `x∈[x_min, x_max]` and `y ≥ y_min` (no top wall), and the costmap/OOB integrals are truncated at the top edge of the costmap (above the goal line). No big-M anywhere.
+
+```bash
+# Baseline diffusion-MPC (standard soft goal-distance cost, no EB barrier)
+uv run python run_medea_ship_fracture.py --full-map --plan --planner diffusion-mpc \
+    --mbd-viz-dir outputs/mbd_debug --mbd-denoising-movie --no-3d
+
+# Same command with EB-MBD enabled (mirrors examples/toy_mbd_bimodal.py)
+uv run python run_medea_ship_fracture.py --full-map --plan --planner diffusion-mpc \
+    --mbd-viz-dir outputs/mbd_debug --mbd-denoising-movie --no-3d --eb-mbd
+```
+
+What `--eb-mbd` changes in this scenario (vs. the baseline call above):
+- **Goal-line reaching** is enforced via the EB log-barrier on `g(u) = y_final − 600` rather than a 1e6 big-M penalty.
+- **OOB** becomes a linear soft cost (`5 / m` of violation distance) over `x ∈ [x_origin, x_origin + width]` and `y ≥ y_origin`; the costmap query no longer adds an `oob_penalty=1e8` for off-grid hull corners.
+- **Cost truncation** is set to the costmap's top edge: waypoints past the first crossing of `y_top` contribute zero costmap & zero OOB cost.
+
+Tuning knobs (defaults shown):
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--eb-c-max 1500` | Initial barrier offset [m] — should exceed the max expected constraint violation. | 1500 |
+| `--eb-mu 50000` | Barrier hardness (cost units). | 50000 |
+| `--eb-kappa 1.0` | Schedule shape: 1 = linear tightening, > 1 = slow-then-fast. | 1.0 |
+| `--eb-oob-constraint` | Treat OOB as a hard EB barrier constraint instead of the default linear soft cost. | off |
+
+The initial plan and every replan use the same EB-MBD setup. Per-replan debug plots (density, top-5, cost-breakdown) go to `--mbd-viz-dir`, and `--mbd-denoising-movie` adds a per-replan MP4 of the denoising evolution.
+
 ### 7. Toy planner: wall with opening
 
 Standalone example: a wall of ice with one gap; the planner finds a path through the gap. Different scenario from the simple 3-floe field.
@@ -207,7 +237,71 @@ uv run python examples/toy_planner_thin_corridor.py --planner mppi
 - **Generated:** `toy_thin_corridor_lattice_search.mp4`, `toy_thin_corridor.mp4`, `toy_thin_corridor_3d.mp4`, `toy_thin_corridor_costmap.mp4`, `toy_thin_corridor_hull_impact.png`.
 - Options: `--planner diffusion-mpc` or `--planner mppi` (sampling-based refinement), `--live`, `--no-damage-cost` (baseline: no thickness preference), `--damage-cost-scale SCALE`, `--no-lattice-search-movie`, `--no-replan` (disable receding-horizon replanning).
 
-### 9. Planner benchmark (random ice fields, all planners)
+### 9. MBD scenario experiments (`toy_mbd_scenarios.py`)
+
+Five synthetic scenarios designed to stress-test homotopy exploration. Each scenario has a fixed costmap and goal line; the planner must reach the goal near a specified x-position.
+
+**Cost function (all scenarios):**
+```
+J(u) = ∫ costmap(traj) ds  +  1.0 × |x_crossing − goal_x|
+```
+Arc length, goal distance, and smoothness weights are all zero. The x-arrival penalty is always active.
+
+**Scenarios:**
+
+| Name | Description | Goal x (m) |
+|------|-------------|-----------|
+| `thin_corridor` | Wide floe leaving 80 m corridors — stresses ESS collapse | 400 |
+| `sequential_gates` | Two offset gates requiring an S-curve path | 400 |
+| `asymmetric` | Wide left / narrow right corridor — goal on narrow side | 760 |
+| `cluttered` | 12 scattered ice disks — many-constraint performance | 400 |
+| `sequential_gates_hard` | Gates as hard rectangular obstacles (EB/AL only) | 400 |
+
+**Run one scenario with one method:**
+```bash
+uv run python examples/toy_mbd_scenarios.py --scenario thin_corridor --method eb_homotopy_mbd
+uv run python examples/toy_mbd_scenarios.py --scenario sequential_gates --method eb_homotopy_mbd
+uv run python examples/toy_mbd_scenarios.py --scenario asymmetric --method eb_homotopy_mbd
+uv run python examples/toy_mbd_scenarios.py --scenario cluttered --method eb_homotopy_mbd
+uv run python examples/toy_mbd_scenarios.py --scenario sequential_gates_hard --method eb_homotopy_mbd
+```
+
+**Run all methods on one scenario (comparison table):**
+```bash
+uv run python examples/toy_mbd_scenarios.py --scenario sequential_gates --run-all-methods
+```
+
+**Available methods:** `mbd`, `eb_mbd`, `reject_mbd`, `al_mbd`, `sa_mbd`, `homotopy_mbd`, `eb_homotopy_mbd`, `al_homotopy_mbd`, `lattice`
+
+**Key tuning flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--nsample N` | 512 | Number of diffusion samples |
+| `--ndiffuse N` | 50 | Diffusion iterations |
+| `--temperature T` | 0.01 | Sampling temperature |
+| `--horizon H` | 1200 | Planning horizon (steps) |
+| `--eb-c-max C` | 1500.0 | EB barrier saturation level |
+| `--eb-mu M` | 50000.0 | EB barrier sharpness |
+| `--eb-oob-cost C` | 5.0 | OOB linear cost per metre |
+| `--homotopy-n-obs-max N` | 3 | Max obstacles for H-signature (→ 2^N classes) |
+| `--no-inflation` | off | Disable ship-beam dilation of obstacles |
+| `--output-root DIR` | `outputs/scenarios` | Root output directory |
+
+**Outputs per run** (under `outputs/scenarios/<scenario>/<method>/`):
+
+| File | Description |
+|------|-------------|
+| `costmap.png` | Costmap with start/goal |
+| `result.png` | Best trajectory on costmap |
+| `trajectory_fan.mp4` | Fan of sampled trajectories over diffusion |
+| `eb_barrier_schedule.mp4` | EB barrier tightening over iterations (EB methods) |
+| `homotopy_class_evolution.png` | Class assignments over diffusion (homotopy methods) |
+| `denoising/` | Per-iteration mean trajectory frames |
+
+---
+
+### 10. Planner benchmark (random ice fields, all planners)
 
 The benchmark script generates **random ice fields** at several concentrations (AUTO-IceNav style), runs every selected planner on each field, and saves planned-path and result (planned + actual path) images with a **planner name suffix**, plus a CSV of metrics (path length, costmap cost, impulse, fuel proxy).
 
@@ -315,6 +409,16 @@ File format: **MP4** by default; use `--gif` for GIF (slower, larger, no paralle
 | `--live` | Real-time 2D window during simulation. |
 | `--save-state FILE` | Save simulation state to pickle for replay. |
 | `--load-state FILE` | Replay: load state and generate animations only. |
+| `--ice-tank-psv` | Switch to the AUTO-IceNav ice-tank PSV-scale vessel (L≈83 m, B≈17 m, 8 kt) instead of the default Fossen supply vessel (L=76.2 m, B=17 m, 6 kt). |
+| `--icebreaker` | Use the large icebreaker from config (L=158 m, B=28 m, 23 kt) instead of the default Fossen supply vessel. |
+| `--eb-mbd` | With `--plan`: use Emerging-Barrier MBD — a log-barrier that tightens progressively over the reverse diffusion instead of big-M OOB/goal penalties. |
+| `--eb-c-max M` | EB-MBD barrier offset at the start of reverse diffusion [m] (default 1500). |
+| `--eb-mu F` | EB-MBD barrier hardness in cost units (default 50000). |
+| `--eb-kappa K` | EB-MBD barrier schedule shape: 1 = linear tightening, >1 = slow-then-fast (default 1.0). |
+| `--eb-oob-constraint` | EB-MBD: enforce OOB as a hard barrier constraint instead of the default linear soft cost. |
+| `--eb-goal-x-weight W` | EB-MBD: soft penalty weight for x-deviation at goal-line crossing (default 0, disabled). |
+| `--mbd-viz-dir DIR` | With `--planner diffusion-mpc`: save per-replan debug plots (density, top-5, cost breakdown) to `DIR`. |
+| `--mbd-denoising-movie` | With `--mbd-viz-dir`: also save a denoising-evolution MP4 per replan step. |
 
 Optional tuning: `--thrust-cap N`, `--no-thrust-cap`, `--no-mss-dynamics`, `--no-dpdem-bonds` (legacy bonds), `--optimize-path` (NLP path refinement; requires CasADi).
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 import jax
 import jax.numpy as jnp
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, List, Union
 
 from medea_ice_ship.config import get_default_simulation_config
 
@@ -105,13 +105,22 @@ def make_dynamics_rollout(
 
 # ── Costmap bilinear interpolation (JAX) ──────────────────────────────────
 
-def _make_query(grid: jnp.ndarray, meta: dict):
-    """Return a bilinear-interpolation query for a JAX costmap grid."""
+def _make_query(grid: jnp.ndarray, meta: dict, oob_penalty: float = 1e8):
+    """Return a bilinear-interpolation query for a JAX costmap grid.
+
+    Parameters
+    ----------
+    oob_penalty : float
+        Cost added when the queried x-coordinate is outside the costmap
+        x-extent.  Set to 0.0 when using EB-MBD (the barrier replaces
+        the hard OOB penalty).  Default 1e8 preserves existing behaviour.
+    """
     xo = float(meta["x_origin"])
     yo = float(meta["y_origin"])
     res = float(meta["resolution"])
     nrows = int(meta["rows"])
     ncols = int(meta["cols"])
+    _oob_penalty = jnp.float32(oob_penalty)
 
     def query(x, y):
         cf = (x - xo) / res - 0.5
@@ -125,8 +134,8 @@ def _make_query(grid: jnp.ndarray, meta: dict):
         c0c = jnp.clip(c0, 0, ncols - 1)
         c1c = jnp.clip(c0 + 1, 0, ncols - 1)
         oob = jnp.where(
-            (r0 < 0) | (r0 + 1 >= nrows) | (c0 < 0) | (c0 + 1 >= ncols),
-            1e4, 0.0,
+            (c0 < 0) | (c0 + 1 >= ncols),
+            _oob_penalty, 0.0,
         )
         val = (
             grid[r0c, c0c] * (1 - fr) * (1 - fc)
@@ -167,23 +176,292 @@ def _resample_path_by_arclength(path: np.ndarray, n_points: int) -> np.ndarray:
     return result
 
 
-# ── Warm-start from lattice path (numpy, pre-JIT) ────────────────────────
+# ── RRT path planner (numpy, costmap-based, for MBD warm-starting) ───────
+
+def rrt_path_on_costmap(
+    cost_map,
+    start_xy: Tuple[float, float],
+    goal_xy: Tuple[float, float],
+    *,
+    max_iters: int = 8000,
+    step_size: float = 20.0,
+    goal_bias: float = 0.15,
+    cost_threshold_frac: float = 0.1,
+    smooth_iters: int = 300,
+    seed: int = 42,
+) -> Optional[np.ndarray]:
+    """
+    RRT path planner on a 2-D costmap grid.
+
+    Cells with cost > max_cost * cost_threshold_frac are treated as obstacles.
+    Uses goal-biased sampling and random-shortcut smoothing.
+
+    Returns (N, 3) float64 array [x, y, heading], or None if no path is found.
+    The returned path can be passed directly to _warm_start_from_path.
+    """
+    grid = np.array(cost_map.cost_map)
+    # Treat wall-cost cells (>=1e7) as obstacles regardless of the threshold fraction.
+    # Clip them for max-cost estimation so ice cells remain detectable.
+    WALL_CLIP = 1e7
+    _det_grid = np.where(grid >= WALL_CLIP, 0.0, grid)
+    max_cost = float(_det_grid.max())
+    res    = float(cost_map.resolution)
+    x_orig = float(cost_map.x_origin)
+    y_orig = float(cost_map.y_origin)
+    nrows, ncols = grid.shape
+
+    if max_cost > 0.0:
+        occ = (grid >= WALL_CLIP) | (_det_grid > max_cost * cost_threshold_frac)
+    else:
+        occ = (grid >= WALL_CLIP)
+
+    x_lo, x_hi = x_orig, x_orig + ncols * res
+    y_lo, y_hi = y_orig, y_orig + nrows * res
+
+    def _free(x, y):
+        ri = int((y - y_orig) / res)
+        ci = int((x - x_orig) / res)
+        if ri < 0 or ri >= nrows or ci < 0 or ci >= ncols:
+            return False
+        return not occ[ri, ci]
+
+    def _segment_free(p1, p2, n=12):
+        ts = np.linspace(0.0, 1.0, n)
+        xs = p1[0] + ts * (p2[0] - p1[0])
+        ys = p1[1] + ts * (p2[1] - p1[1])
+        for x, y in zip(xs, ys):
+            if not _free(x, y):
+                return False
+        return True
+
+    rng     = np.random.default_rng(seed)
+    nodes   = [np.array(start_xy, dtype=np.float64)]
+    parent  = [-1]
+    goal_np = np.array(goal_xy,   dtype=np.float64)
+    found   = False
+
+    for _ in range(max_iters):
+        if rng.random() < goal_bias:
+            q_rand = goal_np.copy()
+        else:
+            q_rand = np.array([rng.uniform(x_lo, x_hi), rng.uniform(y_lo, y_hi)])
+
+        arr    = np.array(nodes)
+        idx_nn = int(np.argmin(np.linalg.norm(arr - q_rand, axis=1)))
+        q_near = nodes[idx_nn]
+
+        d  = q_rand - q_near
+        dn = float(np.linalg.norm(d))
+        if dn < 1e-6:
+            continue
+        q_new = q_near + (d / dn) * min(step_size, dn)
+
+        if not _segment_free(q_near, q_new):
+            continue
+
+        nodes.append(q_new)
+        parent.append(idx_nn)
+
+        if float(np.linalg.norm(q_new - goal_np)) <= step_size:
+            if _segment_free(q_new, goal_np):
+                nodes.append(goal_np.copy())
+                parent.append(len(nodes) - 2)
+                found = True
+                break
+
+    if not found:
+        return None
+
+    # Trace path from goal back to start
+    path: list = []
+    idx = len(nodes) - 1
+    while idx >= 0:
+        path.append(nodes[idx])
+        idx = parent[idx]
+    path.reverse()
+    path_xy = np.array(path)
+
+    # Random shortcutting
+    for _ in range(smooth_iters):
+        n = len(path_xy)
+        if n <= 2:
+            break
+        i = int(rng.integers(0, n - 1))
+        j = int(rng.integers(i + 1, n))
+        if _segment_free(path_xy[i], path_xy[j]):
+            path_xy = np.vstack([path_xy[: i + 1], path_xy[j:]])
+
+    # Attach headings
+    n       = len(path_xy)
+    result  = np.zeros((n, 3), dtype=np.float64)
+    result[:, :2] = path_xy
+    for i in range(n - 1):
+        dx, dy = path_xy[i + 1] - path_xy[i]
+        result[i, 2] = np.arctan2(dy, dx)
+    result[-1, 2] = result[-2, 2]
+    return result
+
+
+# ── A* path planner (numpy, costmap-based, for MBD warm-starting) ────────
+
+def astar_path_on_costmap(
+    cost_map,
+    start_xy: Tuple[float, float],
+    goal_xy: Tuple[float, float],
+    *,
+    cost_threshold_frac: float = 0.1,
+    smooth_iters: int = 300,
+    seed: int = 42,
+) -> Optional[np.ndarray]:
+    """
+    A* path planner on a 2-D costmap grid.
+
+    Uses the same occupancy mask as rrt_path_on_costmap (cells with cost >
+    max_cost * cost_threshold_frac are obstacles, plus wall-cost cells).
+    8-connected grid search with Euclidean heuristic.  Followed by the same
+    random-shortcut smoothing as the RRT planner.
+
+    Returns (N, 3) float64 array [x, y, heading], or None if no path found.
+    """
+    import heapq
+
+    grid   = np.array(cost_map.cost_map)
+    WALL_CLIP = 1e7
+    _det   = np.where(grid >= WALL_CLIP, 0.0, grid)
+    max_cost = float(_det.max())
+    res    = float(cost_map.resolution)
+    x_orig = float(cost_map.x_origin)
+    y_orig = float(cost_map.y_origin)
+    nrows, ncols = grid.shape
+
+    if max_cost > 0.0:
+        occ = (grid >= WALL_CLIP) | (_det > max_cost * cost_threshold_frac)
+    else:
+        occ = (grid >= WALL_CLIP)
+
+    def _world_to_cell(x, y):
+        ci = int(np.clip((x - x_orig) / res, 0, ncols - 1))
+        ri = int(np.clip((y - y_orig) / res, 0, nrows - 1))
+        return ri, ci
+
+    def _cell_to_world(ri, ci):
+        return x_orig + (ci + 0.5) * res, y_orig + (ri + 0.5) * res
+
+    r_start, c_start = _world_to_cell(*start_xy)
+    r_goal,  c_goal  = _world_to_cell(*goal_xy)
+
+    # 8-connected neighbours
+    moves = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    move_costs = [np.sqrt(2), 1.0, np.sqrt(2), 1.0, 1.0, np.sqrt(2), 1.0, np.sqrt(2)]
+
+    def _h(r, c):
+        return np.sqrt((r - r_goal)**2 + (c - c_goal)**2)
+
+    g = np.full((nrows, ncols), np.inf)
+    g[r_start, c_start] = 0.0
+    came_from = {}
+    open_heap = [(float(_h(r_start, c_start)), r_start, c_start)]
+
+    found = False
+    while open_heap:
+        f, r, c = heapq.heappop(open_heap)
+        if r == r_goal and c == c_goal:
+            found = True
+            break
+        if f > g[r, c] + _h(r, c) + 1e-6:
+            continue
+        for (dr, dc), mc in zip(moves, move_costs):
+            nr, nc = r + dr, c + dc
+            if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
+                continue
+            if occ[nr, nc]:
+                continue
+            ng = g[r, c] + mc
+            if ng < g[nr, nc]:
+                g[nr, nc] = ng
+                came_from[(nr, nc)] = (r, c)
+                heapq.heappush(open_heap, (ng + _h(nr, nc), nr, nc))
+
+    if not found:
+        return None
+
+    # Trace path
+    path_cells = []
+    node = (r_goal, c_goal)
+    while node in came_from:
+        path_cells.append(node)
+        node = came_from[node]
+    path_cells.append((r_start, c_start))
+    path_cells.reverse()
+
+    path_xy = np.array([_cell_to_world(r, c) for r, c in path_cells])
+
+    # Same random-shortcut smoothing as RRT
+    def _free(x, y):
+        ri = int((y - y_orig) / res)
+        ci = int((x - x_orig) / res)
+        if ri < 0 or ri >= nrows or ci < 0 or ci >= ncols:
+            return False
+        return not occ[ri, ci]
+
+    def _segment_free(p1, p2, n=12):
+        ts = np.linspace(0.0, 1.0, n)
+        for t in ts:
+            x = p1[0] + t * (p2[0] - p1[0])
+            y = p1[1] + t * (p2[1] - p1[1])
+            if not _free(x, y):
+                return False
+        return True
+
+    rng = np.random.default_rng(seed)
+    for _ in range(smooth_iters):
+        n = len(path_xy)
+        if n <= 2:
+            break
+        i = int(rng.integers(0, n - 1))
+        j = int(rng.integers(i + 1, n))
+        if _segment_free(path_xy[i], path_xy[j]):
+            path_xy = np.vstack([path_xy[:i + 1], path_xy[j:]])
+
+    # Attach headings
+    n = len(path_xy)
+    result = np.zeros((n, 3), dtype=np.float64)
+    result[:, :2] = path_xy
+    for i in range(n - 1):
+        dx, dy = path_xy[i + 1] - path_xy[i]
+        result[i, 2] = np.arctan2(dy, dx)
+    result[-1, 2] = result[-2, 2]
+    return result
+
+
+# ── Warm-start helpers (numpy, pre-JIT) ──────────────────────────────────
 
 def _warm_start_from_path(
     lattice_path: Optional[np.ndarray],
     H: int,
     init_surge_bias: float = 0.7,
+    eta0: Optional[np.ndarray] = None,
+    nu0: Optional[np.ndarray] = None,
+    M3_np: Optional[np.ndarray] = None,
+    D3_np: Optional[np.ndarray] = None,
+    dt_substep: float = 1.0,
+    n_substeps: int = 1,
+    action_center_np: Optional[np.ndarray] = None,
+    action_scale_np: Optional[np.ndarray] = None,
+    lookahead_dist: float = 60.0,
 ) -> np.ndarray:
     """
-    Compute initial normalised actions (H, 3) from a lattice A* path.
+    Compute initial normalised actions (H, 3) from a lattice path.
 
-    Provides an informed starting point for MBD by setting:
-      - surge: constant forward bias
-      - yaw:   proportional to heading changes along the path
-      - sway:  zero (let MBD optimise lateral forces)
+    When ship dynamics parameters are provided (eta0, nu0, M3_np, D3_np,
+    action_center_np, action_scale_np), uses a closed-loop pure-pursuit
+    simulation: the ship state is propagated forward at each step and the yaw
+    command is computed from the actual ship heading vs. a lookahead point on
+    the path.  This produces a warm-start rollout that genuinely follows the
+    RRT path through dynamics.
 
-    The lattice path only seeds the optimisation; it is NOT used as a cost
-    penalty — MBD is free to deviate if costmap + goal suggest a better route.
+    Without dynamics parameters, falls back to the original open-loop geometric
+    approach (path headings only).
     """
     Ybar = np.zeros((H, 3))
     Ybar[:, 0] = init_surge_bias
@@ -193,6 +471,68 @@ def _warm_start_from_path(
 
     path_ref = _resample_path_by_arclength(lattice_path, H + 1)
 
+    # ── Closed-loop pure-pursuit (preferred when dynamics are available) ──
+    if (eta0 is not None and M3_np is not None
+            and action_center_np is not None and action_scale_np is not None):
+
+        eta = np.array(eta0, dtype=np.float64)
+        nu  = np.array(nu0 if nu0 is not None else [2.0, 0.0, 0.0], dtype=np.float64)
+        M3_inv = np.linalg.inv(M3_np.astype(np.float64))
+        D3     = D3_np.astype(np.float64) if D3_np is not None else np.zeros((3, 3))
+        ac     = np.array(action_center_np, dtype=np.float64)
+        asc    = np.array(action_scale_np,  dtype=np.float64)
+        m11    = float(M3_np[0, 0])
+        m22    = float(M3_np[1, 1])
+
+        # Physical surge matching the normalised bias
+        surge_phys = float(init_surge_bias * asc[0] + ac[0])
+
+        # Cumulative arc-length along path_ref for lookahead queries
+        segs   = np.linalg.norm(np.diff(path_ref[:, :2], axis=0), axis=1)
+        cum_s  = np.concatenate([[0.0], np.cumsum(segs)])
+        s_total = float(cum_s[-1])
+
+        def _lookahead_xy(pos_xy: np.ndarray) -> np.ndarray:
+            """World-coordinate target: path point `lookahead_dist` ahead."""
+            dists   = np.linalg.norm(path_ref[:, :2] - pos_xy[None, :], axis=1)
+            nearest = int(np.argmin(dists))
+            target_s = min(float(cum_s[nearest]) + lookahead_dist, s_total)
+            idx = int(np.searchsorted(cum_s, target_s))
+            return path_ref[min(idx, len(path_ref) - 1), :2]
+
+        for t in range(H):
+            tgt = _lookahead_xy(eta[:2])
+            dx  = float(tgt[0] - eta[0])
+            dy  = float(tgt[1] - eta[1])
+            desired = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 0.5 else float(eta[2])
+            err_psi = (desired - float(eta[2]) + np.pi) % (2 * np.pi) - np.pi
+
+            # Proportional-derivative yaw command (physical torque)
+            tau_r   = float(np.clip(err_psi * 2.0 * asc[2], -asc[2], asc[2]))
+            tau     = np.array([surge_phys, 0.0, tau_r])
+            u_norm  = np.clip((tau - ac) / (asc + 1e-8), -1.0, 1.0)
+            Ybar[t] = u_norm
+
+            # Euler substeps with actual ship state
+            for _ in range(n_substeps):
+                C_nu = np.array([
+                    -m22 * nu[1] * nu[2],
+                     m11 * nu[0] * nu[2],
+                    (m22 - m11) * nu[0] * nu[1],
+                ])
+                nu_dot = M3_inv @ (tau - C_nu - D3 @ nu)
+                nu     = nu + dt_substep * nu_dot
+                c, s   = np.cos(eta[2]), np.sin(eta[2])
+                vx     = c * nu[0] - s * nu[1]
+                vy     = s * nu[0] + c * nu[1]
+                eta    = np.array([
+                    eta[0] + dt_substep * vx,
+                    eta[1] + dt_substep * vy,
+                    (eta[2] + dt_substep * nu[2] + np.pi) % (2 * np.pi) - np.pi,
+                ])
+        return Ybar
+
+    # ── Fallback: open-loop geometric (no dynamics info) ──────────────────
     for t in range(H):
         dx = path_ref[t + 1, 0] - path_ref[t, 0]
         dy = path_ref[t + 1, 1] - path_ref[t, 1]
@@ -206,7 +546,7 @@ def _warm_start_from_path(
 
 # ── Cost function (normalised actions → dynamics → costmap + goal) ────────
 
-def make_cost_fn(
+def _make_raw_components_fn(
     grid: jnp.ndarray,
     meta: dict,
     goal_world,
@@ -215,24 +555,29 @@ def make_cost_fn(
     nu0: jnp.ndarray,
     action_center: jnp.ndarray,
     action_scale: jnp.ndarray,
-    costmap_weight: float = 1.0,
-    goal_weight: float = 0.1,
-    length_weight: float = 1.0,
-    smoothness_weight: float = 0.005,
     ship_length: float = 0.0,
     ship_beam: float = 0.0,
+    cost_truncate_y: Optional[float] = None,
+    oob_penalty: float = 1e8,
 ):
     """
-    Build cost J(u_norm) matching the A* lattice planner's cost structure.
+    Shared implementation used by both make_cost_fn and make_cost_components_fn.
 
-    For each trajectory segment the cost is:
-        arc_length  +  max_hull_costmap × segment_length
-    summed (accumulated) over the full trajectory — identical to the lattice
-    planner's ``_compute_path_cost``.  A small goal-distance term provides
-    directional guidance (the lattice planner gets this from the A* heuristic).
+    Returns a function raw_fn(u_norm) -> jnp.array([costmap, length, goal, jerk])
+    where each element is the *unweighted* cost component, using exactly the same
+    formulas as cost_fn so that weighted = raw * weight_vector is always consistent
+    with the total cost returned by cost_fn.
+
+    cost_truncate_y : float, optional
+        If set, waypoints with y > cost_truncate_y contribute zero to the
+        costmap integral (including any OOB penalties from _make_query).
+        Useful for open-ended scenarios where the trajectory is allowed to
+        exit the map from the top without penalty.
     """
-    query = _make_query(grid, meta)
+    query = _make_query(grid, meta, oob_penalty=oob_penalty)
     goal_xy = jnp.array(goal_world[:2], dtype=jnp.float32)
+    _has_truncate = cost_truncate_y is not None
+    _truncate_y = jnp.float32(cost_truncate_y if cost_truncate_y is not None else 0.0)
 
     half_l = float(ship_length) / 2.0
     half_w = float(ship_beam) / 2.0
@@ -251,38 +596,96 @@ def make_cost_fn(
         def _point_cost(point):
             return query(point[0], point[1])
 
-    def cost_fn(u_norm):
+    def raw_fn(u_norm):
         u_phys = u_norm * action_scale + action_center
         traj = rollout_fn(eta0, nu0, u_phys)
 
-        # Segment lengths (arc-length weighting, like A*)
-        diffs = jnp.diff(traj[:, :2], axis=0)  # (H, 2)
-        seg_lens = jnp.sqrt(jnp.sum(diffs ** 2, axis=1) + 1e-8)  # (H,)
+        diffs = jnp.diff(traj[:, :2], axis=0)
+        seg_lens = jnp.sqrt(jnp.sum(diffs ** 2, axis=1) + 1e-8)
 
-        # Hull-aware costmap at waypoints (max over center + 4 corners)
-        wp_costs = jax.vmap(_point_cost)(traj)  # (H+1,)
-
-        # Accumulated costmap cost weighted by segment length (matches A*)
-        # Use average of endpoints per segment × segment_length
+        wp_costs = jax.vmap(_point_cost)(traj)
+        # Zero out cost contributions for waypoints AFTER the goal line is first
+        # crossed.  We use a cumulative-max so the mask respects trajectory order:
+        # every step at or after the first crossing of _truncate_y is suppressed,
+        # but steps before (including the crossing step itself) are kept.
+        # _has_truncate is a Python bool evaluated at trace time, so the branch
+        # is resolved statically and never touches traced JAX values.
+        if _has_truncate:
+            y_cummax = jnp.maximum.accumulate(traj[:, 1])
+            # prev_cummax[t] = max y seen strictly before step t
+            prev_cummax = jnp.concatenate(
+                [jnp.array([jnp.float32(-1e9)]), y_cummax[:-1]]
+            )
+            y_mask = (prev_cummax < _truncate_y).astype(jnp.float32)
+            wp_costs = wp_costs * y_mask
         seg_costmap = 0.5 * (wp_costs[:-1] + wp_costs[1:]) * seg_lens
         costmap_cost = seg_costmap.sum()
 
-        # Arc length (A*'s base distance cost)
         path_length = seg_lens.sum()
 
-        # Small goal nudge (replaces A*'s heuristic-guided search)
-        goal_dist = jnp.sqrt(jnp.sum((traj[-1, :2] - goal_xy) ** 2) + 1e-4)
+        # Exponentially-discounted running mean goal distance (same as cost_fn).
+        H_plus1 = traj.shape[0]
+        t_idx = jnp.arange(H_plus1, dtype=jnp.float32)
+        tau = float(H_plus1) / 3.0
+        discounts = jnp.exp(-t_idx / tau)
+        discounts = discounts / discounts.sum()
+        dists_all = jnp.sqrt(jnp.sum((traj[:, :2] - goal_xy) ** 2, axis=1) + 1e-4)
+        goal_dist = jnp.dot(discounts, dists_all)
 
-        # Control smoothness
         du = jnp.diff(u_norm, axis=0)
         jerk = jnp.mean(du ** 2)
 
-        return (
-            costmap_weight * costmap_cost
-            + length_weight * path_length
-            + goal_weight * goal_dist
-            + smoothness_weight * jerk
-        )
+        return jnp.array([costmap_cost, path_length, goal_dist, jerk])
+
+    return raw_fn
+
+
+def make_cost_fn(
+    grid: jnp.ndarray,
+    meta: dict,
+    goal_world,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    costmap_weight: float = 1.0,
+    costmap_normalizer: float = 1.0,
+    goal_weight: float = 0.1,
+    length_weight: float = 1.0,
+    smoothness_weight: float = 0.005,
+    ship_length: float = 0.0,
+    ship_beam: float = 0.0,
+    cost_truncate_y: Optional[float] = None,
+    oob_penalty: float = 1e8,
+):
+    """
+    Build cost J(u_norm) matching the A* lattice planner's cost structure.
+
+    For each trajectory segment the cost is:
+        arc_length  +  max_hull_costmap × segment_length
+    summed (accumulated) over the full trajectory — identical to the lattice
+    planner's ``_compute_path_cost``.  A small goal-distance term provides
+    directional guidance (the lattice planner gets this from the A* heuristic).
+
+    costmap_normalizer scales down the raw costmap integral so that
+    ``costmap_weight=1.0`` gives comparable magnitude to the path-length term.
+    Effective costmap weight = costmap_weight / costmap_normalizer.
+    Use ``calibration/calibrate_from_mbd_debug.py`` to determine the right value.
+    """
+    raw_fn = _make_raw_components_fn(
+        grid, meta, goal_world, rollout_fn, eta0, nu0,
+        action_center, action_scale, ship_length, ship_beam,
+        cost_truncate_y=cost_truncate_y,
+        oob_penalty=oob_penalty,
+    )
+    weights = jnp.array(
+        [costmap_weight / costmap_normalizer, length_weight, goal_weight, smoothness_weight],
+        dtype=jnp.float32,
+    )
+
+    def cost_fn(u_norm):
+        return jnp.dot(weights, raw_fn(u_norm))
 
     return cost_fn
 
@@ -303,43 +706,389 @@ def make_cost_components_fn(
     Like make_cost_fn but returns individual (unweighted) cost components.
 
     Returns a function components_fn(u_norm) -> jnp.array([costmap, length, goal, jerk])
-    so callers can apply weights and compute percentages for diagnostics.
+    using the same formulas as make_cost_fn so that weighted = raw * weight_vector
+    is always consistent with the total cost.
     """
-    query = _make_query(grid, meta)
-    goal_xy = jnp.array(goal_world[:2], dtype=jnp.float32)
+    return _make_raw_components_fn(
+        grid, meta, goal_world, rollout_fn, eta0, nu0,
+        action_center, action_scale, ship_length, ship_beam,
+    )
 
-    half_l = float(ship_length) / 2.0
-    half_w = float(ship_beam) / 2.0
-    use_hull = ship_length > 0 and ship_beam > 0
 
-    if use_hull:
-        _dx_body = jnp.array([0.0, half_l, half_l, -half_l, -half_l], dtype=jnp.float32)
-        _dy_body = jnp.array([0.0, half_w, -half_w, half_w, -half_w], dtype=jnp.float32)
+def make_goal_line_cost_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    goal_y_line: float,
+    penalty: float = 1e6,
+):
+    """
+    Big-M penalty for trajectories that never reach y >= goal_y_line.
 
-        def _point_cost(point):
-            c, s = jnp.cos(point[2]), jnp.sin(point[2])
-            wx = point[0] + c * _dx_body - s * _dy_body
-            wy = point[1] + s * _dx_body + c * _dy_body
-            return jnp.max(jax.vmap(query)(wx, wy))
-    else:
-        def _point_cost(point):
-            return query(point[0], point[1])
+    Returns 0 if any waypoint satisfies y >= goal_y_line, else `penalty`.
+    Intended to replace the soft goal-distance term with a hard constraint.
+    """
+    _goal_y = jnp.float32(goal_y_line)
+    _penalty = jnp.float32(penalty)
 
-    def components_fn(u_norm):
+    def fn(u_norm):
         u_phys = u_norm * action_scale + action_center
         traj = rollout_fn(eta0, nu0, u_phys)
-        diffs = jnp.diff(traj[:, :2], axis=0)
-        seg_lens = jnp.sqrt(jnp.sum(diffs ** 2, axis=1) + 1e-8)
-        wp_costs = jax.vmap(_point_cost)(traj)
-        seg_costmap = 0.5 * (wp_costs[:-1] + wp_costs[1:]) * seg_lens
-        costmap_cost = seg_costmap.sum()
-        path_length = seg_lens.sum()
-        goal_dist = jnp.sqrt(jnp.sum((traj[-1, :2] - goal_xy) ** 2) + 1e-4)
-        du = jnp.diff(u_norm, axis=0)
-        jerk = jnp.mean(du ** 2)
-        return jnp.array([costmap_cost, path_length, goal_dist, jerk])
+        # max_y = jnp.max(traj[:, 1])
+        y_final = traj[-1, 1]
+        return jnp.where(y_final >= _goal_y, jnp.float32(0.0), _penalty)
 
-    return components_fn
+    return fn
+
+
+def make_goal_arrival_x_cost_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    goal_x: float,
+    goal_y_line: float,
+    weight: float = 1.0,
+):
+    """
+    Soft cost penalising x-deviation at the first crossing of goal_y_line.
+
+    Linearly interpolates the crossing x between the waypoint before and after
+    the first y >= goal_y_line transition.  If the trajectory never reaches the
+    goal line the last waypoint x is used (the goal-line big-M penalty handles
+    the infeasible case more strongly).
+
+    Returns weight * |x_crossing - goal_x|.
+    """
+    _goal_x = jnp.float32(goal_x)
+    _goal_y = jnp.float32(goal_y_line)
+    _weight = jnp.float32(weight)
+    H_plus1 = eta0.shape[0] if hasattr(eta0, "shape") else None  # resolved at trace time
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)            # (H+1, 3)
+
+        crossed = (traj[:, 1] >= _goal_y).astype(jnp.int32)
+        first_idx = jnp.argmax(crossed)                 # 0 if never crossed
+        any_crossed = crossed.sum() > 0
+
+        # Linear interpolation between step before and step of crossing
+        i1 = first_idx
+        i0 = jnp.maximum(i1 - 1, 0)
+        y0 = traj[i0, 1]
+        y1 = traj[i1, 1]
+        x0 = traj[i0, 0]
+        x1 = traj[i1, 0]
+        dy = y1 - y0
+        frac = jnp.where(dy > 1e-6, (_goal_y - y0) / dy, 0.0)
+        frac = jnp.clip(frac, 0.0, 1.0)
+        x_crossing_interp = x0 + frac * (x1 - x0)
+
+        # Fall back to last waypoint x if goal never reached
+        x_crossing = jnp.where(any_crossed, x_crossing_interp, traj[-1, 0])
+        return _weight * jnp.abs(x_crossing - _goal_x)
+
+    return fn
+
+
+# ── EB-MBD constraint functions ──────────────────────────────────────────
+
+def make_oob_constraint_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    cost_truncate_y: Optional[float] = None,
+):
+    """
+    OOB constraint function for EB-MBD.
+
+    Returns g_OOB(u_norm) = min over active waypoints of the signed distance
+    to the nearest OOB boundary (left, right, bottom walls only — no top wall).
+
+      g_OOB > 0  ⟺  all active waypoints are strictly inside [x_min, x_max] × [y_min, ∞)
+      g_OOB ≤ 0  ⟺  at least one active waypoint is OOB
+
+    When cost_truncate_y is set (typically = goal_y_line), waypoints after the
+    first crossing of that y value are excluded from the min computation.
+    """
+    _x_min = jnp.float32(x_min)
+    _x_max = jnp.float32(x_max)
+    _y_min = jnp.float32(y_min)
+    _has_truncate = cost_truncate_y is not None
+    _truncate_y = jnp.float32(cost_truncate_y if cost_truncate_y is not None else 0.0)
+    _large = jnp.float32(1e9)
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)   # (H+1, 3)
+        xs = traj[:, 0]
+        ys = traj[:, 1]
+        # Signed distance to each wall: positive inside, negative outside
+        dist_left   = xs - _x_min    # positive when x > x_min
+        dist_right  = _x_max - xs    # positive when x < x_max
+        dist_bottom = ys - _y_min    # positive when y > y_min
+        if _has_truncate:
+            # Mask out waypoints after the goal line is first crossed.
+            # Inactive waypoints contribute +inf so they never affect the min.
+            y_cummax = jnp.maximum.accumulate(ys)
+            prev_cummax = jnp.concatenate(
+                [jnp.array([jnp.float32(-1e9)]), y_cummax[:-1]]
+            )
+            active = (prev_cummax < _truncate_y)
+            dist_left   = jnp.where(active, dist_left,   _large)
+            dist_right  = jnp.where(active, dist_right,  _large)
+            dist_bottom = jnp.where(active, dist_bottom, _large)
+        return jnp.minimum(
+            jnp.minimum(jnp.min(dist_left), jnp.min(dist_right)),
+            jnp.min(dist_bottom),
+        )
+
+    return fn
+
+
+def make_oob_cost_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    oob_cost_per_m: float = 5.0,
+    cost_truncate_y: Optional[float] = None,
+):
+    """
+    Linear OOB cost added to the base costmap cost for EB-MBD.
+
+    Returns oob_cost_per_m × Σ_t max(0, violation_t), where violation_t is
+    the sum of boundary violations (x < x_min, x > x_max, y < y_min) at each
+    waypoint.  Zero for fully in-bounds trajectories; proportional to distance
+    OOB otherwise — providing a smooth gradient within an all-OOB class without
+    the wall-avoidance bias of a two-sided log barrier.
+    """
+    _x_min = jnp.float32(x_min)
+    _x_max = jnp.float32(x_max)
+    _y_min = jnp.float32(y_min)
+    _scale = jnp.float32(oob_cost_per_m)
+    _has_truncate = cost_truncate_y is not None
+    _truncate_y = jnp.float32(cost_truncate_y if cost_truncate_y is not None else 0.0)
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)   # (H+1, 3)
+        xs = traj[:, 0]
+        ys = traj[:, 1]
+        viol = (jnp.maximum(0.0, _x_min - xs)
+                + jnp.maximum(0.0, xs - _x_max)
+                + jnp.maximum(0.0, _y_min - ys))
+        if _has_truncate:
+            y_cummax = jnp.maximum.accumulate(ys)
+            prev_cummax = jnp.concatenate(
+                [jnp.array([jnp.float32(-1e9)]), y_cummax[:-1]]
+            )
+            y_mask = (prev_cummax < _truncate_y).astype(jnp.float32)
+            viol = viol * y_mask
+        return _scale * jnp.sum(viol)
+
+    return fn
+
+
+def make_goal_constraint_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    goal_y_line: float,
+):
+    """
+    Goal-reaching constraint function for EB-MBD.
+
+    Returns g_goal(u_norm) = y_final - goal_y_line.
+
+      g_goal ≥ 0  ⟺  the final waypoint reaches or exceeds the goal line
+      g_goal < 0  ⟺  trajectory ends short of the goal by |g_goal| metres
+    """
+    _goal_y = jnp.float32(goal_y_line)
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)
+        return traj[-1, 1] - _goal_y
+
+    return fn
+
+
+def make_combined_constraint_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    goal_y_line: float,
+):
+    """
+    Combined OOB + goal constraint for EB-MBD.
+
+    Returns g(u_norm) = min(g_OOB(u_norm), g_goal(u_norm)).
+
+    A trajectory is fully feasible when g ≥ 0 (all waypoints inside
+    bounds AND final waypoint reaches the goal line).  The barrier
+    progressively enforces this as c_s decreases to 0.
+    """
+    oob_fn  = make_oob_constraint_fn(
+        rollout_fn, eta0, nu0, action_center, action_scale,
+        x_min, x_max, y_min,
+    )
+    goal_fn = make_goal_constraint_fn(
+        rollout_fn, eta0, nu0, action_center, action_scale,
+        goal_y_line,
+    )
+
+    def fn(u_norm):
+        return jnp.minimum(oob_fn(u_norm), goal_fn(u_norm))
+
+    return fn
+
+
+def make_rect_obstacles_eb_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    rects: list,
+):
+    """
+    EB-MBD hard-obstacle constraint for rectangular exclusion zones.
+
+    Each rect is (x0, x1, y0, y1) in world coordinates.  Returns a scalar g
+    where g > 0 iff ALL trajectory waypoints are OUTSIDE all rectangles.
+
+    Uses the box signed-distance function: SDF > 0 outside, < 0 inside.
+    """
+    # Pre-compute centres and half-extents as JAX constants
+    _boxes = [(jnp.float32((x0 + x1) / 2), jnp.float32((x1 - x0) / 2),
+               jnp.float32((y0 + y1) / 2), jnp.float32((y1 - y0) / 2))
+              for x0, x1, y0, y1 in rects]
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)   # (H+1, 3)
+        xs, ys = traj[:, 0], traj[:, 1]
+        g = jnp.inf
+        for cx, ax, cy, ay in _boxes:
+            sdf = jnp.maximum(jnp.abs(xs - cx) - ax, jnp.abs(ys - cy) - ay)
+            g = jnp.minimum(g, jnp.min(sdf))   # min over waypoints, then rects
+        return g
+
+    return fn
+
+
+def make_rect_obstacles_al_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    rects: list,
+):
+    """
+    AL-MBD hard-obstacle constraint for rectangular exclusion zones.
+
+    Returns g of shape (H, n_rects) using AL sign convention (g > 0 = violated).
+    Violated at step t when the corresponding waypoint is inside any rectangle.
+    """
+    _boxes = [(jnp.float32((x0 + x1) / 2), jnp.float32((x1 - x0) / 2),
+               jnp.float32((y0 + y1) / 2), jnp.float32((y1 - y0) / 2))
+              for x0, x1, y0, y1 in rects]
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)   # (H+1, 3)
+        xs = traj[1:, 0]    # (H,)
+        ys = traj[1:, 1]    # (H,)
+        cols = []
+        for cx, ax, cy, ay in _boxes:
+            sdf = jnp.maximum(jnp.abs(xs - cx) - ax, jnp.abs(ys - cy) - ay)
+            cols.append((-sdf)[:, None])    # positive inside rect (violated)
+        return jnp.concatenate(cols, axis=1)    # (H, n_rects)
+
+    return fn
+
+
+def make_al_per_step_constraints_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: Optional[float] = None,
+    goal_y_line: Optional[float] = None,
+):
+    """
+    Per-timestep constraint function for AL-MBD (AL paper convention: g ≤ 0 = feasible).
+
+    Returns g(u_norm) of shape (H, 1).
+
+    At each control step t the constraint is the maximum OOB penetration
+    of the resulting waypoint (x_{t+1}, y_{t+1}):
+
+        g_t = max(x_min − x_{t+1},  x_{t+1} − x_max,  y_min − y_{t+1},  y_{t+1} − y_max)
+
+    At the last control step (t = H−1) the goal constraint is also included:
+
+        g_{H-1} = max(g_OOB_{H-1},  goal_y_line − y_H)
+
+    Positive value ⟹ violated; negative ⟹ satisfied (margin = |g_t|).
+    """
+    _x_min  = jnp.float32(x_min)
+    _x_max  = jnp.float32(x_max)
+    _y_min  = jnp.float32(y_min)
+    _y_max  = jnp.float32(y_max) if y_max is not None else None
+    _goal_y = jnp.float32(goal_y_line) if goal_y_line is not None else None
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)   # (H+1, 3)
+        xs = traj[1:, 0]    # (H,) — x after each control step
+        ys = traj[1:, 1]    # (H,) — y after each control step
+
+        # OOB: positive when outside bounds
+        g_oob = jnp.maximum(
+            jnp.maximum(_x_min - xs, xs - _x_max),
+            _y_min - ys,
+        )   # (H,)
+        if _y_max is not None:
+            g_oob = jnp.maximum(g_oob, ys - _y_max)
+
+        if _goal_y is not None:
+            # Goal: positive when below the goal line (only relevant at last step)
+            g_goal_last = jnp.array([_goal_y]) - ys[-1:]   # (1,)
+            g_last = jnp.maximum(g_oob[-1:], g_goal_last)  # (1,)
+            g = jnp.concatenate([g_oob[:-1], g_last], axis=0)  # (H,)
+        else:
+            g = g_oob
+
+        return g[:, None]   # (H, 1)
+
+    return fn
 
 
 # ── MBD reverse diffusion process (action space) ─────────────────────────
@@ -461,6 +1210,8 @@ def run_mbd_with_diagnostics(
     Ybar_init: Optional[jnp.ndarray] = None,
     init_surge_bias: float = 0.7,
     n_top_samples: int = 10,
+    sample_filter_fn=None,
+    max_resample_iters=None,
 ) -> dict:
     """
     Run MBD reverse diffusion and capture per-step diagnostics for visualisation.
@@ -469,13 +1220,32 @@ def run_mbd_with_diagnostics(
     runs the diffusion steps in Python so we can snapshot trajectories and
     samples at every iteration.
 
+    Parameters
+    ----------
+    sample_filter_fn : callable, optional
+        ``filter_fn(Y0s_norm, trajs) -> bool_mask`` where *Y0s_norm* is
+        ``(Nsample, H, 3)`` normalised actions and *trajs* is
+        ``(Nsample, H+1, 3)`` rolled-out trajectories.  Returns a boolean
+        mask of shape ``(Nsample,)`` where ``True`` means the sample is
+        *valid* (e.g., non-OOB and goal-achieving).  When provided, invalid
+        samples are filtered out once (no resampling); only the remaining
+        valid samples are used for cost evaluation and the weighted mean.
+        If no valid samples remain the step falls back to the full batch.
+    max_resample_iters : int or None
+        Ignored — kept for API compatibility only (filter-once mode does not
+        resample).
+
     Returns dict with:
-        mean_trajectories : list of (H+1, 3) arrays — Ybar rolled out at each step
-        sample_trajectories : list of (n_top_samples, H+1, 3) — top samples at each step
-        sample_costs : list of (Nsample,) — all sample costs at each step
-        cost_means : list of floats
-        cost_mins  : list of floats
-        weights    : list of (Nsample,) — importance weights at each step
+        mean_trajectories  : list of (H+1, 3) arrays — Ybar rolled out at each step
+        sample_trajectories: list of (n_top_samples, H+1, 3) — top samples at each step
+        sample_costs       : list of (Nsample,) — all sample costs at each step
+        cost_means         : list of floats
+        cost_mins          : list of floats
+        weights            : list of (Nsample,) — importance weights at each step
+        accept_rates       : list of floats — fraction of accepted samples (1.0 when
+                             sample_filter_fn is None)
+        n_total_sampled    : list of ints — total draws per step (≥ Nsample; equals
+                             Nsample when sample_filter_fn is None)
     """
     if Ybar_init is not None:
         Ybar_c = jnp.array(Ybar_init, dtype=jnp.float32)
@@ -500,7 +1270,15 @@ def run_mbd_with_diagnostics(
         "sample_costs": [],
         "cost_means": [],
         "cost_mins": [],
+        "cost_of_mean": [],   # cost_fn(Ybar_c) evaluated at each step
         "weights": [],
+        "Ybar_final": None,   # filled at end of loop
+        "best_sample_actions": None,   # (H, 3) normalized actions of global best sample
+        "best_sample_cost": float("inf"),
+        "second_best_sample_actions": None,  # (H, 3) normalized actions of 2nd-best (same step as best)
+        "second_best_sample_cost": float("inf"),
+        "accept_rates": [],      # fraction of valid samples per step (1.0 when no filter)
+        "n_total_sampled": [],   # total draws per step (>= Nsample)
     }
 
     def _rollout_actions(u_norm):
@@ -519,6 +1297,18 @@ def run_mbd_with_diagnostics(
         eps = jax.random.normal(rng_s, (Nsample, H, 3), dtype=jnp.float32)
         Y0s = eps * sigmas[i] + Ybar_c
         Y0s = jnp.clip(Y0s, -1.0, 1.0)
+
+        # ── Reject sampling (filter-once, no replacement) ────────────────────
+        _n_valid = Nsample
+        if sample_filter_fn is not None:
+            _u_check = Y0s * action_scale[None] + action_center[None]
+            _trajs_check = np.array(rollout_batch(eta0, nu0, _u_check))
+            _valid = np.array(sample_filter_fn(np.array(Y0s), _trajs_check))
+            _n_valid = int(_valid.sum())
+            if _n_valid > 0:
+                Y0s = Y0s[_valid]   # keep only valid samples (no resample)
+            # else: fallback — keep all samples (too few constraints satisfied)
+        # ─────────────────────────────────────────────────────────────────────
 
         costs = cost_batch(Y0s)
         rews = -costs
@@ -547,19 +1337,1656 @@ def run_mbd_with_diagnostics(
         diag["cost_means"].append(float(costs_np.mean()))
         diag["cost_mins"].append(float(costs_np.min()))
         diag["weights"].append(w_np)
+        diag["n_total_sampled"].append(Nsample)
+        diag["accept_rates"].append(_n_valid / max(Nsample, 1))
+        # Cost of the mean action sequence itself (not any sample)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_c)))
+        # Track global best (and second-best from the same step) across all steps
+        step_sort_idx = np.argsort(costs_np)
+        step_best_idx = int(step_sort_idx[0])
+        step_best_cost = float(costs_np[step_best_idx])
+        if step_best_cost < diag["best_sample_cost"]:
+            diag["best_sample_cost"] = step_best_cost
+            diag["best_sample_actions"] = np.array(Y0s[step_best_idx])
+            if len(step_sort_idx) > 1:
+                step_2nd_idx = int(step_sort_idx[1])
+                diag["second_best_sample_cost"] = float(costs_np[step_2nd_idx])
+                diag["second_best_sample_actions"] = np.array(Y0s[step_2nd_idx])
 
         # Roll out mean trajectory
         mean_traj = np.array(_rollout_actions(Ybar_c))
         diag["mean_trajectories"].append(mean_traj)
 
-        # Roll out top-K sample trajectories (by cost)
-        top_k = min(n_top_samples, Nsample)
-        top_idx = np.argsort(costs_np)[:top_k]
-        top_actions = Y0s[top_idx]
-        top_phys = top_actions * action_scale[None, :] + action_center[None, :]
-        top_trajs = np.array(rollout_batch(eta0, nu0, top_phys))
-        diag["sample_trajectories"].append(top_trajs)
+        # Roll out top samples sorted by cost (best first)
+        _n_avail = len(costs_np)
+        n_store = min(n_top_samples, _n_avail)
+        sort_idx = np.argsort(costs_np)[:n_store]
+        store_actions = Y0s[sort_idx]
+        store_phys = store_actions * action_scale[None, :] + action_center[None, :]
+        store_trajs = np.array(rollout_batch(eta0, nu0, store_phys))
+        diag["sample_trajectories"].append(store_trajs)
 
+    diag["Ybar_final"] = Ybar_c
+    return diag
+
+
+def run_sa_mbd_with_diagnostics(
+    cost_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    sa_lambda: float = 0.05,
+    Ybar_init: Optional[jnp.ndarray] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+) -> dict:
+    """
+    Score-Augmented MBD (SA-MBD) reverse diffusion with per-step diagnostics.
+
+    At every denoising step, after computing the importance-weighted mean
+    Ybar_new = Σ w_k Y_k^(0), a normalized gradient step on the cost function
+    is applied before the score update:
+
+        Ybar_new_aug = Ybar_new − sa_lambda × ∇J(Ybar_new) / ‖∇J(Ybar_new)‖
+
+    This injects cost-gradient information at every noise level, steering the
+    denoising process toward lower-cost homotopy classes before the fine
+    denoising steps lock in the trajectory shape.  Unlike standard MBD where
+    cost pressure only enters through importance weights on clean samples, SA-MBD
+    propagates gradient information through the entire diffusion chain.
+
+    sa_lambda : float
+        Normalized gradient step size in action space.  Because the gradient is
+        unit-normalized, sa_lambda is directly interpretable as the step magnitude
+        in [-1, 1]^(H×3) action space (e.g. 0.05 = 5% of the action range).
+    """
+    if Ybar_init is not None:
+        Ybar_c = jnp.array(Ybar_init, dtype=jnp.float32)
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+    else:
+        Ybar_c = jnp.zeros((H, 3))
+        Ybar_c = Ybar_c.at[:, 0].set(init_surge_bias)
+
+    rng = jax.random.PRNGKey(seed)
+    betas = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas = jnp.sqrt(1.0 - alphas_bar)
+
+    cost_batch = jax.jit(jax.vmap(cost_fn))
+    grad_cost_fn = jax.jit(jax.grad(cost_fn))
+    rollout_batch = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single = jax.jit(rollout_fn)
+
+    diag = {
+        "mean_trajectories":         [],
+        "sample_trajectories":       [],
+        "sample_costs":              [],
+        "cost_means":                [],
+        "cost_mins":                 [],
+        "cost_of_mean":              [],
+        "weights":                   [],
+        "Ybar_final":                None,
+        "best_sample_actions":       None,
+        "best_sample_cost":          float("inf"),
+        "second_best_sample_actions": None,
+        "second_best_sample_cost":   float("inf"),
+        "accept_rates":              [],
+        "n_total_sampled":           [],
+        "grad_norms":                [],   # ‖∇J(Ybar_new)‖ per step (diagnostic)
+    }
+
+    def _rollout_actions(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    traj0 = np.array(_rollout_actions(Ybar_c))
+    diag["mean_trajectories"].append(traj0)
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i = i_rev
+        Yi = Ybar_c * jnp.sqrt(alphas_bar[i])
+
+        rng, rng_s = jax.random.split(rng)
+        eps = jax.random.normal(rng_s, (Nsample, H, 3), dtype=jnp.float32)
+        Y0s = eps * sigmas[i] + Ybar_c
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
+
+        costs = cost_batch(Y0s)
+        rews = -costs
+        rew_mean = rews.mean()
+        rew_std = jnp.maximum(rews.std(), 1e-6)
+        logp0 = (rews - rew_mean) / rew_std / temperature
+        w = jax.nn.softmax(logp0)
+
+        Ybar_new = jnp.einsum("n,nij->ij", w, Y0s)
+
+        # Score augmentation: gradient descent step on cost, normalized by
+        # the max absolute gradient element so sa_lambda is the step size of
+        # the most sensitive action dimension (preserves relative magnitudes).
+        grad = grad_cost_fn(Ybar_new)
+        grad_max = jnp.max(jnp.abs(grad)) + jnp.float32(1e-10)
+        Ybar_new = jnp.clip(
+            Ybar_new - jnp.float32(sa_lambda) * grad / grad_max,
+            -1.0, 1.0,
+        )
+
+        score = (
+            1.0 / (1.0 - alphas_bar[i])
+            * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar_new)
+        )
+        Yim1 = (
+            1.0 / jnp.sqrt(alphas[i])
+            * (Yi + (1.0 - alphas_bar[i]) * score)
+        )
+        i_prev = max(i - 1, 0)
+        Ybar_c = Yim1 / jnp.sqrt(alphas_bar[i_prev])
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+
+        costs_np = np.array(costs)
+        w_np = np.array(w)
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["weights"].append(w_np)
+        diag["n_total_sampled"].append(Nsample)
+        diag["accept_rates"].append(1.0)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_c)))
+        diag["grad_norms"].append(float(grad_max))
+
+        step_sort_idx = np.argsort(costs_np)
+        step_best_idx = int(step_sort_idx[0])
+        step_best_cost = float(costs_np[step_best_idx])
+        if step_best_cost < diag["best_sample_cost"]:
+            diag["best_sample_cost"] = step_best_cost
+            diag["best_sample_actions"] = np.array(Y0s[step_best_idx])
+            if len(step_sort_idx) > 1:
+                step_2nd_idx = int(step_sort_idx[1])
+                diag["second_best_sample_cost"] = float(costs_np[step_2nd_idx])
+                diag["second_best_sample_actions"] = np.array(Y0s[step_2nd_idx])
+
+        mean_traj = np.array(_rollout_actions(Ybar_c))
+        diag["mean_trajectories"].append(mean_traj)
+
+        n_store = min(n_top_samples, len(costs_np))
+        sort_idx = np.argsort(costs_np)[:n_store]
+        store_phys = Y0s[sort_idx] * action_scale[None, :] + action_center[None, :]
+        diag["sample_trajectories"].append(np.array(rollout_batch(eta0, nu0, store_phys)))
+
+    diag["Ybar_final"] = Ybar_c
+    return diag
+
+
+def run_eb_mbd_with_diagnostics(
+    cost_fn,
+    constraint_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    eb_c_max: float,
+    eb_mu: float,
+    eb_kappa: float = 1.0,
+    Ybar_init: Optional[jnp.ndarray] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+    oob_constraint_fn=None,
+    eb_c_max_oob: float = 0.0,
+) -> dict:
+    """
+    Emerging-Barrier MBD reverse diffusion with per-step diagnostics.
+
+    Implements Algorithm 1 from "EB-MBD: Emerging-Barrier Model-Based
+    Diffusion for Safe Trajectory Optimization in Highly Constrained
+    Environments" (Mishra & Manchester, 2026).
+
+    The effective reward uses **additive** barrier terms — one per
+    constraint type — so each constraint gets an independent c_max::
+
+        r(x,s) = −J(x)
+               + μ·log(max(g_goal(x) + c_s,     ε))   ← goal / rects
+               + μ·log(max(g_oob(x)  + c_s_oob, ε))   ← domain walls
+
+    Using separate c_max values prevents the large goal-infeasibility
+    slack (c_max~1500 m) from also permitting far-OOB exploration that
+    bypasses high-cost costmap regions.  Set eb_c_max_oob=0 for a strict
+    domain-wall constraint from step 0.
+
+    Parameters
+    ----------
+    cost_fn : callable
+        Base cost J(u_norm) → scalar.  Should NOT include big-M OOB or
+        goal-line penalties (pass oob_penalty=0 to make_cost_fn and
+        omit make_goal_line_cost_fn).  The barrier enforces those constraints.
+    constraint_fn : callable
+        g_goal(u_norm) → scalar.  Encodes goal-reaching (and optionally
+        hard obstacle) constraints.  Build with make_goal_constraint_fn or
+        make_combined_constraint_fn.  Uses eb_c_max.
+    oob_constraint_fn : callable or None
+        g_oob(u_norm) → scalar.  Encodes domain-wall OOB constraints.
+        Build with make_oob_constraint_fn.  Uses eb_c_max_oob.
+        When None, OOB is folded into constraint_fn (legacy behaviour).
+    eb_c_max : float
+        Barrier offset for the goal/combined constraint at the start of
+        reverse diffusion.  Should be ≥ max expected goal distance (m).
+    eb_c_max_oob : float
+        Barrier offset for the OOB constraint.  Set to 0 to enforce
+        domain walls strictly from step 0 (recommended when the costmap
+        contains soft high-cost regions that trajectories could bypass
+        by going OOB).
+    eb_mu : float
+        Barrier hardness in cost units.  Must be on the same scale as J(x)
+        for the barrier to influence the softmax weights.  A good starting
+        point: eb_mu ≈ 0.1 × E[J(x)] / log(eb_c_max).
+    eb_kappa : float
+        Shape of the barrier schedule.  κ = 1 → linear;  κ > 1 → slow
+        tightening at first, fast at the end;  κ < 1 → fast then slow.
+
+    Returns
+    -------
+    dict — same structure as run_mbd_with_diagnostics, plus:
+        ``barrier_offsets``  : list of floats  — c_s at each step
+        ``constraint_values``: list of (Nsample,) arrays — g(x) per step
+        ``alive_fracs``      : list of floats  — fraction of samples with
+                               g(x) + c_s > 0 at each step
+    """
+    if Ybar_init is not None:
+        Ybar_c = jnp.array(Ybar_init, dtype=jnp.float32)
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+    else:
+        Ybar_c = jnp.zeros((H, 3))
+        Ybar_c = Ybar_c.at[:, 0].set(init_surge_bias)
+
+    rng = jax.random.PRNGKey(seed)
+    betas = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas = jnp.sqrt(1.0 - alphas_bar)
+
+    cost_batch       = jax.jit(jax.vmap(cost_fn))
+    constraint_batch = jax.jit(jax.vmap(constraint_fn))
+    oob_constraint_batch = (
+        jax.jit(jax.vmap(oob_constraint_fn)) if oob_constraint_fn is not None else None
+    )
+    rollout_batch    = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single   = jax.jit(rollout_fn)
+
+    diag = {
+        "mean_trajectories":         [],
+        "sample_trajectories":       [],
+        "sample_sort_indices":       [],   # indices into original sample order used when storing trajectories
+        "sample_costs":              [],
+        "cost_means":                [],
+        "cost_mins":                 [],
+        "reward_maxes":              [],   # per-step max reward (EB-MBD only)
+        "cost_of_mean":              [],
+        "weights":                   [],
+        "Ybar_final":                None,
+        "sample_sort_by_reward":     False,   # EB-MBD stores samples sorted by min cost (same as standard MBD)
+        "best_sample_actions":       None,
+        "best_sample_cost":          float("-inf"),   # tracks best effective reward (higher = better)
+        "second_best_sample_actions": None,
+        "second_best_sample_cost":   float("-inf"),
+        # EB-MBD: best sample by BASE cost (for consistent gold trajectory display)
+        "best_base_cost_actions":    None,
+        "best_base_cost_trajectory": None,
+        "best_base_cost":            float("inf"),
+        "accept_rates":              [],
+        "n_total_sampled":           [],
+        # EB-MBD extras
+        "barrier_offsets":           [],   # c_s at each step
+        "constraint_values":         [],   # g(x) per sample per step
+        "alive_fracs":               [],   # fraction with g+c_s > 0
+    }
+
+    def _rollout_actions(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    # Snapshot initial mean trajectory
+    traj0 = np.array(_rollout_actions(Ybar_c))
+    diag["mean_trajectories"].append(traj0)
+
+    S = float(Ndiffuse - 1)  # total diffusion steps (for barrier schedule)
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i = i_rev
+
+        # ── Barrier offset for this step ──────────────────────────────────
+        # c_s = c_max × (s/S)^κ: relaxed at s=S, tight at s=0
+        s_frac = float(i) / S           # 1.0 at start, → 0 at end
+        c_s     = float(eb_c_max)     * (s_frac ** float(eb_kappa))
+        c_s_oob = float(eb_c_max_oob) * (s_frac ** float(eb_kappa))
+
+        Yi = Ybar_c * jnp.sqrt(alphas_bar[i])
+
+        rng, rng_s = jax.random.split(rng)
+        eps = jax.random.normal(rng_s, (Nsample, H, 3), dtype=jnp.float32)
+        Y0s = eps * sigmas[i] + Ybar_c
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
+
+        # ── Compute costs and constraints ─────────────────────────────────
+        costs   = cost_batch(Y0s)             # (Nsample,) — J(x)
+        g_vals  = constraint_batch(Y0s)       # (Nsample,) — g_goal in metres
+
+        # ── Barrier term(s): additive per constraint type ─────────────────
+        # Goal/combined constraint with large c_max (allows infeasible starts)
+        barrier = jnp.float32(eb_mu) * jnp.log(
+            jnp.maximum(g_vals + jnp.float32(c_s), jnp.float32(1e-6))
+        )
+        # OOB constraint: ONE-SIDED barrier. In-bounds trajectories contribute 0
+        # so they add no variance to the reward signal. OOB trajectories are
+        # immediately and severely penalized (mu*log(1e-6)) to preserve a clean
+        # goal gradient after normalization. c_s_oob=0 enforces this strictly.
+        if oob_constraint_batch is not None:
+            g_oob_vals = oob_constraint_batch(Y0s)
+            effective_g_oob = g_oob_vals + jnp.float32(c_s_oob)
+            oob_barrier = jnp.where(
+                effective_g_oob >= 0.0,
+                jnp.float32(0.0),
+                jnp.float32(eb_mu) * jnp.log(
+                    jnp.maximum(effective_g_oob, jnp.float32(1e-6))
+                ),
+            )
+            barrier = barrier + oob_barrier
+
+        rews = -costs + barrier
+
+        rew_mean = rews.mean()
+        rew_std  = jnp.maximum(rews.std(), jnp.float32(1e-6))
+        logp0    = (rews - rew_mean) / rew_std / jnp.float32(temperature)
+        w        = jax.nn.softmax(logp0)
+
+        Ybar_new = jnp.einsum("n,nij->ij", w, Y0s)
+
+        score = (
+            1.0 / (1.0 - alphas_bar[i])
+            * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar_new)
+        )
+        Yim1 = (
+            1.0 / jnp.sqrt(alphas[i])
+            * (Yi + (1.0 - alphas_bar[i]) * score)
+        )
+        i_prev = max(i - 1, 0)
+        Ybar_c = Yim1 / jnp.sqrt(alphas_bar[i_prev])
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+
+        # ── Record diagnostics ────────────────────────────────────────────
+        costs_np  = np.array(costs)
+        rews_np   = np.array(rews)
+        g_vals_np = np.array(g_vals)
+        w_np      = np.array(w)
+
+        alive_frac = float(np.mean((g_vals_np + c_s) > 0))
+
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["reward_maxes"].append(float(rews_np.max()))
+        diag["weights"].append(w_np)
+        diag["n_total_sampled"].append(Nsample)
+        diag["accept_rates"].append(1.0)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_c)))
+        diag["barrier_offsets"].append(c_s)
+        diag["constraint_values"].append(g_vals_np)
+        diag["alive_fracs"].append(alive_frac)
+
+        # Track global best (and second-best) by effective reward (not raw cost).
+        step_sort_idx  = np.argsort(-rews_np)   # descending reward
+        step_best_idx  = int(step_sort_idx[0])
+        step_best_rew  = float(rews_np[step_best_idx])
+        if step_best_rew > diag["best_sample_cost"]:
+            diag["best_sample_cost"]    = step_best_rew
+            diag["best_sample_actions"] = np.array(Y0s[step_best_idx])
+            if len(step_sort_idx) > 1:
+                step_2nd_idx = int(step_sort_idx[1])
+                diag["second_best_sample_cost"]    = float(rews_np[step_2nd_idx])
+                diag["second_best_sample_actions"] = np.array(Y0s[step_2nd_idx])
+
+        # Roll out mean trajectory
+        mean_traj = np.array(_rollout_actions(Ybar_c))
+        diag["mean_trajectories"].append(mean_traj)
+
+        # Track best sample by BASE cost so gold trajectory cost display is consistent
+        base_best_idx = int(np.argmin(costs_np))
+        base_best_cost = float(costs_np[base_best_idx])
+        if base_best_cost < diag["best_base_cost"]:
+            diag["best_base_cost"]     = base_best_cost
+            diag["best_base_cost_actions"] = np.array(Y0s[base_best_idx])
+            _bb_phys = Y0s[base_best_idx] * action_scale + action_center
+            diag["best_base_cost_trajectory"] = np.array(rollout_single(eta0, nu0, _bb_phys))
+
+        # Roll out top samples sorted by min base cost (best first), same as standard MBD.
+        n_store  = min(n_top_samples, Nsample)
+        sort_idx = np.argsort(costs_np)[:n_store]
+        store_phys  = (Y0s[sort_idx] * action_scale[None, :] + action_center[None, :])
+        store_trajs = np.array(rollout_batch(eta0, nu0, store_phys))
+        diag["sample_trajectories"].append(store_trajs)
+        diag["sample_sort_indices"].append(sort_idx)
+
+    diag["Ybar_final"] = Ybar_c
+    return diag
+
+
+def run_eb_homotopy_mbd_with_diagnostics(
+    cost_fn,
+    constraint_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    eb_c_max: float,
+    eb_mu: float,
+    eb_kappa: float,
+    obstacles,
+    Ybar_init: Optional[Union[jnp.ndarray, List[np.ndarray]]] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+    min_class_samples: int = 3,
+    oob_constraint_fn=None,
+    eb_c_max_oob: float = 0.0,
+    classify_fn_override=None,
+) -> dict:
+    """
+    Emerging-Barrier Homotopy MBD (EB-H-MBD): homotopy-class parallel chains
+    with EB constraint enforcement.
+
+    Combines H-MBD (topology-aware parallel diffusion chains) with the
+    emerging-barrier reward from EB-MBD (Mishra & Manchester 2026).  Within
+    each reverse diffusion step the EB reward
+
+        r(u, s) = −J(u) + μ × log(max(g(u) + c_s, ε))
+
+    replaces the plain negative cost in the per-class importance weighting, so
+    every chain simultaneously stays in its topological class AND is steered
+    away from OOB / goal-miss violations.  The barrier schedule c_s is shared
+    across all classes.
+
+    At the end the class whose mean achieves the lowest *base* cost (J only,
+    no barrier) is returned as Ybar_final.
+
+    Parameters
+    ----------
+    classify_fn_override : optional (classify_fn, n_classes) tuple
+        If provided, replaces the default make_homotopy_classifier.
+        Use make_rf_homotopy_classifier from homotopy_rf.py for the
+        Hernandez reference-frame classifier.
+    Ybar_init : (H, 3) array  OR  list of (H, 3) arrays
+        If a list is given (length must be >= n_classes), class c is seeded
+        from Ybar_init[c].  This enables per-class passage-aware warm starts
+        that fix exploration failure for topologically complex classes.
+    """
+    if classify_fn_override is not None:
+        classify_fn, n_classes = classify_fn_override
+    else:
+        classify_fn, n_classes = make_homotopy_classifier(obstacles)
+
+    cost_batch       = jax.jit(jax.vmap(cost_fn))
+    constraint_batch = jax.jit(jax.vmap(constraint_fn))
+    oob_constraint_batch = (
+        jax.jit(jax.vmap(oob_constraint_fn)) if oob_constraint_fn is not None else None
+    )
+    rollout_batch    = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single   = jax.jit(rollout_fn)
+
+    def _u_norm_to_traj_xy(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)[:, :2]
+
+    classify_batch = jax.jit(jax.vmap(
+        lambda u_norm: classify_fn(_u_norm_to_traj_xy(u_norm))
+    ))
+
+    def _rollout_u(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    _default_init = jnp.zeros((H, 3), dtype=jnp.float32).at[:, 0].set(init_surge_bias)
+    if isinstance(Ybar_init, list):
+        # Per-class seeds: each class gets its own warm start
+        Ybar_classes = [
+            jnp.clip(jnp.array(Ybar_init[c], dtype=jnp.float32), -1.0, 1.0)
+            if c < len(Ybar_init) and Ybar_init[c] is not None
+            else _default_init
+            for c in range(n_classes)
+        ]
+    elif Ybar_init is not None:
+        _init = jnp.clip(jnp.array(Ybar_init, dtype=jnp.float32), -1.0, 1.0)
+        Ybar_classes = [_init] * n_classes
+    else:
+        Ybar_classes = [_default_init] * n_classes
+
+    rng        = jax.random.PRNGKey(seed)
+    betas      = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas     = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas     = jnp.sqrt(1.0 - alphas_bar)
+
+    n_spc = max(1, Nsample // n_classes)
+    S     = float(Ndiffuse - 1)
+
+    diag = {
+        "mean_trajectories":          [],
+        "sample_trajectories":        [],
+        "sample_costs":               [],
+        "cost_means":                 [],
+        "cost_mins":                  [],
+        "cost_of_mean":               [],
+        "weights":                    [],
+        "Ybar_final":                 None,
+        "best_sample_actions":        None,
+        "best_sample_cost":           float("-inf"),
+        "second_best_sample_actions": None,
+        "second_best_sample_cost":    float("-inf"),
+        "best_base_cost_actions":     None,
+        "best_base_cost_trajectory":  None,
+        "best_base_cost":             float("inf"),
+        "accept_rates":               [],
+        "n_total_sampled":            [],
+        # EB fields
+        "barrier_offsets":            [],
+        "constraint_values":          [],
+        "alive_fracs":                [],
+        # Homotopy fields
+        "n_classes":                  n_classes,
+        "obstacles":                  obstacles,
+        "class_counts":               [],
+        "class_costs":                [],
+        "best_class":                 [],
+    }
+
+    best_cls_idx = 0
+    diag["mean_trajectories"].append(np.array(_rollout_u(Ybar_classes[0])))
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i      = i_rev
+        ab_i   = float(alphas_bar[i])
+        a_i    = float(alphas[i])
+        sig_i  = float(sigmas[i])
+        ab_im1 = float(alphas_bar[max(i - 1, 0)])
+
+        # Barrier offsets: relaxed at start, tight at end
+        s_frac  = float(i) / S
+        c_s     = float(eb_c_max)     * (s_frac ** float(eb_kappa))
+        c_s_oob = float(eb_c_max_oob) * (s_frac ** float(eb_kappa))
+
+        # Sample from each class mean
+        rng, rng_s = jax.random.split(rng)
+        cls_keys   = jax.random.split(rng_s, n_classes)
+        Y0s_list   = []
+        for c in range(n_classes):
+            eps_c = jax.random.normal(cls_keys[c], (n_spc, H, 3), dtype=jnp.float32)
+            Y0s_c = jnp.clip(eps_c * sig_i + Ybar_classes[c], -1.0, 1.0)
+            Y0s_list.append(Y0s_c)
+        Y0s = jnp.concatenate(Y0s_list, axis=0)   # (n_total, H, 3)
+
+        costs  = cost_batch(Y0s)        # (n_total,) — J(u)
+        g_vals = constraint_batch(Y0s)  # (n_total,) — g_goal in metres
+
+        # Additive barriers: goal constraint (large c_max) + OOB (one-sided, c_s_oob=0)
+        barrier = jnp.float32(eb_mu) * jnp.log(
+            jnp.maximum(g_vals + jnp.float32(c_s), jnp.float32(1e-6))
+        )
+        if oob_constraint_batch is not None:
+            g_oob_vals = oob_constraint_batch(Y0s)
+            effective_g_oob = g_oob_vals + jnp.float32(c_s_oob)
+            oob_barrier = jnp.where(
+                effective_g_oob >= 0.0,
+                jnp.float32(0.0),
+                jnp.float32(eb_mu) * jnp.log(
+                    jnp.maximum(effective_g_oob, jnp.float32(1e-6))
+                ),
+            )
+            barrier = barrier + oob_barrier
+        rews   = -costs + barrier       # EB reward used for importance weighting
+        h_sigs = classify_batch(Y0s)    # (n_total,) int32
+
+        costs_np  = np.array(costs)
+        rews_np   = np.array(rews)
+        g_vals_np = np.array(g_vals)
+        h_sigs_np = np.array(h_sigs)
+        Y0s_np    = np.array(Y0s)
+
+        # Per-class reverse-diffusion updates using EB reward
+        class_counts     = np.zeros(n_classes, dtype=int)
+        class_cost_means = np.full(n_classes, np.inf)
+
+        for c in range(n_classes):
+            cls_idx = np.where(h_sigs_np == c)[0]
+            class_counts[c] = len(cls_idx)
+            if len(cls_idx) < min_class_samples:
+                continue
+
+            class_cost_means[c] = float(costs_np[cls_idx].mean())
+
+            # Importance weights from EB reward (not raw cost)
+            cls_rews     = rews_np[cls_idx]
+            cls_rew_mean = cls_rews.mean()
+            cls_rew_std  = max(float(cls_rews.std()), 1e-6)
+            cls_logp     = (cls_rews - cls_rew_mean) / cls_rew_std / temperature
+            cls_logp    -= cls_logp.max()
+            cls_w        = np.exp(cls_logp)
+            cls_w       /= cls_w.sum()
+            Ybar_new_c   = jnp.array(np.einsum("n,nij->ij", cls_w, Y0s_np[cls_idx]))
+
+            Yi_c   = Ybar_classes[c] * jnp.sqrt(jnp.float32(ab_i))
+            score  = (jnp.float32(1.0 / (1.0 - ab_i))
+                      * (-Yi_c + jnp.sqrt(jnp.float32(ab_i)) * Ybar_new_c))
+            Yim1_c = (jnp.float32(1.0 / a_i ** 0.5)
+                      * (Yi_c + jnp.float32(1.0 - ab_i) * score))
+            Ybar_classes[c] = jnp.clip(
+                Yim1_c / jnp.sqrt(jnp.float32(ab_im1)), -1.0, 1.0
+            )
+
+        # Best class = lowest mean base cost among non-empty classes
+        valid = np.isfinite(class_cost_means)
+        if valid.any():
+            best_cls_idx = int(np.argmin(np.where(valid, class_cost_means, np.inf)))
+
+        # Diagnostics
+        alive_frac = float(np.mean((g_vals_np + c_s) > 0))
+
+        step_sort_idx = np.argsort(-rews_np)
+        step_best_idx = int(step_sort_idx[0])
+        step_best_rew = float(rews_np[step_best_idx])
+        if step_best_rew > diag["best_sample_cost"]:
+            diag["best_sample_cost"]    = step_best_rew
+            diag["best_sample_actions"] = Y0s_np[step_best_idx]
+            if len(step_sort_idx) > 1:
+                diag["second_best_sample_cost"]    = float(rews_np[int(step_sort_idx[1])])
+                diag["second_best_sample_actions"] = Y0s_np[int(step_sort_idx[1])]
+
+        base_best_idx  = int(np.argmin(costs_np))
+        base_best_cost = float(costs_np[base_best_idx])
+        if base_best_cost < diag["best_base_cost"]:
+            diag["best_base_cost"]           = base_best_cost
+            diag["best_base_cost_actions"]   = Y0s_np[base_best_idx]
+            _bb_phys = Y0s[base_best_idx] * action_scale + action_center
+            diag["best_base_cost_trajectory"] = np.array(rollout_single(eta0, nu0, _bb_phys))
+
+        all_std  = max(float(rews_np.std()), 1e-6)
+        all_logp = (rews_np - rews_np.mean()) / all_std / temperature
+        all_logp -= all_logp.max()
+        all_w     = np.exp(all_logp)
+        all_w    /= all_w.sum()
+
+        n_total = len(costs_np)
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["weights"].append(all_w)
+        diag["n_total_sampled"].append(n_total)
+        diag["accept_rates"].append(1.0)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_classes[best_cls_idx])))
+        diag["barrier_offsets"].append(c_s)
+        diag["constraint_values"].append(g_vals_np)
+        diag["alive_fracs"].append(alive_frac)
+        diag["class_counts"].append(class_counts.copy())
+        diag["class_costs"].append(class_cost_means.copy())
+        diag["best_class"].append(best_cls_idx)
+        diag["mean_trajectories"].append(np.array(_rollout_u(Ybar_classes[best_cls_idx])))
+
+        n_store    = min(n_top_samples, n_total)
+        sort_idx   = step_sort_idx[:n_store]
+        store_phys = Y0s[sort_idx] * action_scale[None] + action_center[None]
+        diag["sample_trajectories"].append(np.array(rollout_batch(eta0, nu0, store_phys)))
+
+    # Select winner by lowest base cost on each class mean
+    final_costs = np.array([float(cost_fn(Ybar_classes[c])) for c in range(n_classes)])
+    best_final  = int(np.argmin(final_costs))
+
+    class_summary = ", ".join(f"cls{c}={v:.0f}" for c, v in enumerate(final_costs))
+    print(
+        f"  [EB-H-MBD] final class costs: {class_summary}  → winner cls={best_final}",
+        flush=True,
+    )
+    diag["Ybar_final"] = Ybar_classes[best_final]
+    return diag
+
+
+def run_al_mbd_with_diagnostics(
+    cost_fn,
+    al_constraint_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    al_rho: float,
+    al_M_max: float,
+    Ybar_init: Optional[jnp.ndarray] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+) -> dict:
+    """
+    Augmented Lagrangian MBD (AL-MBD) reverse diffusion with per-step diagnostics.
+
+    Implements Algorithm 1 from the AL-MBD research note.  The hard-indicator
+    constraint weight of vanilla MBD is replaced by a smooth AL-derived weight::
+
+        w^AL(Y) ∝ exp(−L(Y, M, ρ) / λ)
+
+    where the trajectory AL cost is::
+
+        L(Y, M, ρ) = J(Y) + (ρ/2) Σ_{t,j} [M_{t,j}/ρ + g_{t,j}(x_t, u_t)]²₊
+
+    Lagrange multipliers M are updated at every diffusion step via dual ascent::
+
+        M_t ← max(0,  M_t + ρ γ_i g_t(x*_t, u*_t))
+
+    with γ_i = ᾱ_i (suppresses dual steps in the high-noise regime).
+
+    Parameters
+    ----------
+    cost_fn : callable
+        Base cost J(u_norm) → scalar.  Should NOT include OOB or goal-line
+        big-M penalties; the AL constraint handles those.
+    al_constraint_fn : callable
+        g(u_norm) → (H, n_g).  g_{t,j} ≤ 0 means constraint j is satisfied
+        at timestep t.  Build with make_al_per_step_constraints_fn.
+    al_rho : float
+        AL penalty weight ρ.  Controls how fast constraints are enforced per
+        dual step.  Practical starting point: 0.1–1.0.
+    al_M_max : float
+        Maximum multiplier value (clipping for numerical stability).
+
+    Returns
+    -------
+    dict — same keys as run_mbd_with_diagnostics, plus:
+        ``multiplier_means``      : list of floats  — mean M across (t, j) per step
+        ``multiplier_maxes``      : list of floats  — max M per step
+        ``constraint_violations`` : list of floats  — mean max(0, g_t) of mean traj per step
+        ``al_penalties``          : list of (Nsample,) arrays — per-sample AL penalty
+    """
+    if Ybar_init is not None:
+        Ybar_c = jnp.array(Ybar_init, dtype=jnp.float32)
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+    else:
+        Ybar_c = jnp.zeros((H, 3))
+        Ybar_c = Ybar_c.at[:, 0].set(init_surge_bias)
+
+    rng = jax.random.PRNGKey(seed)
+    betas      = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas     = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas     = jnp.sqrt(1.0 - alphas_bar)
+
+    # Detect n_g from a single constraint evaluation
+    _g_init = al_constraint_fn(Ybar_c)   # (H, n_g)
+    n_g = int(_g_init.shape[1])
+
+    # Multipliers M: (H, n_g), initialised at zero (cold start)
+    M = jnp.zeros((H, n_g), dtype=jnp.float32)
+
+    cost_batch            = jax.jit(jax.vmap(cost_fn))
+    al_constraint_batch   = jax.jit(jax.vmap(al_constraint_fn))
+    rollout_batch         = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single        = jax.jit(rollout_fn)
+
+    diag = {
+        "mean_trajectories":          [],
+        "sample_trajectories":        [],
+        "sample_sort_indices":        [],   # indices into original sample order used when storing trajectories
+        "sample_costs":               [],
+        "cost_means":                 [],
+        "cost_mins":                  [],
+        "cost_of_mean":               [],
+        "weights":                    [],
+        "Ybar_final":                 None,
+        "best_sample_actions":        None,
+        "best_sample_cost":           float("-inf"),
+        "second_best_sample_actions": None,
+        "second_best_sample_cost":    float("-inf"),
+        # AL-MBD: best sample by BASE cost (not total AL cost)
+        "best_base_cost_actions":     None,
+        "best_base_cost_trajectory":  None,
+        "best_base_cost":             float("inf"),
+        "accept_rates":               [],
+        "n_total_sampled":            [],
+        # AL-MBD extras
+        "multiplier_means":           [],
+        "multiplier_maxes":           [],
+        "constraint_violations":      [],
+        "al_penalties":               [],
+    }
+
+    def _rollout_actions(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    diag["mean_trajectories"].append(np.array(_rollout_actions(Ybar_c)))
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i = i_rev
+
+        Yi = Ybar_c * jnp.sqrt(alphas_bar[i])
+
+        rng, rng_s = jax.random.split(rng)
+        eps = jax.random.normal(rng_s, (Nsample, H, 3), dtype=jnp.float32)
+        Y0s = eps * sigmas[i] + Ybar_c
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
+
+        # Base cost and per-step constraint values
+        costs  = cost_batch(Y0s)               # (Nsample,)
+        g_vals = al_constraint_batch(Y0s)      # (Nsample, H, n_g)
+
+        # AL penalty: scheduled (linear + quadratic) form.
+        #
+        # Two improvements over the standard quadratic AL:
+        #   1. Use max(g, 0) not max(M/rho + g, 0) — the M/rho offset creates a
+        #      spurious penalty zone for FEASIBLE trajectories (g ∈ [-M/rho, 0]),
+        #      pushing the trajectory mean away from constraint boundaries even when
+        #      it's already inside, which causes it to miss narrow gates.
+        #   2. Scale by alphas_bar[i] (same as dual-ascent gamma_i) — near-0 at
+        #      early diffusion steps (high noise) so samples are weighted by base cost
+        #      (ice + goal), allowing lateral exploration toward low-cost corridors;
+        #      grows to ~0.8 at late steps to enforce constraints.
+        #
+        # Penalty form for g > 0: schedule * (M*g + (rho/2)*g^2)
+        # This equals the linearized AL: the first-order Lagrangian term M*g plus
+        # the quadratic penalty (rho/2)*g^2.  Combined, they have the same gradient
+        # structure as standard AL but without the feasibility-zone penalization.
+        penalty_schedule = float(alphas_bar[i])
+        g_pos   = jnp.maximum(g_vals, jnp.float32(0.0))               # (Nsample, H, n_g)
+        al_pen  = penalty_schedule * (
+            M[None, :, :] * g_pos + (jnp.float32(al_rho) / 2.0) * g_pos ** 2
+        ).sum(axis=(-2, -1))                                           # (Nsample,)
+
+        L = costs + al_pen   # (Nsample,) total AL cost
+
+        rews     = -L
+        rew_mean = rews.mean()
+        rew_std  = jnp.maximum(rews.std(), jnp.float32(1e-6))
+        logp0    = (rews - rew_mean) / rew_std / jnp.float32(temperature)
+        w        = jax.nn.softmax(logp0)
+
+        Ybar_new = jnp.einsum("n,nij->ij", w, Y0s)
+
+        score = (
+            1.0 / (1.0 - alphas_bar[i])
+            * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar_new)
+        )
+        Yim1 = (
+            1.0 / jnp.sqrt(alphas[i])
+            * (Yi + (1.0 - alphas_bar[i]) * score)
+        )
+        i_prev = max(i - 1, 0)
+        Ybar_c = Yim1 / jnp.sqrt(alphas_bar[i_prev])
+        Ybar_c = jnp.clip(Ybar_c, -1.0, 1.0)
+
+        # Dual ascent on M using current best estimate Y^{(i-1)} = Ybar_c
+        # Step size γ_i = ᾱ_i (suppresses updates in high-noise regime)
+        g_cur   = al_constraint_fn(Ybar_c)   # (H, n_g)
+        gamma_i = float(alphas_bar[i])
+        M = jnp.maximum(
+            jnp.float32(0.0),
+            M + jnp.float32(al_rho * gamma_i) * g_cur,
+        )
+        M = jnp.minimum(M, jnp.float32(al_M_max))
+
+        # Diagnostics
+        costs_np  = np.array(costs)
+        L_np      = np.array(L)
+        al_pen_np = np.array(al_pen)
+        g_cur_np  = np.array(g_cur)
+        w_np      = np.array(w)
+        M_np      = np.array(M)
+
+        step_sort_idx = np.argsort(L_np)          # ascending total AL cost
+        step_best_idx = int(step_sort_idx[0])
+        step_best_rew = -float(L_np[step_best_idx])
+
+        if step_best_rew > diag["best_sample_cost"]:
+            diag["best_sample_cost"]    = step_best_rew
+            diag["best_sample_actions"] = np.array(Y0s[step_best_idx])
+            if len(step_sort_idx) > 1:
+                step_2nd_idx = int(step_sort_idx[1])
+                diag["second_best_sample_cost"]    = -float(L_np[step_2nd_idx])
+                diag["second_best_sample_actions"] = np.array(Y0s[step_2nd_idx])
+
+        # Track best sample by BASE cost (excludes AL penalty) so the
+        # diagnostic gold trajectory matches the reported base cost exactly.
+        base_best_idx = int(np.argmin(costs_np))
+        base_best_cost = float(costs_np[base_best_idx])
+        if base_best_cost < diag["best_base_cost"]:
+            diag["best_base_cost"]     = base_best_cost
+            diag["best_base_cost_actions"] = np.array(Y0s[base_best_idx])
+            _bb_phys = Y0s[base_best_idx] * action_scale + action_center
+            diag["best_base_cost_trajectory"] = np.array(rollout_single(eta0, nu0, _bb_phys))
+
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["weights"].append(w_np)
+        diag["n_total_sampled"].append(Nsample)
+        diag["accept_rates"].append(1.0)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_c)))
+        diag["multiplier_means"].append(float(M_np.mean()))
+        diag["multiplier_maxes"].append(float(M_np.max()))
+        diag["constraint_violations"].append(float(np.maximum(g_cur_np, 0.0).mean()))
+        diag["al_penalties"].append(al_pen_np)
+
+        diag["mean_trajectories"].append(np.array(_rollout_actions(Ybar_c)))
+
+        n_store    = min(n_top_samples, Nsample)
+        sort_idx   = np.argsort(L_np)[:n_store]
+        store_phys = Y0s[sort_idx] * action_scale[None, :] + action_center[None, :]
+        diag["sample_trajectories"].append(np.array(rollout_batch(eta0, nu0, store_phys)))
+        diag["sample_sort_indices"].append(sort_idx)  # maps stored traj index → original sample index
+
+    diag["Ybar_final"] = Ybar_c
+    return diag
+
+
+# ── Augmented-Lagrangian Homotopy MBD (AL-H-MBD) ────────────────────────────
+
+def run_al_homotopy_mbd_with_diagnostics(
+    cost_fn,
+    al_constraint_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    al_rho: float,
+    al_M_max: float,
+    obstacles,
+    Ybar_init: Optional[Union[jnp.ndarray, List[np.ndarray]]] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+    min_class_samples: int = 3,
+    classify_fn_override=None,
+) -> dict:
+    """
+    Augmented-Lagrangian Homotopy MBD (AL-H-MBD).
+
+    Combines topological parallel chains (H-MBD) with augmented-Lagrangian
+    constraint enforcement (AL-MBD).  Each homotopy class maintains its own
+    Lagrange multiplier matrix M_c ∈ ℝ^{H × n_g}, updated by dual ascent on
+    the class mean at every diffusion step.
+
+    The per-sample AL cost within class c is:
+
+        L_c(u) = J(u) + (ρ/2) Σ_{t,j} max(0, M_c_{t,j}/ρ + g_{t,j}(u))²
+
+    where g_{t,j} ≤ 0 means constraint j is satisfied at step t.
+    Importance weights within each class are computed from −L_c (Z-scored),
+    so the AL quadratic penalty provides a gradient across OOB trajectories
+    (barely OOB ≠ deeply OOB) without any in-bounds bias.
+
+    At the end the class with the lowest mean BASE cost (J only) is returned.
+
+    Parameters
+    ----------
+    al_constraint_fn : callable
+        g(u_norm) → (H, n_g).  Build with make_al_per_step_constraints_fn.
+    al_rho : float
+        AL penalty weight ρ.
+    al_M_max : float
+        Multiplier clip value for numerical stability.
+    obstacles : list
+        From detect_obstacles_from_costmap().
+    """
+    if classify_fn_override is not None:
+        classify_fn, n_classes = classify_fn_override
+    else:
+        classify_fn, n_classes = make_homotopy_classifier(obstacles)
+
+    cost_batch          = jax.jit(jax.vmap(cost_fn))
+    al_constraint_batch = jax.jit(jax.vmap(al_constraint_fn))
+    rollout_batch       = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single      = jax.jit(rollout_fn)
+
+    def _u_norm_to_traj_xy(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)[:, :2]
+
+    classify_batch = jax.jit(jax.vmap(
+        lambda u_norm: classify_fn(_u_norm_to_traj_xy(u_norm))
+    ))
+
+    # Detect n_g from one evaluation
+    _g_probe = al_constraint_fn(
+        jnp.zeros((H, 3), dtype=jnp.float32).at[:, 0].set(init_surge_bias)
+    )
+    n_g = int(_g_probe.shape[1])
+
+    # Initialise class means and per-class Lagrange multipliers
+    _default_init = jnp.zeros((H, 3), dtype=jnp.float32).at[:, 0].set(init_surge_bias)
+    if isinstance(Ybar_init, list):
+        Ybar_classes = [
+            jnp.clip(jnp.array(Ybar_init[c], dtype=jnp.float32), -1.0, 1.0)
+            if c < len(Ybar_init) and Ybar_init[c] is not None
+            else _default_init
+            for c in range(n_classes)
+        ]
+    elif Ybar_init is not None:
+        _init = jnp.clip(jnp.array(Ybar_init, dtype=jnp.float32), -1.0, 1.0)
+        Ybar_classes = [_init] * n_classes
+    else:
+        Ybar_classes = [_default_init] * n_classes
+    M_classes    = [jnp.zeros((H, n_g), dtype=jnp.float32) for _ in range(n_classes)]
+
+    rng        = jax.random.PRNGKey(seed)
+    betas      = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas     = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas     = jnp.sqrt(1.0 - alphas_bar)
+
+    n_spc = max(1, Nsample // n_classes)
+
+    # Scale M_max by 1/sqrt(n_classes) to keep ESS stable as the per-class
+    # sample count drops.  With n_classes=1 (512 samples): M_max unchanged.
+    # With n_classes=8 (64 samples): M_max *= 1/sqrt(8) ≈ 0.35.
+    al_M_max_eff = float(al_M_max) / float(n_classes) ** 0.5
+
+    def _rollout_u(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    diag = {
+        "mean_trajectories":          [],
+        "sample_trajectories":        [],
+        "sample_sort_indices":        [],
+        "sample_costs":               [],
+        "cost_means":                 [],
+        "cost_mins":                  [],
+        "cost_of_mean":               [],
+        "weights":                    [],
+        "Ybar_final":                 None,
+        "best_sample_actions":        None,
+        "best_sample_cost":           float("inf"),
+        "second_best_sample_actions": None,
+        "second_best_sample_cost":    float("inf"),
+        "best_base_cost_actions":     None,
+        "best_base_cost_trajectory":  None,
+        "best_base_cost":             float("inf"),
+        "accept_rates":               [],
+        "n_total_sampled":            [],
+        # AL extras
+        "multiplier_means":           [],
+        "multiplier_maxes":           [],
+        "constraint_violations":      [],
+        "al_penalties":               [],
+        # Homotopy extras
+        "n_classes":    n_classes,
+        "obstacles":    obstacles,
+        "class_counts": [],
+        "class_costs":  [],
+        "best_class":   [],
+    }
+
+    best_cls_idx = 0
+    diag["mean_trajectories"].append(np.array(_rollout_u(Ybar_classes[0])))
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i      = i_rev
+        ab_i   = float(alphas_bar[i])
+        a_i    = float(alphas[i])
+        sig_i  = float(sigmas[i])
+        ab_im1 = float(alphas_bar[max(i - 1, 0)])
+        gamma_i         = ab_i   # dual step size — suppresses updates in high-noise regime
+        penalty_schedule = ab_i   # same schedule for AL penalty (see run_al_mbd_with_diagnostics)
+
+        # Draw samples from each class mean
+        rng, rng_s = jax.random.split(rng)
+        cls_keys = jax.random.split(rng_s, n_classes)
+
+        Y0s_list = []
+        for c in range(n_classes):
+            eps_c = jax.random.normal(cls_keys[c], (n_spc, H, 3), dtype=jnp.float32)
+            Y0s_c = jnp.clip(eps_c * sig_i + Ybar_classes[c], -1.0, 1.0)
+            Y0s_list.append(Y0s_c)
+        Y0s = jnp.concatenate(Y0s_list, axis=0)   # (n_total, H, 3)
+
+        costs  = cost_batch(Y0s)           # (n_total,)
+        g_vals = al_constraint_batch(Y0s)  # (n_total, H, n_g)
+        h_sigs = classify_batch(Y0s)       # (n_total,)
+
+        costs_np  = np.array(costs)
+        g_vals_np = np.array(g_vals)
+        h_sigs_np = np.array(h_sigs)
+        Y0s_np    = np.array(Y0s)
+
+        class_counts          = np.zeros(n_classes, dtype=int)
+        class_cost_means      = np.full(n_classes, np.inf)   # mean sample cost (diag)
+        class_mean_traj_costs = np.full(n_classes, np.inf)   # cost_fn at class mean (select)
+
+        for c in range(n_classes):
+            cls_idx = np.where(h_sigs_np == c)[0]
+            class_counts[c] = len(cls_idx)
+            if len(cls_idx) < min_class_samples:
+                continue
+
+            class_cost_means[c] = float(costs_np[cls_idx].mean())
+
+            # AL penalty for class c: scheduled (linear + quadratic) form
+            M_c_np = np.array(M_classes[c])   # (H, n_g)
+            g_pos_c = np.maximum(g_vals_np[cls_idx], 0.0)  # (n_cls, H, n_g)
+            al_pen_c = penalty_schedule * (
+                M_c_np[None, :, :] * g_pos_c + (al_rho / 2.0) * g_pos_c ** 2
+            ).sum(axis=(-2, -1))
+
+            L_c = costs_np[cls_idx] + al_pen_c   # (n_cls,) total AL cost
+
+            # Importance-weighted mean (Z-scored within class)
+            rews_c = -L_c
+            rews_mean = rews_c.mean()
+            rews_std  = max(float(rews_c.std()), 1e-6)
+            logp_c    = (rews_c - rews_mean) / rews_std / temperature
+            logp_c   -= logp_c.max()
+            w_c       = np.exp(logp_c)
+            w_c      /= w_c.sum()
+
+            Ybar_new_c = jnp.array(np.einsum("n,nij->ij", w_c, Y0s_np[cls_idx]))
+
+            # Reverse-diffusion update (same as H-MBD / EB-H-MBD)
+            Yi_c   = Ybar_classes[c] * jnp.sqrt(jnp.float32(ab_i))
+            score  = (jnp.float32(1.0 / (1.0 - ab_i))
+                      * (-Yi_c + jnp.sqrt(jnp.float32(ab_i)) * Ybar_new_c))
+            Yim1_c = (jnp.float32(1.0 / a_i ** 0.5)
+                      * (Yi_c + jnp.float32(1.0 - ab_i) * score))
+            Ybar_classes[c] = jnp.clip(
+                Yim1_c / jnp.sqrt(jnp.float32(ab_im1)), -1.0, 1.0
+            )
+
+            # Dual ascent: update M_c using constraint at new class mean
+            g_cur_c = al_constraint_fn(Ybar_classes[c])   # (H, n_g)
+            M_classes[c] = jnp.clip(
+                jnp.maximum(
+                    jnp.float32(0.0),
+                    M_classes[c] + jnp.float32(al_rho * gamma_i) * g_cur_c,
+                ),
+                jnp.float32(0.0), jnp.float32(al_M_max_eff),
+            )
+
+            # Cost of class mean trajectory (includes OOB cost if any)
+            class_mean_traj_costs[c] = float(cost_fn(Ybar_classes[c]))
+
+        # Best class by cost_fn at the class mean (includes OOB cost penalty).
+        # Avoids selecting a class whose mean trajectory goes slightly OOB.
+        valid_mean = np.isfinite(class_mean_traj_costs)
+        if valid_mean.any():
+            best_cls_idx = int(np.argmin(np.where(valid_mean, class_mean_traj_costs, np.inf)))
+        else:
+            valid = np.isfinite(class_cost_means)
+            if valid.any():
+                best_cls_idx = int(np.argmin(np.where(valid, class_cost_means, np.inf)))
+
+        # Global best sample by base cost (across all classes)
+        base_best_idx  = int(np.argmin(costs_np))
+        base_best_cost = float(costs_np[base_best_idx])
+        if base_best_cost < diag["best_base_cost"]:
+            diag["best_base_cost"]           = base_best_cost
+            diag["best_base_cost_actions"]   = Y0s_np[base_best_idx]
+            _bb_phys = Y0s[base_best_idx] * action_scale + action_center
+            diag["best_base_cost_trajectory"] = np.array(rollout_single(eta0, nu0, _bb_phys))
+
+        # Best sample by total AL cost (using best-class multipliers)
+        M_best_np = np.array(M_classes[best_cls_idx])
+        phi_all   = M_best_np[None, :, :] / al_rho + g_vals_np
+        al_pen_all = (al_rho / 2.0) * (np.maximum(phi_all, 0.0) ** 2).sum(axis=(-2, -1))
+        L_all = costs_np + al_pen_all
+        step_sort_idx = np.argsort(L_all)
+        step_best_idx = int(step_sort_idx[0])
+        step_best_rew = -float(L_all[step_best_idx])
+        if step_best_rew > diag["best_sample_cost"]:
+            diag["best_sample_cost"]    = step_best_rew
+            diag["best_sample_actions"] = Y0s_np[step_best_idx]
+            if len(step_sort_idx) > 1:
+                diag["second_best_sample_cost"]    = -float(L_all[int(step_sort_idx[1])])
+                diag["second_best_sample_actions"] = Y0s_np[int(step_sort_idx[1])]
+
+        # Aggregate multiplier stats across classes
+        all_M_np = np.concatenate([np.array(M_classes[c]) for c in range(n_classes)])
+        g_cur_best = np.array(al_constraint_fn(Ybar_classes[best_cls_idx]))
+
+        # Global weight for diagnostics (using best-class AL cost)
+        rews_all   = -L_all
+        rews_std_g = max(float(rews_all.std()), 1e-6)
+        logp_all   = (rews_all - rews_all.mean()) / rews_std_g / temperature
+        logp_all  -= logp_all.max()
+        w_all      = np.exp(logp_all)
+        w_all     /= w_all.sum()
+
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["weights"].append(w_all)
+        diag["n_total_sampled"].append(len(costs_np))
+        diag["accept_rates"].append(1.0)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_classes[best_cls_idx])))
+        diag["multiplier_means"].append(float(all_M_np.mean()))
+        diag["multiplier_maxes"].append(float(all_M_np.max()))
+        diag["constraint_violations"].append(float(np.maximum(g_cur_best, 0.0).mean()))
+        diag["al_penalties"].append(al_pen_all)
+        diag["class_counts"].append(class_counts.copy())
+        diag["class_costs"].append(class_cost_means.copy())
+        diag["best_class"].append(best_cls_idx)
+        diag["mean_trajectories"].append(np.array(_rollout_u(Ybar_classes[best_cls_idx])))
+
+        n_store  = min(n_top_samples, len(costs_np))
+        sort_idx = np.argsort(L_all)[:n_store]
+        store_phys = Y0s[sort_idx] * action_scale[None, :] + action_center[None, :]
+        diag["sample_trajectories"].append(np.array(rollout_batch(eta0, nu0, store_phys)))
+        diag["sample_sort_indices"].append(sort_idx)
+
+    diag["Ybar_final"] = Ybar_classes[best_cls_idx]
+    return diag
+
+
+# ── Homotopy-class MBD ───────────────────────────────────────────────────────
+
+def detect_obstacles_from_costmap(cost_map, threshold_frac: float = 0.1, n_obs_max: int = 3):
+    """
+    Detect connected high-cost regions from a costmap.
+
+    Thresholds at threshold_frac × max_cost, labels connected components, and
+    returns [(cx_obs, cx_free, cy, ry), ...] in world coordinates sorted by
+    area descending, capped at n_obs_max.
+
+    Each tuple element:
+      cx_obs  — obstacle centroid x (world coords)
+      cx_free — x-centre of the largest FREE corridor at the obstacle's y-band
+      cy      — obstacle centroid y
+      ry      — obstacle half-height
+
+    cx_free is used by the homotopy classifier to distinguish trajectories that
+    pass through the corridor (close to cx_free) from those that go through the
+    obstacle body (close to cx_obs).
+
+    Parameters
+    ----------
+    threshold_frac : float
+        Cells with cost > max_cost * threshold_frac are treated as obstacles.
+    n_obs_max : int
+        Cap on tracked obstacles → 2**n_obs_max homotopy classes.
+    """
+    from scipy.ndimage import label as _label
+    grid = np.array(cost_map.cost_map)  # (rows, cols)
+    # Clamp boundary-wall cells (cost >= 1e7) so they don't dominate the threshold.
+    # The domain walls are intentionally impassable but should not be treated as
+    # ice obstacles by the homotopy detector.
+    WALL_CLIP = 1e7
+    detection_grid = np.where(grid >= WALL_CLIP, 0.0, grid)
+    max_cost = float(detection_grid.max())
+    if max_cost < 1.0:
+        return []
+
+    obstacle_mask = detection_grid > max_cost * threshold_frac
+    free_mask     = ~obstacle_mask
+    labeled, n    = _label(obstacle_mask)
+    res           = float(cost_map.resolution)
+    x_orig        = float(cost_map.x_origin)
+    y_orig        = float(cost_map.y_origin)
+
+    obstacles = []
+    for o in range(1, n + 1):
+        coords  = np.argwhere(labeled == o)  # (n_pix, 2) — [row, col]
+        row_min = int(coords[:, 0].min())
+        row_max = int(coords[:, 0].max())
+        cx_obs  = x_orig + float(coords[:, 1].mean()) * res
+        cy      = y_orig + float(coords[:, 0].mean()) * res
+        ry      = (row_max - row_min + 1) * res / 2.0
+
+        # Free corridor centre: average x of free cells in the obstacle y-band
+        row_lo = max(0, row_min)
+        row_hi = min(grid.shape[0], row_max + 1)
+        # A column is "free" in the band if more than half its rows in the band are free
+        free_col_frac = free_mask[row_lo:row_hi, :].mean(axis=0)  # (cols,)
+        free_cols = np.where(free_col_frac > 0.5)[0]
+
+        all_passages = []
+        if len(free_cols) > 0:
+            # Find ALL connected free segments, sorted by width (widest first)
+            breaks   = np.where(np.diff(free_cols) > 1)[0] + 1
+            segments = np.split(free_cols, breaks)
+            segments.sort(key=len, reverse=True)
+            all_passages = [x_orig + float(seg.mean()) * res for seg in segments if len(seg) > 0]
+            cx_free = all_passages[0] if all_passages else cx_obs
+        else:
+            cx_free = cx_obs  # fallback: indistinguishable — use obstacle centre
+
+        # Return (cx_obs, cx_free, cy, ry, all_passages): 5-element tuple.
+        # Existing code that only reads [:4] remains unaffected.
+        obstacles.append((cx_obs, cx_free, cy, ry, len(coords), all_passages))
+
+    obstacles.sort(key=lambda x: -x[4])  # largest first
+    return [(cx_obs, cx_free, cy, ry, all_passages)
+            for cx_obs, cx_free, cy, ry, _, all_passages in obstacles[:n_obs_max]]
+
+
+def make_homotopy_classifier(obstacles):
+    """
+    Build a vmap-compatible JAX H-signature classifier.
+
+    Each obstacle contributes one bit determined by whether the trajectory's
+    mean x-position in the obstacle's y-band is closer to the *free corridor
+    centre* (cx_free) or to the *obstacle body centre* (cx_obs):
+
+        bit = 1  if  |mean_x − cx_free| < |mean_x − cx_obs|   (in corridor)
+        bit = 0  otherwise                                       (in body / wrong side)
+
+    This distance-based criterion correctly handles obstacles where the corridor
+    is not near the geometric centre (e.g. a block that covers 0–600 m with the
+    only gap at 600–800 m; centroid=300, corridor_centre=700).
+
+    Parameters
+    ----------
+    obstacles : list of (cx_obs, cx_free, cy, ry)
+        From detect_obstacles_from_costmap().
+
+    Returns
+    -------
+    classify_fn : callable  — classify_fn(traj_xy: (T, 2)) → int32
+    n_classes   : int       — 2**len(obstacles)
+    """
+    n_obs = len(obstacles)
+    if n_obs == 0:
+        return (lambda traj_xy: jnp.int32(0)), 1
+
+    obs_cx_body = jnp.array([o[0] for o in obstacles], dtype=jnp.float32)  # obstacle centroid
+    obs_cx_free = jnp.array([o[1] for o in obstacles], dtype=jnp.float32)  # corridor centre
+    obs_cy      = jnp.array([o[2] for o in obstacles], dtype=jnp.float32)
+    obs_ry      = jnp.array([o[3] for o in obstacles], dtype=jnp.float32)
+    powers      = jnp.array([1 << j for j in range(n_obs)], dtype=jnp.int32)
+
+    def classify(traj_xy):
+        """traj_xy : (T, 2) → int32 class label."""
+        xs = traj_xy[:, 0]
+        ys = traj_xy[:, 1]
+        in_band   = jnp.abs(ys[None, :] - obs_cy[:, None]) <= obs_ry[:, None]  # (n_obs, T)
+        n_in_band = in_band.sum(axis=1).astype(jnp.float32)                    # (n_obs,)
+        sum_x     = (xs[None, :] * in_band).sum(axis=1)
+        mean_x    = jnp.where(n_in_band > 0, sum_x / jnp.maximum(n_in_band, 1.0), xs[0])
+        # bit=1 when trajectory is closer to the free corridor than the obstacle body
+        dist_free = jnp.abs(mean_x - obs_cx_free)
+        dist_body = jnp.abs(mean_x - obs_cx_body)
+        bits      = (dist_free < dist_body).astype(jnp.int32)
+        return jnp.sum(bits * powers)
+
+    return classify, (1 << n_obs)
+
+
+def run_homotopy_mbd_with_diagnostics(
+    cost_fn,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    H: int,
+    Nsample: int,
+    Ndiffuse: int,
+    temperature: float,
+    beta0: float,
+    betaT: float,
+    seed: int,
+    obstacles,
+    Ybar_init: Optional[Union[jnp.ndarray, List[np.ndarray]]] = None,
+    init_surge_bias: float = 0.7,
+    n_top_samples: int = 10,
+    min_class_samples: int = 3,
+    classify_fn_override=None,
+) -> dict:
+    """
+    Homotopy-class MBD (H-MBD): parallel diffusion chains in distinct topological classes.
+
+    Each obstacle detected from the costmap contributes one classification bit:
+    a sample trajectory is labelled 1 for that obstacle if its mean x-position
+    while traversing the obstacle's y-band exceeds the obstacle's centroid x
+    (i.e. it passed to the right), and 0 otherwise.  The n-bit vector is packed
+    into a single integer, giving 2^n_obs homotopy classes.
+
+    At each diffusion step Nsample/n_classes trajectories are drawn around each
+    class mean.  Every sample is then assigned to the class matching its actual
+    H-signature, and only samples in class c update class c's mean via the
+    standard MBD importance-weighted update.  This prevents the mode-averaging
+    collapse that causes vanilla MBD to fail on topologically complex scenarios.
+
+    At the end the class whose final mean achieves the lowest base cost is
+    returned as Ybar_final.
+
+    Parameters
+    ----------
+    obstacles : list of (cx, cy, ry)
+        From detect_obstacles_from_costmap().
+    min_class_samples : int
+        A class mean is only updated when at least this many samples fall in it.
+        Classes with fewer samples keep their previous mean.
+    """
+    if classify_fn_override is not None:
+        classify_fn, n_classes = classify_fn_override
+    else:
+        classify_fn, n_classes = make_homotopy_classifier(obstacles)
+
+    cost_batch     = jax.jit(jax.vmap(cost_fn))
+    rollout_batch  = jax.jit(jax.vmap(rollout_fn, in_axes=(None, None, 0)))
+    rollout_single = jax.jit(rollout_fn)
+
+    def _u_norm_to_traj_xy(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj   = rollout_single(eta0, nu0, u_phys)
+        return traj[:, :2]
+
+    classify_batch = jax.jit(jax.vmap(
+        lambda u_norm: classify_fn(_u_norm_to_traj_xy(u_norm))
+    ))
+
+    # Initialise class means: per-class seeds or shared init
+    _default_init = jnp.zeros((H, 3), dtype=jnp.float32).at[:, 0].set(init_surge_bias)
+    if isinstance(Ybar_init, list):
+        Ybar_classes = [
+            jnp.clip(jnp.array(Ybar_init[c], dtype=jnp.float32), -1.0, 1.0)
+            if c < len(Ybar_init) and Ybar_init[c] is not None
+            else _default_init
+            for c in range(n_classes)
+        ]
+    elif Ybar_init is not None:
+        _init = jnp.clip(jnp.array(Ybar_init, dtype=jnp.float32), -1.0, 1.0)
+        Ybar_classes = [_init] * n_classes
+    else:
+        Ybar_classes = [_default_init] * n_classes
+
+    rng        = jax.random.PRNGKey(seed)
+    betas      = jnp.linspace(beta0, betaT, Ndiffuse)
+    alphas     = 1.0 - betas
+    alphas_bar = jnp.cumprod(alphas)
+    sigmas     = jnp.sqrt(1.0 - alphas_bar)
+
+    n_spc = max(1, Nsample // n_classes)  # samples per class
+
+    def _rollout_u(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        return rollout_single(eta0, nu0, u_phys)
+
+    diag = {
+        # Standard MBD-compatible keys
+        "mean_trajectories":          [],
+        "sample_trajectories":        [],
+        "sample_costs":               [],
+        "cost_means":                 [],
+        "cost_mins":                  [],
+        "cost_of_mean":               [],
+        "weights":                    [],
+        "Ybar_final":                 None,
+        "best_sample_actions":        None,
+        "best_sample_cost":           float("inf"),
+        "second_best_sample_actions": None,
+        "second_best_sample_cost":    float("inf"),
+        "accept_rates":               [],
+        "n_total_sampled":            [],
+        # AL/EB-compatible for result extraction
+        "best_base_cost_actions":     None,
+        "best_base_cost_trajectory":  None,
+        "best_base_cost":             float("inf"),
+        # Homotopy-specific
+        "n_classes":    n_classes,
+        "obstacles":    obstacles,
+        "class_counts": [],   # list of (n_classes,) int arrays
+        "class_costs":  [],   # list of (n_classes,) float arrays — mean sample cost per class
+        "best_class":   [],   # list of ints — which class leads at each step
+    }
+
+    best_cls_idx = 0
+    diag["mean_trajectories"].append(np.array(_rollout_u(Ybar_classes[0])))
+
+    for i_rev in range(Ndiffuse - 1, 0, -1):
+        i      = i_rev
+        ab_i   = float(alphas_bar[i])
+        a_i    = float(alphas[i])
+        sig_i  = float(sigmas[i])
+        ab_im1 = float(alphas_bar[max(i - 1, 0)])
+
+        # ── Draw n_spc samples from each class mean ───────────────────────
+        rng, rng_s = jax.random.split(rng)
+        cls_keys = jax.random.split(rng_s, n_classes)
+
+        Y0s_list = []
+        for c in range(n_classes):
+            eps_c = jax.random.normal(cls_keys[c], (n_spc, H, 3), dtype=jnp.float32)
+            Y0s_c = jnp.clip(eps_c * sig_i + Ybar_classes[c], -1.0, 1.0)
+            Y0s_list.append(Y0s_c)
+        Y0s = jnp.concatenate(Y0s_list, axis=0)  # (n_classes * n_spc, H, 3)
+
+        costs  = cost_batch(Y0s)       # (N_total,)
+        h_sigs = classify_batch(Y0s)   # (N_total,) int32
+
+        costs_np  = np.array(costs)
+        h_sigs_np = np.array(h_sigs)
+        Y0s_np    = np.array(Y0s)
+
+        # ── Per-class reverse-diffusion updates ───────────────────────────
+        class_counts     = np.zeros(n_classes, dtype=int)
+        class_cost_means = np.full(n_classes, np.inf)
+
+        for c in range(n_classes):
+            cls_idx = np.where(h_sigs_np == c)[0]
+            class_counts[c] = len(cls_idx)
+            if len(cls_idx) < min_class_samples:
+                continue
+
+            cls_costs = costs_np[cls_idx]
+            class_cost_means[c] = float(cls_costs.mean())
+
+            # Importance-weighted mean within class c
+            cls_rews     = -cls_costs
+            cls_rew_mean = cls_rews.mean()
+            cls_rew_std  = max(float(cls_rews.std()), 1e-6)
+            cls_logp     = (cls_rews - cls_rew_mean) / cls_rew_std / temperature
+            cls_logp    -= cls_logp.max()
+            cls_w        = np.exp(cls_logp)
+            cls_w       /= cls_w.sum()
+            Ybar_new_c   = jnp.array(np.einsum("n,nij->ij", cls_w, Y0s_np[cls_idx]))
+
+            # Reverse diffusion step for class c
+            Yi_c   = Ybar_classes[c] * jnp.sqrt(jnp.float32(ab_i))
+            score  = (jnp.float32(1.0 / (1.0 - ab_i))
+                      * (-Yi_c + jnp.sqrt(jnp.float32(ab_i)) * Ybar_new_c))
+            Yim1_c = (jnp.float32(1.0 / a_i ** 0.5)
+                      * (Yi_c + jnp.float32(1.0 - ab_i) * score))
+            Ybar_classes[c] = jnp.clip(
+                Yim1_c / jnp.sqrt(jnp.float32(ab_im1)), -1.0, 1.0
+            )
+
+        # ── Best class = lowest mean sample cost among non-empty classes ──
+        valid = np.isfinite(class_cost_means)
+        if valid.any():
+            best_cls_idx = int(np.argmin(np.where(valid, class_cost_means, np.inf)))
+
+        # ── Global diagnostics ────────────────────────────────────────────
+        step_sort      = np.argsort(costs_np)
+        step_best_idx  = int(step_sort[0])
+        step_best_cost = float(costs_np[step_best_idx])
+
+        if step_best_cost < diag["best_sample_cost"]:
+            diag["best_sample_cost"]    = step_best_cost
+            diag["best_sample_actions"] = Y0s_np[step_best_idx]
+            if len(step_sort) > 1:
+                diag["second_best_sample_cost"]    = float(costs_np[int(step_sort[1])])
+                diag["second_best_sample_actions"] = Y0s_np[int(step_sort[1])]
+
+        if step_best_cost < diag["best_base_cost"]:
+            diag["best_base_cost"]           = step_best_cost
+            diag["best_base_cost_actions"]   = Y0s_np[step_best_idx]
+            _bb_phys = Y0s[step_best_idx] * action_scale + action_center
+            diag["best_base_cost_trajectory"] = np.array(rollout_single(eta0, nu0, _bb_phys))
+
+        # Global softmax weights (for visualization consistency with other methods)
+        all_rews = -costs_np
+        all_std  = max(float(all_rews.std()), 1e-6)
+        all_logp = (all_rews - all_rews.mean()) / all_std / temperature
+        all_logp -= all_logp.max()
+        all_w    = np.exp(all_logp)
+        all_w   /= all_w.sum()
+
+        n_total = len(costs_np)
+        diag["sample_costs"].append(costs_np)
+        diag["cost_means"].append(float(costs_np.mean()))
+        diag["cost_mins"].append(float(costs_np.min()))
+        diag["weights"].append(all_w)
+        diag["n_total_sampled"].append(n_total)
+        diag["accept_rates"].append(1.0)
+        diag["cost_of_mean"].append(float(cost_fn(Ybar_classes[best_cls_idx])))
+        diag["class_counts"].append(class_counts.copy())
+        diag["class_costs"].append(class_cost_means.copy())
+        diag["best_class"].append(best_cls_idx)
+        diag["mean_trajectories"].append(np.array(_rollout_u(Ybar_classes[best_cls_idx])))
+
+        n_store    = min(n_top_samples, n_total)
+        sort_idx   = step_sort[:n_store]
+        store_phys = Y0s[sort_idx] * action_scale[None] + action_center[None]
+        diag["sample_trajectories"].append(np.array(rollout_batch(eta0, nu0, store_phys)))
+
+    # ── Select final best class by lowest cost_fn on its mean ─────────────
+    final_costs = np.array([float(cost_fn(Ybar_classes[c])) for c in range(n_classes)])
+    best_final  = int(np.argmin(final_costs))
+    diag["Ybar_final"] = Ybar_classes[best_final]
+
+    class_summary = ", ".join(f"cls{c}={v:.0f}" for c, v in enumerate(final_costs))
+    print(
+        f"  [H-MBD] final class costs: {class_summary}  → winner cls={best_final}",
+        flush=True,
+    )
     return diag
 
 
@@ -608,6 +3035,142 @@ def _sample_final_step(
     return trajs, costs, np.array(Y0s)
 
 
+def _generate_denoising_movie_from_diagnostics(
+    diag: dict,
+    cost_map,
+    world_polygons,
+    thicknesses,
+    goal_y_line,
+    goal,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    replan_idx: int,
+    output_path: str,
+    fps: int = 10,
+) -> None:
+    """
+    Generate a denoising-evolution MP4 for one replan step from diagnostics data.
+
+    Each animation frame corresponds to one diffusion step and shows the sample
+    trajectory distribution alongside the current mean trajectory.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
+    from matplotlib.collections import PatchCollection, LineCollection
+    from matplotlib import animation
+    import os
+
+    mean_trajs = diag["mean_trajectories"]     # list of (H+1, 3), length Ndiffuse
+    sample_trajs = diag["sample_trajectories"] # list of (Nsample, H+1, 3), length Ndiffuse-1
+    cost_mins = diag.get("cost_mins", [])
+    cost_means = diag.get("cost_means", [])
+    reward_maxes = diag.get("reward_maxes", [])   # non-empty only for EB-MBD
+
+    n_frames = len(mean_trajs)
+    n_samples = len(sample_trajs[0]) if sample_trajs else 0
+
+    print(
+        f"  [replan {replan_idx:04d}] Generating denoising movie: "
+        f"{n_frames} steps, {n_samples} samples -> {output_path}",
+        flush=True,
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    # Static background
+    grid = cost_map.cost_map
+    extent = [
+        cost_map.x_origin, cost_map.x_origin + cost_map.width,
+        cost_map.y_origin, cost_map.y_origin + cost_map.height,
+    ]
+    vmax_grid = float(np.percentile(grid[grid > 0], 95)) if np.any(grid > 0) else 1.0
+    ax.imshow(grid, origin="lower", extent=extent, cmap="YlOrRd", alpha=0.5,
+              vmin=0, vmax=vmax_grid)
+
+    if world_polygons is not None and thicknesses is not None and len(world_polygons) > 0:
+        patches = [MplPolygon(poly, closed=True) for poly in world_polygons]
+        pc = PatchCollection(patches, cmap="Blues", edgecolor="#555555", linewidth=0.3, alpha=0.5)
+        pc.set_array(np.array(thicknesses))
+        pc.set_clim(float(thicknesses.min()), float(thicknesses.max()))
+        ax.add_collection(pc)
+
+    if goal_y_line is not None:
+        ax.axhline(goal_y_line, color="lime", ls="--", lw=2, zorder=4,
+                   label=f"Goal y={goal_y_line:.0f}")
+    else:
+        ax.plot(goal[0], goal[1], "mx", ms=14, mew=3, zorder=6, label="Goal")
+
+    pad = 30.0
+    ax.set_xlim(x_min - pad, x_max + pad)
+    ax.set_ylim(y_min - pad, y_max + pad)
+    ax.set_aspect("equal")
+    ax.set_xlabel("X [m]")
+    ax.set_ylabel("Y [m]")
+
+    sample_norm = plt.Normalize(vmin=0, vmax=1)
+    sample_lc = LineCollection([], cmap="cool", norm=sample_norm,
+                                linewidths=0.6, alpha=0.25, zorder=4)
+    ax.add_collection(sample_lc)
+
+    mean_outline, = ax.plot([], [], "w-", lw=4, zorder=5)
+    mean_line, = ax.plot([], [], "-", color="tomato", lw=2, zorder=5,
+                         label="Mean trajectory")
+    min_outline, = ax.plot([], [], "w-", lw=4, zorder=6)
+    min_line, = ax.plot([], [], "-", color="lime", lw=2.5, zorder=7,
+                        label="Running min-cost trajectory")
+    title_obj = ax.set_title(f"Replan {replan_idx:04d} — denoising step 0 / {n_frames - 1}")
+    ax.legend(loc="upper right", fontsize=8)
+
+    _running_min = {"cost": float("inf"), "traj": None}
+
+    def _update(frame):
+        mt = mean_trajs[frame]
+        mean_outline.set_data(mt[:, 0], mt[:, 1])
+        mean_line.set_data(mt[:, 0], mt[:, 1])
+
+        if frame < len(sample_trajs) and sample_trajs:
+            st = sample_trajs[frame]
+            segments = [st[k, :, :2] for k in range(len(st))]
+            colors = np.linspace(0, 1, len(st))
+            sample_lc.set_segments(segments)
+            sample_lc.set_array(colors)
+
+            # Track running min-cost trajectory (st[0] = min-cost sample this frame).
+            if frame < len(cost_mins) and cost_mins[frame] < _running_min["cost"]:
+                _running_min["cost"] = cost_mins[frame]
+                _running_min["traj"] = st[0]
+        else:
+            sample_lc.set_segments([])
+
+        if _running_min["traj"] is not None:
+            mt_min = _running_min["traj"]
+            min_outline.set_data(mt_min[:, 0], mt_min[:, 1])
+            min_line.set_data(mt_min[:, 0], mt_min[:, 1])
+        else:
+            min_outline.set_data([], [])
+            min_line.set_data([], [])
+
+        cost_str = ""
+        if frame < len(cost_mins):
+            cost_str = (
+                f"  |  cost_min={cost_mins[frame]:.1f}"
+                f"  global_min={_running_min['cost']:.1f}"
+                f"  cost_mean={cost_means[frame]:.1f}"
+            )
+        title_obj.set_text(
+            f"Replan {replan_idx:04d} — denoising step {frame} / {n_frames - 1}{cost_str}"
+        )
+
+    ani = animation.FuncAnimation(fig, _update, frames=n_frames, interval=1000 // fps)
+
+    from medea_ice_ship.visualization import _animation_writer
+    writer, output_path = _animation_writer(output_path, fps)
+    ani.save(output_path, writer=writer, dpi=120)
+    plt.close(fig)
+
+
 def _save_mbd_replan_viz(
     viz_dir: str,
     replan_idx: int,
@@ -624,9 +3187,10 @@ def _save_mbd_replan_viz(
     cost_map,
     goal_world,
     costmap_weight: float,
-    length_weight: float,
-    goal_weight: float,
-    smoothness_weight: float,
+    costmap_normalizer: float = 1.0,
+    length_weight: float = 1.0,
+    goal_weight: float = 0.1,
+    smoothness_weight: float = 0.005,
     world_polygons=None,
     thicknesses=None,
     lattice_path=None,
@@ -739,15 +3303,59 @@ def _save_mbd_replan_viz(
     plt.close(fig2)
     print(f"  [MBD viz] saved top-{n_top} plot  → {top_path}", flush=True)
 
+    # ── Plot 3: Terminal position scatter ──────────────────────────────────
+    term_xy = trajs[:, -1, :2]  # (Nsample, 2)
+    fig3, ax3 = plt.subplots(figsize=(12, 12))
+    _draw_background(ax3)
+    sc = ax3.scatter(
+        term_xy[:, 0], term_xy[:, 1],
+        c=costs, cmap="RdYlGn_r", s=12, alpha=0.6,
+        vmin=costs.min(), vmax=np.percentile(costs, 90),
+        zorder=4,
+    )
+    plt.colorbar(sc, ax=ax3, label="Total cost")
+    ax3.plot(*ship_xy, "go", ms=10, zorder=6, label="Ship (start)")
+    ax3.plot(*goal_xy, "mx", ms=12, mew=2.5, zorder=6, label="Goal")
+    ax3.set_xlim(*xlim)
+    ax3.set_ylim(*ylim)
+    ax3.set_aspect("equal")
+    ax3.set_xlabel("X [m]")
+    ax3.set_ylabel("Y [m]")
+    ax3.set_title(
+        f"MBD Replan #{replan_idx} — Terminal positions of {len(trajs)} samples\n"
+        f"colour = total cost  |  goal at ({goal_xy[0]:.0f}, {goal_xy[1]:.0f})"
+    )
+    ax3.legend(fontsize=9)
+    plt.tight_layout()
+    scatter_path = os.path.join(viz_dir, f"replan_{replan_idx:04d}_terminal_scatter.png")
+    fig3.savefig(scatter_path, dpi=120, bbox_inches="tight")
+    plt.close(fig3)
+    print(f"  [MBD viz] saved terminal scatter → {scatter_path}", flush=True)
+
     # ── Text: cost decomposition for top-N ────────────────────────────────
-    weights_arr = np.array([costmap_weight, length_weight, goal_weight, smoothness_weight])
+    # Effective costmap weight = costmap_weight / costmap_normalizer
+    effective_costmap_weight = costmap_weight / costmap_normalizer
+    weights_arr = np.array([effective_costmap_weight, length_weight, goal_weight, smoothness_weight])
     comp_names = ["costmap", "length ", "goal   ", "jerk   "]
     comp_jit = jax.jit(components_fn)
 
+    # Geometry summary — helps spot OOB issues immediately
+    cm_x0, cm_y0 = cost_map.x_origin, cost_map.y_origin
+    cm_x1, cm_y1 = cm_x0 + cost_map.width, cm_y0 + cost_map.height
+    traj_len_est = float(np.mean([
+        np.sum(np.linalg.norm(np.diff(trajs[i, :, :2], axis=0), axis=1))
+        for i in sort_idx[:min(5, len(sort_idx))]
+    ]))
     lines = [
         f"MBD Replan #{replan_idx} — Top {n_top} cost breakdown",
-        f"Weights: costmap={costmap_weight:.3f}  length={length_weight:.3f}"
-        f"  goal={goal_weight:.4f}  smoothness={smoothness_weight:.5f}",
+        f"Weights: costmap={costmap_weight:.3f}  normalizer={costmap_normalizer:.4g}"
+        f"  effective_costmap={effective_costmap_weight:.5g}"
+        f"  length={length_weight:.3f}  goal={goal_weight:.4f}  smoothness={smoothness_weight:.5f}",
+        "-" * 72,
+        f"Geometry: costmap [{cm_x0:.0f},{cm_x1:.0f}] x [{cm_y0:.0f},{cm_y1:.0f}]  "
+        f"({cost_map.width:.0f}x{cost_map.height:.0f} m)",
+        f"  ship=({ship_xy[0]:.0f},{ship_xy[1]:.0f})  goal=({goal_xy[0]:.0f},{goal_xy[1]:.0f})  "
+        f"avg traj length={traj_len_est:.0f} m",
         "=" * 72,
     ]
     for rank, idx in enumerate(top_idx):
@@ -761,6 +3369,32 @@ def _save_mbd_replan_viz(
             lines.append(
                 f"  {name}  weighted={w_val:9.3f}  ({pct:5.1f}%)  raw={raw_val:.3f}"
             )
+        # OOB analysis for this trajectory
+        traj_i = trajs[idx]  # (H+1, 3)
+        oob_mask = (
+            (traj_i[:, 0] < cm_x0) | (traj_i[:, 0] > cm_x1) |
+            (traj_i[:, 1] < cm_y0)
+        )
+        n_oob = int(oob_mask.sum())
+        if n_oob > 0:
+            seg_lens_i = np.linalg.norm(np.diff(traj_i[:, :2], axis=0), axis=1)
+            # Estimate OOB cost contribution: each OOB waypoint adds 1e4 × avg(adj seg lens)
+            oob_cost_est = 0.0
+            for t in range(len(traj_i)):
+                if oob_mask[t]:
+                    adj_lens = []
+                    if t > 0:
+                        adj_lens.append(seg_lens_i[t - 1])
+                    if t < len(seg_lens_i):
+                        adj_lens.append(seg_lens_i[t])
+                    oob_cost_est += 1e4 * (sum(adj_lens) / max(len(adj_lens), 1))
+            oob_pct = 100.0 * oob_cost_est / total_cost if total_cost > 0 else 0.0
+            lines.append(
+                f"  *** OOB: {n_oob} waypoints outside costmap  "
+                f"est. OOB cost={oob_cost_est:.0f}  ({oob_pct:.1f}% of total) ***"
+            )
+        else:
+            lines.append(f"  OOB: 0 waypoints outside costmap")
 
     txt_path = os.path.join(viz_dir, f"replan_{replan_idx:04d}_costs.txt")
     with open(txt_path, "w") as f:
@@ -795,6 +3429,41 @@ def jax_mbd_optimize(
     replan_idx: int = 0,
     viz_world_polygons=None,
     viz_thicknesses=None,
+    return_diagnostics: bool = False,
+    return_cost_components: bool = False,
+    goal_y_line: Optional[float] = None,
+    goal_y_line_penalty: float = 1e6,
+    goal_x_weight: Optional[float] = None,
+    denoising_movie_dir: Optional[str] = None,
+    cost_truncate_y: Optional[float] = None,
+    sample_filter_fn=None,
+    max_resample_iters=None,
+    # ── EB-MBD parameters ──────────────────────────────────────────────────
+    use_eb_mbd: bool = False,
+    eb_x_min: Optional[float] = None,
+    eb_x_max: Optional[float] = None,
+    eb_y_min: Optional[float] = None,
+    eb_c_max: Optional[float] = None,
+    eb_mu: Optional[float] = None,
+    eb_kappa: Optional[float] = None,
+    eb_oob_cost: float = 5.0,
+    eb_oob_as_constraint: bool = False,
+    # ── AL-MBD parameters ──────────────────────────────────────────────────
+    use_al_mbd: bool = False,
+    al_x_min: Optional[float] = None,
+    al_x_max: Optional[float] = None,
+    al_y_min: Optional[float] = None,
+    al_y_max: Optional[float] = None,
+    al_rho: Optional[float] = None,
+    al_M_max: Optional[float] = None,
+    # ── SA-MBD parameters ──────────────────────────────────────────────────
+    use_sa_mbd: bool = False,
+    sa_lambda: Optional[float] = None,
+    # ── Homotopy-class MBD parameters ─────────────────────────────────────
+    use_homotopy_mbd: bool = False,
+    homotopy_n_obs_max: int = 3,
+    # ── Hard rectangular obstacles (for EB/AL only) ────────────────────────
+    obstacle_rects: Optional[list] = None,
 ) -> np.ndarray:
     """
     Optimize trajectory using JAX Model-Based Diffusion with 3-DOF dynamics.
@@ -837,9 +3506,13 @@ def jax_mbd_optimize(
     beta0 = getattr(run_cfg, "planning_jax_mbd_beta0", 1e-4)
     betaT = getattr(run_cfg, "planning_jax_mbd_betaT", 0.05)
     costmap_weight = getattr(run_cfg, "planning_jax_mbd_costmap_weight", 1.0)
+    costmap_normalizer = getattr(run_cfg, "planning_jax_mbd_costmap_normalizer", 1.0)
     goal_weight = getattr(run_cfg, "planning_jax_mbd_goal_weight", 0.1)
     length_weight = getattr(run_cfg, "planning_jax_mbd_length_weight", 1.0)
     smoothness_weight = getattr(run_cfg, "planning_jax_mbd_smoothness_weight", 0.005)
+    _cfg_goal_x_weight = getattr(run_cfg, "planning_jax_mbd_goal_x_weight", 0.0)
+    # Explicit argument overrides config; None means "use config value"
+    goal_x_weight = goal_x_weight if goal_x_weight is not None else _cfg_goal_x_weight
     surge_max = getattr(run_cfg, "planning_jax_mbd_surge_max", 2e6)
     sway_max = getattr(run_cfg, "planning_jax_mbd_sway_max", 5e5)
     yaw_max = getattr(run_cfg, "planning_jax_mbd_yaw_max", 5e8)
@@ -847,9 +3520,39 @@ def jax_mbd_optimize(
     n_substeps = getattr(run_cfg, "planning_jax_mbd_n_substeps", 5)
     init_surge_bias = getattr(run_cfg, "planning_jax_mbd_init_surge_bias", 0.7)
     seed = getattr(run_cfg, "planning_diffusion_seed", None) or 42
+    use_best_sample = getattr(run_cfg, "planning_jax_mbd_use_best_sample", False)
+    use_per_class_seeds = getattr(run_cfg, "planning_jax_mbd_homotopy_per_class_seeds", True)
+    use_rf_classifier   = getattr(run_cfg, "planning_jax_mbd_use_rf_classifier", False)
 
     if warm_start is None:
         warm_start = getattr(run_cfg, "planning_jax_mbd_warm_start", True)
+
+    # ── EB-MBD parameters (args override config) ──────────────────────
+    if not use_eb_mbd:
+        use_eb_mbd = getattr(run_cfg, "planning_jax_mbd_use_eb_mbd", False)
+    if eb_c_max is None:
+        eb_c_max = getattr(run_cfg, "planning_jax_mbd_eb_c_max", 500.0)
+    if eb_mu is None:
+        eb_mu = getattr(run_cfg, "planning_jax_mbd_eb_mu", 50000.0)
+    if eb_kappa is None:
+        eb_kappa = getattr(run_cfg, "planning_jax_mbd_eb_kappa", 1.0)
+    # ── AL-MBD parameters (args override config) ──────────────────────
+    if not use_al_mbd:
+        use_al_mbd = getattr(run_cfg, "planning_jax_mbd_use_al_mbd", False)
+    if al_rho is None:
+        al_rho = getattr(run_cfg, "planning_jax_mbd_al_rho", 0.1)
+    if al_M_max is None:
+        al_M_max = getattr(run_cfg, "planning_jax_mbd_al_M_max", 1000.0)
+
+    # ── SA-MBD parameters (args override config) ──────────────────────
+    if not use_sa_mbd:
+        use_sa_mbd = getattr(run_cfg, "planning_jax_mbd_use_sa_mbd", False)
+    if sa_lambda is None:
+        sa_lambda = getattr(run_cfg, "planning_jax_mbd_sa_lambda", 0.05)
+
+    # ── Homotopy-MBD parameters (args override config) ────────────────
+    if not use_homotopy_mbd:
+        use_homotopy_mbd = getattr(run_cfg, "planning_jax_mbd_use_homotopy_mbd", False)
 
     # ── Convert costmap to JAX ────────────────────────────────────────
     grid = jnp.array(cost_map.cost_map, dtype=jnp.float32)
@@ -868,7 +3571,7 @@ def jax_mbd_optimize(
     Izz = (1.0 / 12.0) * mass * (L ** 2 + B ** 2)
 
     sim_cfg = get_default_simulation_config()
-    rollout_fn, _, _ = make_dynamics_rollout(
+    rollout_fn, M3_np, D3_np = make_dynamics_rollout(
         mass=mass,
         Izz=Izz,
         dt_substep=dt_substep,
@@ -906,61 +3609,567 @@ def jax_mbd_optimize(
         cutoff_idx = max(min(cutoff_idx, len(lattice_path)), 2)
 
         truncated = lattice_path[:cutoff_idx]
-        Ybar_init = _warm_start_from_path(truncated, H, init_surge_bias)
+        Ybar_init = _warm_start_from_path(
+            truncated, H, init_surge_bias,
+            eta0=np.array(start_pose, dtype=np.float64),
+            nu0=np.array(start_nu or (2.0, 0.0, 0.0), dtype=np.float64),
+            M3_np=M3_np,
+            D3_np=D3_np,
+            dt_substep=dt_substep,
+            n_substeps=n_substeps,
+            action_center_np=np.array([surge_max / 2, 0.0, 0.0]),
+            action_scale_np=np.array([surge_max / 2, sway_max, yaw_max]),
+        )
 
-    # ── Cost function (costmap + goal + effort + smoothness only) ─────
-    cost_fn = make_cost_fn(
-        grid, meta, goal, rollout_fn, eta0, nu0,
-        action_center, action_scale,
-        costmap_weight=costmap_weight,
-        goal_weight=goal_weight,
-        length_weight=length_weight,
-        smoothness_weight=smoothness_weight,
-        ship_length=L,
-        ship_beam=B,
-    )
+    # ── Cost function and constraint function ─────────────────────────
+    # When a goal line is used, automatically suppress all cost contributions
+    # (costmap and OOB penalties) for waypoints that have already crossed it.
+    # The simulation stops at the goal line, so trajectory portions beyond it
+    # are irrelevant and should not be penalised.
+    effective_truncate_y = cost_truncate_y
+    if effective_truncate_y is None and goal_y_line is not None:
+        effective_truncate_y = goal_y_line
+
+    oob_constraint_fn = None  # set in EB branch below; None elsewhere
+
+    if use_eb_mbd:
+        # EB-MBD: wall cells in the costmap handle OOB for rect-grid scenarios;
+        # the EB linear OOB cost handles disk-costmap scenarios.
+        # Keep oob_penalty=0.0 to avoid penalising hull corners near the grid edge.
+        cost_fn = make_cost_fn(
+            grid, meta, goal, rollout_fn, eta0, nu0,
+            action_center, action_scale,
+            costmap_weight=costmap_weight,
+            costmap_normalizer=costmap_normalizer,
+            goal_weight=goal_weight,
+            length_weight=length_weight,
+            smoothness_weight=smoothness_weight,
+            ship_length=L,
+            ship_beam=B,
+            cost_truncate_y=effective_truncate_y,
+            oob_penalty=0.0,
+        )
+        if goal_y_line is not None and goal_x_weight > 0.0:
+            _gx_fn = make_goal_arrival_x_cost_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
+            )
+            _base_fn = cost_fn
+            cost_fn = lambda u_norm: _base_fn(u_norm) + _gx_fn(u_norm)  # noqa: E731
+        # Resolve EB-MBD boundary parameters (default to costmap extent)
+        _x_min = eb_x_min if eb_x_min is not None else float(cost_map.x_origin)
+        _x_max = (eb_x_max if eb_x_max is not None
+                  else float(cost_map.x_origin) + float(cost_map.width))
+        _y_min = eb_y_min if eb_y_min is not None else float(cost_map.y_origin)
+        _goal_y = float(goal_y_line) if goal_y_line is not None else float(goal[1])
+        constraint_fn = make_goal_constraint_fn(
+            rollout_fn, eta0, nu0, action_center, action_scale,
+            goal_y_line=_goal_y,
+        )
+        if eb_oob_as_constraint:
+            # OOB as a hard EB barrier constraint (combined with goal constraint).
+            oob_constraint_fn = make_oob_constraint_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                x_min=_x_min, x_max=_x_max, y_min=_y_min,
+                cost_truncate_y=effective_truncate_y,
+            )
+        else:
+            # OOB enforcement via linear cost (distance × steps), not a barrier.
+            # A constant log-barrier cancels under Z-score normalisation when all
+            # class members are OOB, making it ineffective.  A proportional cost
+            # provides per-trajectory differentiation and no wall-avoidance bias.
+            if eb_oob_cost > 0.0:
+                _oob_cost_fn = make_oob_cost_fn(
+                    rollout_fn, eta0, nu0, action_center, action_scale,
+                    x_min=_x_min, x_max=_x_max, y_min=_y_min,
+                    oob_cost_per_m=eb_oob_cost,
+                    cost_truncate_y=effective_truncate_y,
+                )
+                _base_cost_fn = cost_fn
+                cost_fn = lambda u: _base_cost_fn(u) + _oob_cost_fn(u)  # noqa: E731
+            oob_constraint_fn = None
+        if obstacle_rects:
+            _rect_fn = make_rect_obstacles_eb_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale, obstacle_rects)
+            _base_c = constraint_fn
+            # Hard obstacle rects combined with goal constraint (share large c_max)
+            constraint_fn = lambda u: jnp.minimum(_base_c(u), _rect_fn(u))  # noqa: E731
+    else:
+        cost_fn = make_cost_fn(
+            grid, meta, goal, rollout_fn, eta0, nu0,
+            action_center, action_scale,
+            costmap_weight=costmap_weight,
+            costmap_normalizer=costmap_normalizer,
+            goal_weight=goal_weight,
+            length_weight=length_weight,
+            smoothness_weight=smoothness_weight,
+            ship_length=L,
+            ship_beam=B,
+            cost_truncate_y=effective_truncate_y,
+        )
+        if goal_y_line is not None:
+            _gl_fn = make_goal_line_cost_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                goal_y_line, goal_y_line_penalty,
+            )
+            _base_fn = cost_fn
+            cost_fn = lambda u_norm: _base_fn(u_norm) + _gl_fn(u_norm)  # noqa: E731
+        if goal_y_line is not None and goal_x_weight > 0.0:
+            _gx_fn = make_goal_arrival_x_cost_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
+            )
+            _prev_fn = cost_fn
+            cost_fn = lambda u_norm: _prev_fn(u_norm) + _gx_fn(u_norm)  # noqa: E731
+        constraint_fn = None
+
+    # ── AL-MBD: build base cost (no OOB penalty) + per-step constraint fn ─
+    al_constraint_fn = None
+    if use_al_mbd:
+        if use_eb_mbd:
+            raise ValueError("use_al_mbd and use_eb_mbd are mutually exclusive.")
+        cost_fn = make_cost_fn(
+            grid, meta, goal, rollout_fn, eta0, nu0,
+            action_center, action_scale,
+            costmap_weight=costmap_weight,
+            costmap_normalizer=costmap_normalizer,
+            goal_weight=goal_weight,
+            length_weight=length_weight,
+            smoothness_weight=smoothness_weight,
+            ship_length=L,
+            ship_beam=B,
+            cost_truncate_y=effective_truncate_y,
+            oob_penalty=1e8,
+        )
+        # Soft goal-line penalty provides gradient signal from step 0; the AL
+        # dual ascent progressively tightens the hard constraint.  Use a smaller
+        # penalty than vanilla MBD (1e4 vs 1e6) so the base cost stays well-
+        # conditioned alongside the AL penalty.
+        if goal_y_line is not None:
+            _gl_fn = make_goal_line_cost_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                goal_y_line, penalty=1e4,
+            )
+            _base_fn = cost_fn
+            cost_fn = lambda u_norm: _base_fn(u_norm) + _gl_fn(u_norm)  # noqa: E731
+        if goal_y_line is not None and goal_x_weight > 0.0:
+            _gx_fn = make_goal_arrival_x_cost_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
+            )
+            _prev_fn = cost_fn
+            cost_fn = lambda u_norm: _prev_fn(u_norm) + _gx_fn(u_norm)  # noqa: E731
+        _al_x_min = al_x_min if al_x_min is not None else float(cost_map.x_origin)
+        _al_x_max = (al_x_max if al_x_max is not None
+                     else float(cost_map.x_origin) + float(cost_map.width))
+        _al_y_min = al_y_min if al_y_min is not None else float(cost_map.y_origin)
+        _al_y_max = (al_y_max if al_y_max is not None
+                     else float(cost_map.y_origin) + float(cost_map.height))
+        # Linear OOB cost: same as EB-MBD approach — provides gradient at the
+        # domain boundary so the class mean never drifts slightly OOB.
+        # The AL dual-ascent constraint is an additional enforcement layer.
+        if eb_oob_cost > 0.0:
+            _oob_cost_fn = make_oob_cost_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale,
+                x_min=_al_x_min, x_max=_al_x_max, y_min=_al_y_min,
+                oob_cost_per_m=eb_oob_cost,
+                cost_truncate_y=effective_truncate_y,
+            )
+            _base_fn_al = cost_fn
+            cost_fn = lambda u: _base_fn_al(u) + _oob_cost_fn(u)  # noqa: E731
+        _al_goal_y = float(goal_y_line) if goal_y_line is not None else float(goal[1])
+        al_constraint_fn = make_al_per_step_constraints_fn(
+            rollout_fn, eta0, nu0, action_center, action_scale,
+            x_min=_al_x_min, x_max=_al_x_max, y_min=_al_y_min, y_max=_al_y_max,
+            goal_y_line=_al_goal_y,
+        )
+        if obstacle_rects:
+            _rect_al_fn = make_rect_obstacles_al_fn(
+                rollout_fn, eta0, nu0, action_center, action_scale, obstacle_rects)
+            _base_al = al_constraint_fn
+            al_constraint_fn = lambda u: jnp.concatenate(  # noqa: E731
+                [_base_al(u), _rect_al_fn(u)], axis=1)
+
+    # ── Homotopy-MBD: detect obstacles once before diffusion loop ────────
+    _homotopy_obstacles = []
+    if use_homotopy_mbd:
+        # Auto-cap n_obs_max so each class gets >= 128 samples.
+        # floor(log2(Nsample/128)) gives the largest k with 2^k <= Nsample/128.
+        import math as _math
+        _min_spc = 128
+        _n_obs_auto = max(0, int(_math.log2(max(1, Nsample / _min_spc))))
+        _n_obs_eff = min(homotopy_n_obs_max, _n_obs_auto)
+        _homotopy_obstacles = detect_obstacles_from_costmap(
+            cost_map, threshold_frac=0.1, n_obs_max=_n_obs_eff,
+        )
+        for _o_idx, _o in enumerate(_homotopy_obstacles):
+            print(
+                f"  H-MBD obs{_o_idx}: body_cx={_o[0]:.0f} corridor_cx={_o[1]:.0f}"
+                f"  cy={_o[2]:.0f} ry={_o[3]:.0f}",
+                flush=True,
+            )
+        print(
+            f"  H-MBD: {len(_homotopy_obstacles)} obstacle(s) → "
+            f"{1 << len(_homotopy_obstacles)} homotopy classes",
+            flush=True,
+        )
+
+    # Per-class seeds: route each class through its passage sequence
+    _homotopy_classify_override = None
+    if use_homotopy_mbd and _homotopy_obstacles:
+        _start_xy  = (float(start_pose[0]), float(start_pose[1]))
+        _goal_xy   = (float(goal[0]),       float(goal[1]))
+        _start_psi = float(start_pose[2])
+
+        if use_per_class_seeds:
+            from medea_ice_ship.homotopy_rf import generate_per_class_waypoints
+            _class_wpts = generate_per_class_waypoints(
+                _homotopy_obstacles, _start_xy, _goal_xy, _start_psi,
+            )
+            Ybar_init = [
+                _warm_start_from_path(wpts, H, init_surge_bias)
+                for wpts in _class_wpts
+            ]
+            print(
+                f"  H-MBD: per-class seeds generated for {len(Ybar_init)} classes",
+                flush=True,
+            )
+        if use_rf_classifier:
+            from medea_ice_ship.homotopy_rf import make_rf_homotopy_classifier
+            _rf_fn, _rf_nc = make_rf_homotopy_classifier(_homotopy_obstacles, _start_xy)
+            _homotopy_classify_override = (_rf_fn, _rf_nc)
+            print(f"  H-MBD: using Hernandez reference-frame classifier", flush=True)
 
     # ── Run MBD (importance-weighted score ascent) ────────────────────
+    if use_eb_mbd and use_homotopy_mbd:
+        _algo = "EB-H-MBD"
+    elif use_al_mbd and use_homotopy_mbd:
+        _algo = "AL-H-MBD"
+    elif use_homotopy_mbd:
+        _algo = "H-MBD"
+    elif use_al_mbd:
+        _algo = "AL-MBD"
+    elif use_eb_mbd:
+        _algo = "EB-MBD"
+    elif use_sa_mbd:
+        _algo = "SA-MBD"
+    else:
+        _algo = "MBD"
     ws_label = "warm-started from A*" if Ybar_init is not None else "cold start (no A* prior)"
     backend = _jax_backend_info()
     print(
-        f"  JAX MBD [{backend}]: H={H}, Nsample={Nsample}, Ndiffuse={Ndiffuse}, "
+        f"  JAX {_algo} [{backend}]: H={H}, Nsample={Nsample}, Ndiffuse={Ndiffuse}, "
         f"temp={temperature}, dt_action={dt_action}s, {ws_label}",
         flush=True,
     )
+    if use_eb_mbd:
+        print(
+            f"  EB-MBD barrier: c_max={eb_c_max:.1f}, mu={eb_mu:.0f}, kappa={eb_kappa:.2f}",
+            flush=True,
+        )
+    if use_al_mbd:
+        print(
+            f"  AL-MBD: rho={al_rho:.4g}, M_max={al_M_max:.4g}",
+            flush=True,
+        )
+    if use_sa_mbd:
+        print(
+            f"  SA-MBD: sa_lambda={sa_lambda:.4g}",
+            flush=True,
+        )
     import time as _time
     _t0 = _time.perf_counter()
-    Ybar_final, cost_mean, cost_min = run_mbd(
-        cost_fn, H, Nsample, Ndiffuse, temperature,
-        beta0, betaT, seed,
-        Ybar_init=Ybar_init,
-        init_surge_bias=init_surge_bias,
-    )
+    _diagnostics = None
+    # Run diagnostics mode when explicitly requested OR when a denoising movie is wanted
+    _need_diagnostics = return_diagnostics or (denoising_movie_dir is not None)
+    if _need_diagnostics:
+        if use_eb_mbd and use_homotopy_mbd:
+            _diagnostics = run_eb_homotopy_mbd_with_diagnostics(
+                cost_fn, constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                eb_c_max=eb_c_max,
+                eb_mu=eb_mu,
+                eb_kappa=eb_kappa,
+                obstacles=_homotopy_obstacles,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+                oob_constraint_fn=oob_constraint_fn,
+                eb_c_max_oob=0.0,
+                classify_fn_override=_homotopy_classify_override,
+            )
+        elif use_al_mbd and use_homotopy_mbd:
+            _diagnostics = run_al_homotopy_mbd_with_diagnostics(
+                cost_fn, al_constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                al_rho=al_rho,
+                al_M_max=al_M_max,
+                obstacles=_homotopy_obstacles,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+                classify_fn_override=_homotopy_classify_override,
+            )
+        elif use_homotopy_mbd:
+            _diagnostics = run_homotopy_mbd_with_diagnostics(
+                cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                obstacles=_homotopy_obstacles,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+                classify_fn_override=_homotopy_classify_override,
+            )
+        elif use_al_mbd:
+            _diagnostics = run_al_mbd_with_diagnostics(
+                cost_fn, al_constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                al_rho=al_rho,
+                al_M_max=al_M_max,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+            )
+        elif use_eb_mbd:
+            _diagnostics = run_eb_mbd_with_diagnostics(
+                cost_fn, constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                eb_c_max=eb_c_max,
+                eb_mu=eb_mu,
+                eb_kappa=eb_kappa,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+                oob_constraint_fn=oob_constraint_fn,
+                eb_c_max_oob=0.0,
+            )
+        elif use_sa_mbd:
+            _diagnostics = run_sa_mbd_with_diagnostics(
+                cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                sa_lambda=sa_lambda,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+            )
+        else:
+            _diagnostics = run_mbd_with_diagnostics(
+                cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=Nsample,
+                sample_filter_fn=sample_filter_fn,
+                max_resample_iters=max_resample_iters,
+            )
+        # Use cost stats from final diagnostics step
+        cost_mean = _diagnostics["cost_means"][-1] if _diagnostics["cost_means"] else float("nan")
+        cost_min = _diagnostics["cost_mins"][-1] if _diagnostics["cost_mins"] else float("nan")
+        Ybar_final = _diagnostics["Ybar_final"]  # normalized action sequence (H, 3)
+    else:
+        if use_eb_mbd and use_homotopy_mbd:
+            _h_diag = run_eb_homotopy_mbd_with_diagnostics(
+                cost_fn, constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                eb_c_max=eb_c_max,
+                eb_mu=eb_mu,
+                eb_kappa=eb_kappa,
+                obstacles=_homotopy_obstacles,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=1,
+                oob_constraint_fn=oob_constraint_fn,
+                eb_c_max_oob=0.0,
+                classify_fn_override=_homotopy_classify_override,
+            )
+            Ybar_final = _h_diag["Ybar_final"]
+            cost_mean  = _h_diag["cost_means"][-1] if _h_diag["cost_means"] else float("nan")
+            cost_min   = _h_diag["cost_mins"][-1]  if _h_diag["cost_mins"]  else float("nan")
+        elif use_al_mbd and use_homotopy_mbd:
+            _alh_diag = run_al_homotopy_mbd_with_diagnostics(
+                cost_fn, al_constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                al_rho=al_rho,
+                al_M_max=al_M_max,
+                obstacles=_homotopy_obstacles,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=1,
+                classify_fn_override=_homotopy_classify_override,
+            )
+            Ybar_final = _alh_diag["Ybar_final"]
+            cost_mean  = _alh_diag["cost_means"][-1] if _alh_diag["cost_means"] else float("nan")
+            cost_min   = _alh_diag["cost_mins"][-1]  if _alh_diag["cost_mins"]  else float("nan")
+        elif use_homotopy_mbd:
+            _h_diag = run_homotopy_mbd_with_diagnostics(
+                cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                obstacles=_homotopy_obstacles,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=1,
+                classify_fn_override=_homotopy_classify_override,
+            )
+            Ybar_final = _h_diag["Ybar_final"]
+            cost_mean  = _h_diag["cost_means"][-1] if _h_diag["cost_means"] else float("nan")
+            cost_min   = _h_diag["cost_mins"][-1]  if _h_diag["cost_mins"]  else float("nan")
+        elif use_al_mbd:
+            _al_diag = run_al_mbd_with_diagnostics(
+                cost_fn, al_constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                al_rho=al_rho,
+                al_M_max=al_M_max,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=1,
+            )
+            Ybar_final = _al_diag["Ybar_final"]
+            cost_mean  = _al_diag["cost_means"][-1] if _al_diag["cost_means"] else float("nan")
+            cost_min   = _al_diag["cost_mins"][-1]  if _al_diag["cost_mins"]  else float("nan")
+        elif use_eb_mbd:
+            _eb_diag = run_eb_mbd_with_diagnostics(
+                cost_fn, constraint_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                eb_c_max=eb_c_max,
+                eb_mu=eb_mu,
+                eb_kappa=eb_kappa,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=1,
+                oob_constraint_fn=oob_constraint_fn,
+                eb_c_max_oob=0.0,
+            )
+            Ybar_final = _eb_diag["Ybar_final"]
+            cost_mean  = _eb_diag["cost_means"][-1] if _eb_diag["cost_means"] else float("nan")
+            cost_min   = _eb_diag["cost_mins"][-1]  if _eb_diag["cost_mins"]  else float("nan")
+        elif use_sa_mbd:
+            _sa_diag = run_sa_mbd_with_diagnostics(
+                cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, Ndiffuse, temperature, beta0, betaT, seed,
+                sa_lambda=sa_lambda,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+                n_top_samples=1,
+            )
+            Ybar_final = _sa_diag["Ybar_final"]
+            cost_mean  = _sa_diag["cost_means"][-1] if _sa_diag["cost_means"] else float("nan")
+            cost_min   = _sa_diag["cost_mins"][-1]  if _sa_diag["cost_mins"]  else float("nan")
+        else:
+            Ybar_final, cost_mean, cost_min = run_mbd(
+                cost_fn, H, Nsample, Ndiffuse, temperature,
+                beta0, betaT, seed,
+                Ybar_init=Ybar_init,
+                init_surge_bias=init_surge_bias,
+            )
     _elapsed = _time.perf_counter() - _t0
     print(
-        f"  JAX MBD done ({_elapsed:.1f}s): cost_mean={cost_mean:.1f}, cost_min={cost_min:.1f}",
+        f"  JAX {_algo} done ({_elapsed:.1f}s): cost_mean={cost_mean:.1f}, cost_min={cost_min:.1f}",
         flush=True,
     )
+    if _diagnostics is not None and _diagnostics["cost_mins"]:
+        _cost_mins_arr = np.array(_diagnostics["cost_mins"])
+        _cost_of_mean_arr = np.array(_diagnostics["cost_of_mean"])
+        _global_min_cost = float(_cost_mins_arr.min())
+        _global_min_step = int(_cost_mins_arr.argmin())
+        _n_steps = len(_cost_mins_arr)
+        _last_step_min = float(_cost_mins_arr[-1])
+        _last_step_std = float(np.std(_diagnostics["sample_costs"][-1]))
+        _final_cost = float(jax.jit(cost_fn)(Ybar_final))
+        # Best cost_of_mean ever achieved (closest the mean got to the good basin)
+        _mean_best_cost = float(_cost_of_mean_arr.min())
+        _mean_best_step = int(_cost_of_mean_arr.argmin())
+        print(
+            f"  [MBD debug] "
+            f"final_traj={_final_cost:.1f} | "
+            f"last_step: best={_last_step_min:.1f}, std={_last_step_std:.1f} | "
+            f"global_min={_global_min_cost:.1f} at step {_global_min_step}/{_n_steps - 1} | "
+            f"mean_best={_mean_best_cost:.1f} at step {_mean_best_step}/{_n_steps - 1}",
+            flush=True,
+        )
+        # Per-step table: step | cost_of_mean | cost_min | gap
+        print(f"  [MBD debug] step-by-step (cost_of_mean | cost_min | gap):", flush=True)
+        for _s in range(_n_steps):
+            _com = _cost_of_mean_arr[_s]
+            _cmin = _cost_mins_arr[_s]
+            _marker = " <-- global min" if _s == _global_min_step else ""
+            _marker2 = " <-- mean best" if _s == _mean_best_step and _mean_best_step != _global_min_step else ""
+            print(f"    step {_s:3d}: mean={_com:10.1f} | best_sample={_cmin:10.1f} | gap={_com - _cmin:10.1f}{_marker}{_marker2}", flush=True)
+
+        # ── Action-space convexity probe ──────────────────────────────────────
+        # Interpolate between the global best and its same-step 2nd-best sample
+        # across alpha in [0, 1].  If the midpoint cost >> both endpoints, the
+        # cost landscape is non-convex in action space (the "banana" problem).
+        _Ya = _diagnostics["best_sample_actions"]
+        _Yb = _diagnostics["second_best_sample_actions"]
+        if _Ya is not None and _Yb is not None:
+            _cost_fn_jit = jax.jit(cost_fn)
+            _alphas = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+            _interp_costs = []
+            for _a in _alphas:
+                _Ymix = jnp.array((1.0 - _a) * _Ya + _a * _Yb)
+                _interp_costs.append(float(_cost_fn_jit(_Ymix)))
+            print(
+                f"  [MBD convexity] best={_diagnostics['best_sample_cost']:.1f}, "
+                f"2nd_best={_diagnostics['second_best_sample_cost']:.1f}",
+                flush=True,
+            )
+            print(
+                f"  [MBD convexity] action-space interpolation (alpha=0 is best, alpha=1 is 2nd-best):",
+                flush=True,
+            )
+            for _a, _c in zip(_alphas, _interp_costs):
+                _excess = _c - min(_interp_costs[0], _interp_costs[-1])
+                print(f"    alpha={_a:.2f}: cost={_c:10.1f}  (+{_excess:.1f} above lower endpoint)", flush=True)
 
     # ── Optional: generate replan visualizations ──────────────────────
+    # Static plots (density / top-N / cost breakdown): use final-step samples.
+    # When diagnostics are available (denoising movie path), derive from them.
+    # Otherwise fall back to the cheap single-step resample.
     if viz_dir is not None:
         components_fn = make_cost_components_fn(
             grid, meta, goal, rollout_fn, eta0, nu0,
             action_center, action_scale,
             ship_length=L, ship_beam=B,
         )
-        trajs_viz, costs_viz, Y0s_viz = _sample_final_step(
-            Ybar_final, cost_fn, rollout_fn, eta0, nu0,
-            action_center, action_scale,
-            H, Nsample, beta0, betaT, Ndiffuse, seed,
-        )
+        if _need_diagnostics and _diagnostics is not None:
+            # Last step samples are already in diagnostics — use for density/scatter plots.
+            trajs_viz = _diagnostics["sample_trajectories"][-1]
+            costs_viz = _diagnostics["sample_costs"][-1]
+            Ybar_for_viz = _diagnostics["Ybar_final"]  # normalized action sequence (H, 3)
+            # Y0s_norm not stored in diagnostics; resample around Ybar_final to get real
+            # action sequences for the cost-breakdown text file (cheap single forward pass).
+            _, _, Y0s_viz = _sample_final_step(
+                Ybar_for_viz, cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, beta0, betaT, Ndiffuse, seed,
+            )
+        else:
+            trajs_viz, costs_viz, Y0s_viz = _sample_final_step(
+                Ybar_final, cost_fn, rollout_fn, eta0, nu0,
+                action_center, action_scale,
+                H, Nsample, beta0, betaT, Ndiffuse, seed,
+            )
+            Ybar_for_viz = Ybar_final
         _save_mbd_replan_viz(
             viz_dir=viz_dir,
             replan_idx=replan_idx,
             trajs=trajs_viz,
             costs=costs_viz,
             Y0s_norm=Y0s_viz,
-            Ybar_final=Ybar_final,
+            Ybar_final=Ybar_for_viz,
             rollout_fn=rollout_fn,
             eta0=eta0,
             nu0=nu0,
@@ -970,6 +4179,7 @@ def jax_mbd_optimize(
             cost_map=cost_map,
             goal_world=goal,
             costmap_weight=costmap_weight,
+            costmap_normalizer=costmap_normalizer,
             length_weight=length_weight,
             goal_weight=goal_weight,
             smoothness_weight=smoothness_weight,
@@ -977,9 +4187,91 @@ def jax_mbd_optimize(
             thicknesses=viz_thicknesses,
         )
 
+    # ── Optional: denoising movie ─────────────────────────────────────
+    if denoising_movie_dir is not None and _diagnostics is not None:
+        import os
+        os.makedirs(denoising_movie_dir, exist_ok=True)
+        movie_path = os.path.join(denoising_movie_dir, f"replan_{replan_idx:04d}_denoising.mp4")
+        _xlim = (cost_map.x_origin, cost_map.x_origin + cost_map.width)
+        _ylim = (cost_map.y_origin, cost_map.y_origin + cost_map.height)
+        _generate_denoising_movie_from_diagnostics(
+            diag=_diagnostics,
+            cost_map=cost_map,
+            world_polygons=viz_world_polygons,
+            thicknesses=viz_thicknesses,
+            goal_y_line=goal_y_line,
+            goal=goal,
+            x_min=_xlim[0], x_max=_xlim[1],
+            y_min=_ylim[0], y_max=_ylim[1],
+            replan_idx=replan_idx,
+            output_path=movie_path,
+        )
+
     # ── Roll out final trajectory ─────────────────────────────────────
     rollout_jit = jax.jit(rollout_fn)
-    u_phys = Ybar_final * action_scale + action_center
-    traj = rollout_jit(eta0, nu0, u_phys)
+    if use_best_sample and _diagnostics is not None and _diagnostics["best_sample_actions"] is not None:
+        # Use the best individual sample action sequence found across all denoising steps
+        best_actions_norm = jnp.array(_diagnostics["best_sample_actions"])
+        u_phys_best = best_actions_norm * action_scale + action_center
+        traj = np.array(rollout_jit(eta0, nu0, u_phys_best))
+        print(
+            f"  [MBD best-sample] using best sample (cost={_diagnostics['best_sample_cost']:.1f}) "
+            f"instead of Ybar_final (cost={float(cost_fn(Ybar_final)):.1f})",
+            flush=True,
+        )
+    elif return_diagnostics:
+        # Final trajectory is already the last mean trajectory captured in diagnostics
+        traj = _diagnostics["mean_trajectories"][-1]
+    else:
+        u_phys = Ybar_final * action_scale + action_center
+        traj = np.array(rollout_jit(eta0, nu0, u_phys))
 
-    return np.array(traj)
+    # ── Optionally compute raw (unweighted) cost components ───────────
+    # Only supported on the fast path (not return_diagnostics) since we need
+    # Ybar_final as an action sequence.
+    _cost_components = None
+    if return_cost_components and not return_diagnostics:
+        comp_fn = jax.jit(make_cost_components_fn(
+            grid, meta, goal, rollout_fn, eta0, nu0,
+            action_center, action_scale,
+            ship_length=L, ship_beam=B,
+        ))
+        comps = np.array(comp_fn(Ybar_final))
+        _cost_components = {
+            "costmap_cost": float(comps[0]),
+            "path_length": float(comps[1]),
+            "goal_dist": float(comps[2]),
+            "smoothness": float(comps[3]),
+            "costmap_normalizer": costmap_normalizer,
+            "weights": {
+                "costmap": costmap_weight,
+                "length": length_weight,
+                "goal": goal_weight,
+                "smoothness": smoothness_weight,
+            },
+            # total_weighted uses the *effective* costmap weight (divided by normalizer)
+            # so it matches the actual cost evaluated by make_cost_fn.
+            "total_weighted": float(
+                (costmap_weight / costmap_normalizer) * comps[0]
+                + length_weight * comps[1]
+                + goal_weight * comps[2]
+                + smoothness_weight * comps[3]
+            ),
+        }
+
+    if return_diagnostics:
+        # Attach the warm-start rollout so callers can compare it against the
+        # RRT path and the final MBD trajectory.
+        if _diagnostics is not None and Ybar_init is not None:
+            try:
+                _ws_arr = jnp.array(Ybar_init, dtype=jnp.float32)
+                if _ws_arr.ndim == 2:
+                    _ws_phys = _ws_arr * action_scale + action_center
+                    _ws_traj = np.array(jax.jit(rollout_fn)(eta0, nu0, _ws_phys))
+                    _diagnostics["warmstart_trajectory"] = _ws_traj
+            except Exception:
+                pass
+        return traj, _diagnostics
+    if return_cost_components:
+        return traj, _cost_components
+    return traj
