@@ -116,9 +116,16 @@ def get_scenario(block: str, scenario_id: str) -> ScenarioSpec:
     raise ValueError(f"Scenario {scenario_id!r} not found in block {block!r}")
 
 
+ICE_Y_START: float = 100.0   # m — clear water below ship start
+ICE_Y_END:   float = GOAL_Y_LINE  # m — no ice past the goal line
+
+
 def make_ice_field(spec: ScenarioSpec, seed: int) -> dict:
     """
     Generate an ice field for the given scenario and random seed.
+
+    Ice is placed in x ∈ [0, MAP_WIDTH] and y ∈ [ICE_Y_START, ICE_Y_END].
+    generate_ice_field() centers x at 0, so we shift by +MAP_WIDTH/2 afterwards.
 
     Returns the generate_ice_field() dict (keys: polygons, centroids,
     thicknesses, concentration, domain) with thicknesses overridden
@@ -127,13 +134,22 @@ def make_ice_field(spec: ScenarioSpec, seed: int) -> dict:
     A separate RNG (seed + 10_000) is used for thickness assignment so
     that the ice layout (positions, shapes) is determined solely by seed.
     """
+    ice_height = ICE_Y_END - ICE_Y_START  # 600 m
+
     field = generate_ice_field(
         concentration=spec.concentration,
-        map_shape=(MAP_LENGTH, MAP_WIDTH),
+        map_shape=(ice_height, MAP_WIDTH),
+        ice_start_y=ICE_Y_START,
         min_radius=FLOE_RADIUS_MIN,
         max_radius=FLOE_RADIUS_MAX,
         seed=seed,
     )
+
+    # Shift x from [-MAP_WIDTH/2, +MAP_WIDTH/2] to [0, MAP_WIDTH]
+    x_shift = np.array([MAP_WIDTH / 2.0, 0.0])
+    field["polygons"]  = [p + x_shift for p in field["polygons"]]
+    field["centroids"] = field["centroids"] + x_shift
+    field["domain"]    = (X_LO, X_HI, ICE_Y_START, ICE_Y_END)
 
     n = len(field["polygons"])
     rng = np.random.RandomState(seed + 10_000)

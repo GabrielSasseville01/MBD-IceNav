@@ -65,6 +65,26 @@ def make_dynamics_rollout(
     _m11 = jnp.float32(m11)
     _m22 = jnp.float32(m22)
     _dt = jnp.float32(dt_substep)
+    # Explicit float32 constants so that Python floats (which become float64
+    # when jax_enable_x64=True) do not promote the heading arithmetic to float64,
+    # which would change the scan carry dtype and corrupt the rollout.
+    _pi  = jnp.float32(3.141592653589793)
+    _2pi = jnp.float32(6.283185307179586)
+    # Velocity clipping to prevent float32 overflow from the Coriolis instability.
+    # Under large yaw torques the coupled surge/sway/yaw Euler ODE has an
+    # unstable mode (eigenvalue > 0) that causes velocities to grow
+    # exponentially, producing NaN via inf−inf.  The clips must also be
+    # physically realistic: with ±30 m/s clips the rollout quickly hits 30 m/s,
+    # producing a ~23 km arc-length path; the goal sits at only 1.6% of that
+    # arc, so the simulation traverses it far faster than the intended 4 m/s.
+    # Physically:
+    #   terminal surge  = surge_max / (mass × damping_xy) ≈ 4.35 m/s
+    #   terminal sway   = sway_max  / (mass × damping_xy) ≈ 1.09 m/s
+    #   terminal yaw    = yaw_max   / (Izz  × damping_psi) ≈ 0.07 rad/s
+    # Clips are set to 1.5–7× terminal so the planner can still explore
+    # fast and sharp-turn trajectories while keeping arc-lengths realistic.
+    _nu_lo = jnp.array([-3.0, -2.0, -0.5], dtype=jnp.float32)
+    _nu_hi = jnp.array([ 6.0,  2.0,  0.5], dtype=jnp.float32)
 
     def _euler_step(state, tau):
         """Single Euler sub-step.  state = [eta(3); nu(3)]."""
@@ -76,12 +96,12 @@ def make_dynamics_rollout(
             (_m22 - _m11) * nu[0] * nu[1],
         ])
         nu_dot = M3_inv_diag * (tau - C_nu - D3_diag * nu)
-        nu_new = nu + _dt * nu_dot
+        nu_new = jnp.clip(nu + _dt * nu_dot, _nu_lo, _nu_hi)
         c = jnp.cos(eta[2])
         s = jnp.sin(eta[2])
         vx = c * nu_new[0] - s * nu_new[1]
         vy = s * nu_new[0] + c * nu_new[1]
-        psi_new = (eta[2] + _dt * nu_new[2] + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        psi_new = (eta[2] + _dt * nu_new[2] + _pi) % _2pi - _pi
         eta_new = jnp.stack([eta[0] + _dt * vx, eta[1] + _dt * vy, psi_new])
         return jnp.concatenate([eta_new, nu_new]), None
 
@@ -618,10 +638,15 @@ def _make_raw_components_fn(
             )
             y_mask = (prev_cummax < _truncate_y).astype(jnp.float32)
             wp_costs = wp_costs * y_mask
+            # Mask path-length the same way: only count segments before goal crossing.
+            # Without this, a long horizon (e.g. H=800, dt=5s → 4000s rollout) makes
+            # path_length ~56 km regardless of trajectory quality, collapsing reward
+            # variance to zero and causing softmax overflow (NaN weights).
+            path_length = (seg_lens * y_mask[:-1]).sum()
+        else:
+            path_length = seg_lens.sum()
         seg_costmap = 0.5 * (wp_costs[:-1] + wp_costs[1:]) * seg_lens
         costmap_cost = seg_costmap.sum()
-
-        path_length = seg_lens.sum()
 
         # Exponentially-discounted running mean goal distance (same as cost_fn).
         H_plus1 = traj.shape[0]
@@ -739,6 +764,71 @@ def make_goal_line_cost_fn(
         # max_y = jnp.max(traj[:, 1])
         y_final = traj[-1, 1]
         return jnp.where(y_final >= _goal_y, jnp.float32(0.0), _penalty)
+
+    return fn
+
+
+def make_terminal_goal_distance_cost_fn(
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    goal_x: float,
+    goal_y_line: float,
+    weight: float = 1.0,
+):
+    """
+    Distance-to-goal cost that ignores anything past the goal line.
+
+    Two regimes (selected by whether any waypoint crosses ``goal_y_line``):
+
+      • Trajectory reaches/crosses the goal line:
+            cost = weight · |x_crossing - goal_x|
+        ``x_crossing`` is linearly interpolated between the two waypoints
+        straddling the first ``y >= goal_y_line`` transition.  This way
+        anything the trajectory does *after* crossing the line (sideways
+        drift, overshoot in y) is not penalised.
+
+      • Trajectory misses the goal (no waypoint reaches goal_y_line):
+            cost = weight · sqrt( (x_final - goal_x)² + (goal_y_line - y_final)² )
+        Full Euclidean distance from the final waypoint to the goal point.
+        Provides smooth gradient information in BOTH x and y so misses
+        still feel a pull toward the goal.
+
+    A tiny ε is added inside the sqrt on the miss branch for differentiability
+    at the goal.
+    """
+    _goal_x = jnp.float32(goal_x)
+    _goal_y = jnp.float32(goal_y_line)
+    _weight = jnp.float32(weight)
+    _eps_sq = jnp.float32(1e-6)
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)            # (H+1, 3)
+
+        # ── First crossing of goal_y_line ────────────────────────────────
+        crossed = (traj[:, 1] >= _goal_y).astype(jnp.int32)
+        any_crossed = crossed.sum() > 0
+        i1 = jnp.argmax(crossed)                        # 0 if never crossed
+        i0 = jnp.maximum(i1 - 1, 0)
+        y0 = traj[i0, 1]
+        y1 = traj[i1, 1]
+        x0 = traj[i0, 0]
+        x1 = traj[i1, 0]
+        dy_seg = y1 - y0
+        frac = jnp.where(dy_seg > 1e-6, (_goal_y - y0) / dy_seg, 0.0)
+        frac = jnp.clip(frac, 0.0, 1.0)
+        x_crossing = x0 + frac * (x1 - x0)
+
+        # ── Two regimes ──────────────────────────────────────────────────
+        cost_reach = jnp.abs(x_crossing - _goal_x)
+        dx_miss    = traj[-1, 0] - _goal_x
+        dy_miss    = _goal_y - traj[-1, 1]
+        cost_miss  = jnp.sqrt(dx_miss * dx_miss + dy_miss * dy_miss + _eps_sq)
+
+        return _weight * jnp.where(any_crossed, cost_reach, cost_miss)
 
     return fn
 
@@ -925,6 +1015,76 @@ def make_goal_constraint_fn(
         u_phys = u_norm * action_scale + action_center
         traj = rollout_fn(eta0, nu0, u_phys)
         return traj[-1, 1] - _goal_y
+
+    return fn
+
+
+def make_ice_cost_constraint_fn(
+    grid: jnp.ndarray,
+    meta: dict,
+    rollout_fn,
+    eta0: jnp.ndarray,
+    nu0: jnp.ndarray,
+    action_center: jnp.ndarray,
+    action_scale: jnp.ndarray,
+    ice_threshold: float = 0.0,
+    cost_truncate_y: Optional[float] = None,
+    ship_length: float = 0.0,
+    ship_beam: float = 0.0,
+):
+    """
+    Ice-avoidance constraint for EB-MBD.
+
+    Returns g_ice(u_norm) = ice_threshold - total_costmap_integral_along_traj.
+
+      g_ice >= 0  ⟺  total ice cost <= ice_threshold  (trajectory avoids ice)
+      g_ice <  0  ⟺  trajectory hits ice (infeasible under the EB barrier)
+
+    With ice_threshold=0.0 (default), any ice contact is infeasible.
+    Uses the same trapezoid-rule costmap integral as make_cost_fn, with
+    optional hull footprint sampling and goal-line truncation.
+    """
+    query = _make_query(grid, meta, oob_penalty=0.0)
+    _threshold = jnp.float32(ice_threshold)
+    _has_truncate = cost_truncate_y is not None
+    _truncate_y = jnp.float32(cost_truncate_y if cost_truncate_y is not None else 0.0)
+
+    half_l = float(ship_length) / 2.0
+    half_w = float(ship_beam) / 2.0
+    use_hull = ship_length > 0 and ship_beam > 0
+
+    if use_hull:
+        _dx_body = jnp.array([0.0, half_l, half_l, -half_l, -half_l], dtype=jnp.float32)
+        _dy_body = jnp.array([0.0, half_w, -half_w, half_w, -half_w], dtype=jnp.float32)
+
+        def _point_cost(point):
+            c, s = jnp.cos(point[2]), jnp.sin(point[2])
+            wx = point[0] + c * _dx_body - s * _dy_body
+            wy = point[1] + s * _dx_body + c * _dy_body
+            return jnp.max(jax.vmap(query)(wx, wy))
+    else:
+        def _point_cost(point):
+            return query(point[0], point[1])
+
+    def fn(u_norm):
+        u_phys = u_norm * action_scale + action_center
+        traj = rollout_fn(eta0, nu0, u_phys)
+
+        diffs = jnp.diff(traj[:, :2], axis=0)
+        seg_lens = jnp.sqrt(jnp.sum(diffs ** 2, axis=1) + 1e-8)
+
+        wp_costs = jax.vmap(_point_cost)(traj)
+        if _has_truncate:
+            y_cummax = jnp.maximum.accumulate(traj[:, 1])
+            prev_cummax = jnp.concatenate(
+                [jnp.array([jnp.float32(-1e9)]), y_cummax[:-1]]
+            )
+            y_mask = (prev_cummax < _truncate_y).astype(jnp.float32)
+            wp_costs = wp_costs * y_mask
+
+        seg_costmap = 0.5 * (wp_costs[:-1] + wp_costs[1:]) * seg_lens
+        total_ice_cost = seg_costmap.sum()
+        return _threshold - total_ice_cost
 
     return fn
 
@@ -1229,8 +1389,11 @@ def run_mbd_with_diagnostics(
         mask of shape ``(Nsample,)`` where ``True`` means the sample is
         *valid* (e.g., non-OOB and goal-achieving).  When provided, invalid
         samples are filtered out once (no resampling); only the remaining
-        valid samples are used for cost evaluation and the weighted mean.
-        If no valid samples remain the step falls back to the full batch.
+        valid samples are used for cost evaluation and the weighted mean
+        (i.e. invalid samples receive zero weight — indicator-function
+        rejection).  If no valid samples remain at a step, ``Ybar_c`` is
+        left unchanged for that step (rather than letting the rejected
+        pool drive the mean).
     max_resample_iters : int or None
         Ignored — kept for API compatibility only (filter-once mode does not
         resample).
@@ -1279,6 +1442,11 @@ def run_mbd_with_diagnostics(
         "second_best_sample_cost": float("inf"),
         "accept_rates": [],      # fraction of valid samples per step (1.0 when no filter)
         "n_total_sampled": [],   # total draws per step (>= Nsample)
+        # Top-N trajectories from the rejected pool per step. Same shape as
+        # sample_trajectories. Empty list entry when no filter or all samples
+        # accepted. Used by the denoising movie to render rejected samples
+        # in a distinct colour.
+        "rejected_sample_trajectories": [],
     }
 
     def _rollout_actions(u_norm):
@@ -1300,24 +1468,37 @@ def run_mbd_with_diagnostics(
 
         # ── Reject sampling (filter-once, no replacement) ────────────────────
         _n_valid = Nsample
+        _valid_mask = None
+        _trajs_pre_filter = None
+        _Y0s_pre_filter = None
         if sample_filter_fn is not None:
             _u_check = Y0s * action_scale[None] + action_center[None]
-            _trajs_check = np.array(rollout_batch(eta0, nu0, _u_check))
-            _valid = np.array(sample_filter_fn(np.array(Y0s), _trajs_check))
+            _trajs_pre_filter = np.array(rollout_batch(eta0, nu0, _u_check))
+            _valid = np.array(sample_filter_fn(np.array(Y0s), _trajs_pre_filter))
             _n_valid = int(_valid.sum())
+            _valid_mask = _valid
+            _Y0s_pre_filter = Y0s
             if _n_valid > 0:
                 Y0s = Y0s[_valid]   # keep only valid samples (no resample)
-            # else: fallback — keep all samples (too few constraints satisfied)
         # ─────────────────────────────────────────────────────────────────────
 
-        costs = cost_batch(Y0s)
-        rews = -costs
-        rew_mean = rews.mean()
-        rew_std = jnp.maximum(rews.std(), 1e-6)
-        logp0 = (rews - rew_mean) / rew_std / temperature
-        w = jax.nn.softmax(logp0)
+        if sample_filter_fn is not None and _n_valid == 0:
+            # Indicator-function weighting: all weights are zero, so no sample
+            # contributes to the mean. Keep Ybar_c unchanged this step rather
+            # than dragging it toward the (constraint-violating) full sample
+            # pool. Build placeholder diagnostics over the pre-filter pool.
+            costs = cost_batch(_Y0s_pre_filter)
+            w = jnp.zeros((_Y0s_pre_filter.shape[0],), dtype=jnp.float32)
+            Ybar_new = Ybar_c
+        else:
+            costs = cost_batch(Y0s)
+            rews = -costs
+            rew_mean = rews.mean()
+            rew_std = jnp.maximum(rews.std(), 1e-6)
+            logp0 = (rews - rew_mean) / rew_std / temperature
+            w = jax.nn.softmax(logp0)
 
-        Ybar_new = jnp.einsum("n,nij->ij", w, Y0s)
+            Ybar_new = jnp.einsum("n,nij->ij", w, Y0s)
 
         score = (
             1.0 / (1.0 - alphas_bar[i])
@@ -1357,14 +1538,45 @@ def run_mbd_with_diagnostics(
         mean_traj = np.array(_rollout_actions(Ybar_c))
         diag["mean_trajectories"].append(mean_traj)
 
-        # Roll out top samples sorted by cost (best first)
-        _n_avail = len(costs_np)
-        n_store = min(n_top_samples, _n_avail)
-        sort_idx = np.argsort(costs_np)[:n_store]
-        store_actions = Y0s[sort_idx]
-        store_phys = store_actions * action_scale[None, :] + action_center[None, :]
-        store_trajs = np.array(rollout_batch(eta0, nu0, store_phys))
-        diag["sample_trajectories"].append(store_trajs)
+        # Store top-N accepted and top-N rejected trajectories separately.
+        # The "accepted" pool is exactly the set the filter approved
+        # (_valid_mask True); the "rejected" pool is its complement. We do NOT
+        # use the post-fallback Y0s for "accepted" — when _n_valid == 0 the
+        # softmax falls back to the full set to avoid NaN, but every sample
+        # was rejected so the accepted pool is empty.
+        if _valid_mask is not None and _trajs_pre_filter is not None and _Y0s_pre_filter is not None:
+            # Cost on every pre-filter sample (cheap: rollouts already cached)
+            _all_costs = np.array(cost_batch(_Y0s_pre_filter))
+
+            _acc_idx = np.where(_valid_mask)[0]
+            _rej_idx = np.where(~_valid_mask)[0]
+
+            if len(_acc_idx) > 0:
+                _acc_top = _acc_idx[np.argsort(_all_costs[_acc_idx])[:n_top_samples]]
+                _acc_trajs = _trajs_pre_filter[_acc_top]
+            else:
+                _acc_trajs = np.zeros((0, H + 1, 3), dtype=np.float32)
+
+            if len(_rej_idx) > 0:
+                _rej_top = _rej_idx[np.argsort(_all_costs[_rej_idx])[:n_top_samples]]
+                _rej_trajs = _trajs_pre_filter[_rej_top]
+            else:
+                _rej_trajs = np.zeros((0, H + 1, 3), dtype=np.float32)
+
+            diag["sample_trajectories"].append(_acc_trajs)
+            diag["rejected_sample_trajectories"].append(_rej_trajs)
+        else:
+            # No filter: store top-N by post-softmax cost as before
+            _n_avail = len(costs_np)
+            n_store = min(n_top_samples, _n_avail)
+            sort_idx = np.argsort(costs_np)[:n_store]
+            store_actions = Y0s[sort_idx]
+            store_phys = store_actions * action_scale[None, :] + action_center[None, :]
+            store_trajs = np.array(rollout_batch(eta0, nu0, store_phys))
+            diag["sample_trajectories"].append(store_trajs)
+            diag["rejected_sample_trajectories"].append(
+                np.zeros((0, H + 1, 3), dtype=np.float32)
+            )
 
     diag["Ybar_final"] = Ybar_c
     return diag
@@ -1764,8 +1976,16 @@ def run_eb_mbd_with_diagnostics(
         mean_traj = np.array(_rollout_actions(Ybar_c))
         diag["mean_trajectories"].append(mean_traj)
 
-        # Track best sample by BASE cost so gold trajectory cost display is consistent
-        base_best_idx = int(np.argmin(costs_np))
+        # Track best sample by BASE cost AMONG GOAL-REACHING SAMPLES ONLY so the
+        # gold trajectory in the denoising movie always shows a feasible path.
+        # Non-goal-reaching samples (g < 0) can have low base cost (they don't
+        # need to travel the full distance), so filtering is essential.
+        goal_mask = g_vals_np >= 0.0
+        if goal_mask.any():
+            masked_costs = np.where(goal_mask, costs_np, np.inf)
+            base_best_idx = int(np.argmin(masked_costs))
+        else:
+            base_best_idx = int(np.argmin(costs_np))  # fallback: no feasible sample yet
         base_best_cost = float(costs_np[base_best_idx])
         if base_best_cost < diag["best_base_cost"]:
             diag["best_base_cost"]     = base_best_cost
@@ -3064,9 +3284,17 @@ def _generate_denoising_movie_from_diagnostics(
 
     mean_trajs = diag["mean_trajectories"]     # list of (H+1, 3), length Ndiffuse
     sample_trajs = diag["sample_trajectories"] # list of (Nsample, H+1, 3), length Ndiffuse-1
+    rejected_trajs = diag.get("rejected_sample_trajectories", [])
     cost_mins = diag.get("cost_mins", [])
     cost_means = diag.get("cost_means", [])
     reward_maxes = diag.get("reward_maxes", [])   # non-empty only for EB-MBD
+    alive_fracs = diag.get("alive_fracs", [])     # fraction of goal-reaching samples (EB-MBD)
+    accept_rates = diag.get("accept_rates", [])   # fraction of accepted reject-sampling samples
+    # Reject sampling is "active" if at any step at least one sample was
+    # rejected. Used to decide whether to display "accept=N%" in the title.
+    _has_reject_sampling = any(
+        rt is not None and len(rt) > 0 for rt in rejected_trajs
+    ) if rejected_trajs else False
 
     n_frames = len(mean_trajs)
     n_samples = len(sample_trajs[0]) if sample_trajs else 0
@@ -3077,24 +3305,23 @@ def _generate_denoising_movie_from_diagnostics(
         flush=True,
     )
 
+    from medea_ice_ship.visualization import WATER_COLOR, ICE_CMAP, ICE_EDGE_COLOR
+
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    ax.set_facecolor(WATER_COLOR)
 
-    # Static background
-    grid = cost_map.cost_map
-    extent = [
-        cost_map.x_origin, cost_map.x_origin + cost_map.width,
-        cost_map.y_origin, cost_map.y_origin + cost_map.height,
-    ]
-    vmax_grid = float(np.percentile(grid[grid > 0], 95)) if np.any(grid > 0) else 1.0
-    ax.imshow(grid, origin="lower", extent=extent, cmap="YlOrRd", alpha=0.5,
-              vmin=0, vmax=vmax_grid)
-
+    # Actual ice polygons (no inflated costmap shown — same style as the 2D
+    # ship movie and A* search movie).
     if world_polygons is not None and thicknesses is not None and len(world_polygons) > 0:
         patches = [MplPolygon(poly, closed=True) for poly in world_polygons]
-        pc = PatchCollection(patches, cmap="Blues", edgecolor="#555555", linewidth=0.3, alpha=0.5)
-        pc.set_array(np.array(thicknesses))
-        pc.set_clim(float(thicknesses.min()), float(thicknesses.max()))
+        pc = PatchCollection(patches, cmap=ICE_CMAP, edgecolor=ICE_EDGE_COLOR,
+                              linewidth=0.3, alpha=0.95)
+        t_arr = np.asarray(thicknesses, dtype=float)
+        pc.set_array(t_arr)
+        pc.set_clim(float(t_arr.min()), float(t_arr.max()))
         ax.add_collection(pc)
+        fig.colorbar(pc, ax=ax, shrink=0.5, label="Thickness [m]",
+                     location="left")
 
     if goal_y_line is not None:
         ax.axhline(goal_y_line, color="lime", ls="--", lw=2, zorder=4,
@@ -3111,17 +3338,42 @@ def _generate_denoising_movie_from_diagnostics(
 
     sample_norm = plt.Normalize(vmin=0, vmax=1)
     sample_lc = LineCollection([], cmap="cool", norm=sample_norm,
-                                linewidths=0.6, alpha=0.25, zorder=4)
+                                linewidths=0.6, alpha=0.25, zorder=4,
+                                label="Accepted samples")
     ax.add_collection(sample_lc)
+
+    # Rejected samples: top-N from the reject-sampling pool, drawn in red so
+    # the filter's effect is visible step by step.
+    rejected_lc = LineCollection([], colors="#ff3030",
+                                  linewidths=0.6, alpha=0.30, zorder=3,
+                                  label="Rejected samples")
+    ax.add_collection(rejected_lc)
 
     mean_outline, = ax.plot([], [], "w-", lw=4, zorder=5)
     mean_line, = ax.plot([], [], "-", color="tomato", lw=2, zorder=5,
                          label="Mean trajectory")
     min_outline, = ax.plot([], [], "w-", lw=4, zorder=6)
+
+    # EB-MBD: show the globally best goal-reaching trajectory (static overlay).
+    # Standard MBD: fall back to running per-step minimum (original behaviour).
+    # Using the per-step st[0] for EB-MBD was wrong: non-goal-reaching samples
+    # can have low base cost, so the "min-cost" line showed infeasible paths.
+    _best_goal_traj = diag.get("best_base_cost_trajectory") if diag is not None else None
+    _best_goal_cost = diag.get("best_base_cost", float("inf")) if diag is not None else float("inf")
+    _use_static_best = _best_goal_traj is not None
+    if _use_static_best:
+        min_label = "Best goal-reaching trajectory"
+    else:
+        min_label = "Running min-cost trajectory"
     min_line, = ax.plot([], [], "-", color="lime", lw=2.5, zorder=7,
-                        label="Running min-cost trajectory")
+                        label=min_label)
     title_obj = ax.set_title(f"Replan {replan_idx:04d} — denoising step 0 / {n_frames - 1}")
     ax.legend(loc="upper right", fontsize=8)
+
+    # For EB-MBD: draw the global best trajectory immediately (it never changes).
+    if _use_static_best:
+        min_outline.set_data(_best_goal_traj[:, 0], _best_goal_traj[:, 1])
+        min_line.set_data(_best_goal_traj[:, 0], _best_goal_traj[:, 1])
 
     _running_min = {"cost": float("inf"), "traj": None}
 
@@ -3137,27 +3389,44 @@ def _generate_denoising_movie_from_diagnostics(
             sample_lc.set_segments(segments)
             sample_lc.set_array(colors)
 
-            # Track running min-cost trajectory (st[0] = min-cost sample this frame).
-            if frame < len(cost_mins) and cost_mins[frame] < _running_min["cost"]:
-                _running_min["cost"] = cost_mins[frame]
-                _running_min["traj"] = st[0]
+            if not _use_static_best and len(st) > 0:
+                # Standard MBD: update running min from per-step st[0]. Skip
+                # when the accepted pool is empty (accept=0% — no candidate to
+                # extract). Without this guard, st[0] raises IndexError and
+                # kills the animation, producing a 0-second MP4.
+                if frame < len(cost_mins) and cost_mins[frame] < _running_min["cost"]:
+                    _running_min["cost"] = cost_mins[frame]
+                    _running_min["traj"] = st[0]
         else:
             sample_lc.set_segments([])
 
-        if _running_min["traj"] is not None:
+        # Rejected samples (reject-sampling MBD): top-N rejected trajectories
+        # drawn in red so the user can see which samples the filter dropped.
+        if (frame < len(rejected_trajs) and rejected_trajs
+                and rejected_trajs[frame] is not None
+                and len(rejected_trajs[frame]) > 0):
+            rt = rejected_trajs[frame]
+            rejected_lc.set_segments([rt[k, :, :2] for k in range(len(rt))])
+        else:
+            rejected_lc.set_segments([])
+
+        if not _use_static_best and _running_min["traj"] is not None:
             mt_min = _running_min["traj"]
             min_outline.set_data(mt_min[:, 0], mt_min[:, 1])
             min_line.set_data(mt_min[:, 0], mt_min[:, 1])
-        else:
-            min_outline.set_data([], [])
-            min_line.set_data([], [])
 
         cost_str = ""
         if frame < len(cost_mins):
+            _global_min = _best_goal_cost if _use_static_best else _running_min["cost"]
+            _alive = f"  alive={alive_fracs[frame]:.0%}" if frame < len(alive_fracs) else ""
+            _accept = (f"  accept={accept_rates[frame]:.0%}"
+                       if _has_reject_sampling and frame < len(accept_rates)
+                       else "")
             cost_str = (
                 f"  |  cost_min={cost_mins[frame]:.1f}"
-                f"  global_min={_running_min['cost']:.1f}"
+                f"  best={'goal' if _use_static_best else 'run'}={_global_min:.1f}"
                 f"  cost_mean={cost_means[frame]:.1f}"
+                f"{_alive}{_accept}"
             )
         title_obj.set_text(
             f"Replan {replan_idx:04d} — denoising step {frame} / {n_frames - 1}{cost_str}"
@@ -3448,6 +3717,7 @@ def jax_mbd_optimize(
     eb_kappa: Optional[float] = None,
     eb_oob_cost: float = 5.0,
     eb_oob_as_constraint: bool = False,
+    eb_ice_as_constraint: bool = False,
     # ── AL-MBD parameters ──────────────────────────────────────────────────
     use_al_mbd: bool = False,
     al_x_min: Optional[float] = None,
@@ -3464,6 +3734,9 @@ def jax_mbd_optimize(
     homotopy_n_obs_max: int = 3,
     # ── Hard rectangular obstacles (for EB/AL only) ────────────────────────
     obstacle_rects: Optional[list] = None,
+    # ── OOB big-M override (non-EB branch). When None, defaults to 1e8.
+    #    Pass 0.0 to disable the big-M (used by reject-sampling MBD).
+    oob_penalty: Optional[float] = None,
 ) -> np.ndarray:
     """
     Optimize trajectory using JAX Model-Based Diffusion with 3-DOF dynamics.
@@ -3636,10 +3909,13 @@ def jax_mbd_optimize(
         # EB-MBD: wall cells in the costmap handle OOB for rect-grid scenarios;
         # the EB linear OOB cost handles disk-costmap scenarios.
         # Keep oob_penalty=0.0 to avoid penalising hull corners near the grid edge.
+        # When eb_ice_as_constraint=True the costmap is removed from J(x) entirely
+        # and enforced as a hard EB barrier constraint (g_ice = 0 - costmap_integral).
+        _cmap_weight = 0.0 if eb_ice_as_constraint else costmap_weight
         cost_fn = make_cost_fn(
             grid, meta, goal, rollout_fn, eta0, nu0,
             action_center, action_scale,
-            costmap_weight=costmap_weight,
+            costmap_weight=_cmap_weight,
             costmap_normalizer=costmap_normalizer,
             goal_weight=goal_weight,
             length_weight=length_weight,
@@ -3650,7 +3926,7 @@ def jax_mbd_optimize(
             oob_penalty=0.0,
         )
         if goal_y_line is not None and goal_x_weight > 0.0:
-            _gx_fn = make_goal_arrival_x_cost_fn(
+            _gx_fn = make_terminal_goal_distance_cost_fn(
                 rollout_fn, eta0, nu0, action_center, action_scale,
                 goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
             )
@@ -3666,6 +3942,18 @@ def jax_mbd_optimize(
             rollout_fn, eta0, nu0, action_center, action_scale,
             goal_y_line=_goal_y,
         )
+        if eb_ice_as_constraint:
+            # Ice avoidance as a hard EB barrier constraint (combined with goal constraint).
+            # g_ice = 0 - total_costmap_integral: feasible iff trajectory touches no ice.
+            _ice_c_fn = make_ice_cost_constraint_fn(
+                grid, meta, rollout_fn, eta0, nu0, action_center, action_scale,
+                ice_threshold=0.0,
+                cost_truncate_y=effective_truncate_y,
+                ship_length=L,
+                ship_beam=B,
+            )
+            _goal_c_fn = constraint_fn
+            constraint_fn = lambda u: jnp.minimum(_goal_c_fn(u), _ice_c_fn(u))  # noqa: E731
         if eb_oob_as_constraint:
             # OOB as a hard EB barrier constraint (combined with goal constraint).
             oob_constraint_fn = make_oob_constraint_fn(
@@ -3695,6 +3983,7 @@ def jax_mbd_optimize(
             # Hard obstacle rects combined with goal constraint (share large c_max)
             constraint_fn = lambda u: jnp.minimum(_base_c(u), _rect_fn(u))  # noqa: E731
     else:
+        _oob_pen = 1e8 if oob_penalty is None else float(oob_penalty)
         cost_fn = make_cost_fn(
             grid, meta, goal, rollout_fn, eta0, nu0,
             action_center, action_scale,
@@ -3706,8 +3995,9 @@ def jax_mbd_optimize(
             ship_length=L,
             ship_beam=B,
             cost_truncate_y=effective_truncate_y,
+            oob_penalty=_oob_pen,
         )
-        if goal_y_line is not None:
+        if goal_y_line is not None and float(goal_y_line_penalty) > 0.0:
             _gl_fn = make_goal_line_cost_fn(
                 rollout_fn, eta0, nu0, action_center, action_scale,
                 goal_y_line, goal_y_line_penalty,
@@ -3715,7 +4005,7 @@ def jax_mbd_optimize(
             _base_fn = cost_fn
             cost_fn = lambda u_norm: _base_fn(u_norm) + _gl_fn(u_norm)  # noqa: E731
         if goal_y_line is not None and goal_x_weight > 0.0:
-            _gx_fn = make_goal_arrival_x_cost_fn(
+            _gx_fn = make_terminal_goal_distance_cost_fn(
                 rollout_fn, eta0, nu0, action_center, action_scale,
                 goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
             )
@@ -3753,7 +4043,7 @@ def jax_mbd_optimize(
             _base_fn = cost_fn
             cost_fn = lambda u_norm: _base_fn(u_norm) + _gl_fn(u_norm)  # noqa: E731
         if goal_y_line is not None and goal_x_weight > 0.0:
-            _gx_fn = make_goal_arrival_x_cost_fn(
+            _gx_fn = make_terminal_goal_distance_cost_fn(
                 rollout_fn, eta0, nu0, action_center, action_scale,
                 goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
             )
@@ -4099,14 +4389,25 @@ def jax_mbd_optimize(
             f"mean_best={_mean_best_cost:.1f} at step {_mean_best_step}/{_n_steps - 1}",
             flush=True,
         )
-        # Per-step table: step | cost_of_mean | cost_min | gap
-        print(f"  [MBD debug] step-by-step (cost_of_mean | cost_min | gap):", flush=True)
+        # Per-step table: step | cost_of_mean | cost_min | gap | accept
+        _ar = _diagnostics.get("accept_rates") or []
+        if _ar:
+            _ar_arr = np.array(_ar)
+            print(
+                f"  [MBD debug] reject-sampling accept: "
+                f"min={_ar_arr.min()*100:.1f}%  mean={_ar_arr.mean()*100:.1f}%  "
+                f"max={_ar_arr.max()*100:.1f}%  zero-accept steps={int((_ar_arr == 0.0).sum())}/{len(_ar_arr)}",
+                flush=True,
+            )
+        print(f"  [MBD debug] step-by-step (cost_of_mean | cost_min | gap | accept):", flush=True)
         for _s in range(_n_steps):
             _com = _cost_of_mean_arr[_s]
             _cmin = _cost_mins_arr[_s]
+            _acc = _ar[_s] if _s < len(_ar) else None
+            _acc_str = f" | accept={_acc*100:5.1f}%" if _acc is not None else ""
             _marker = " <-- global min" if _s == _global_min_step else ""
             _marker2 = " <-- mean best" if _s == _mean_best_step and _mean_best_step != _global_min_step else ""
-            print(f"    step {_s:3d}: mean={_com:10.1f} | best_sample={_cmin:10.1f} | gap={_com - _cmin:10.1f}{_marker}{_marker2}", flush=True)
+            print(f"    step {_s:3d}: mean={_com:10.1f} | best_sample={_cmin:10.1f} | gap={_com - _cmin:10.1f}{_acc_str}{_marker}{_marker2}", flush=True)
 
         # ── Action-space convexity probe ──────────────────────────────────────
         # Interpolate between the global best and its same-step 2nd-best sample

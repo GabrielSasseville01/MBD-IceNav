@@ -74,8 +74,10 @@ def create_medea_lattice_planner(
             f"y={cost_map.y_origin:.1f}..{cost_map.y_origin + cost_map.height:.1f}]"
         )
 
+    # Primitives expects turning_radius in cells (it multiplies by scale internally),
+    # but planning_turning_radius is in metres — so convert first.
     primitives = Primitives(
-        turning_radius=run_cfg.planning_turning_radius,
+        turning_radius=run_cfg.planning_turning_radius / run_cfg.planning_resolution,
         num_headings=run_cfg.planning_num_headings,
         scale=run_cfg.planning_resolution,
     )
@@ -122,7 +124,7 @@ def create_medea_diffusion_mpc_planner(
             f"y={cost_map.y_origin:.1f}..{cost_map.y_origin + cost_map.height:.1f}]"
         )
     primitives = Primitives(
-        turning_radius=run_cfg.planning_turning_radius,
+        turning_radius=run_cfg.planning_turning_radius / run_cfg.planning_resolution,
         num_headings=run_cfg.planning_num_headings,
         scale=run_cfg.planning_resolution,
     )
@@ -244,6 +246,8 @@ def optimize_with_diffusion(
     eb_mu: Optional[float] = None,
     eb_kappa: Optional[float] = None,
     eb_oob_as_constraint: bool = False,
+    eb_ice_as_constraint: bool = False,
+    oob_penalty: Optional[float] = None,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Model-Based Diffusion (3-DOF dynamics + costmap).
@@ -308,6 +312,8 @@ def optimize_with_diffusion(
         eb_mu=eb_mu,
         eb_kappa=eb_kappa,
         eb_oob_as_constraint=eb_oob_as_constraint,
+        eb_ice_as_constraint=eb_ice_as_constraint,
+        oob_penalty=oob_penalty,
     )
 
     if return_diagnostics:
@@ -345,6 +351,8 @@ def optimize_with_mppi(
     run_cfg: RunConfig,
     start_nu: Optional[Tuple[float, float, float]] = None,
     warm_start: Optional[bool] = None,
+    goal_y_line: Optional[float] = None,
+    goal_y_line_penalty: float = 1e6,
 ) -> np.ndarray:
     """
     Optimize a path using JAX MPPI (3-DOF dynamics + costmap).
@@ -367,6 +375,8 @@ def optimize_with_mppi(
         start_nu=start_nu,
         lattice_path=continuous_path,
         warm_start=warm_start,
+        goal_y_line=goal_y_line,
+        goal_y_line_penalty=goal_y_line_penalty,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
@@ -472,6 +482,8 @@ def optimize_with_rss(
     run_cfg: RunConfig,
     start_nu: Optional[Tuple[float, float, float]] = None,
     warm_start: Optional[bool] = None,
+    goal_y_line: Optional[float] = None,
+    goal_y_line_penalty: float = 1e6,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Random Single Shooting.
@@ -494,6 +506,8 @@ def optimize_with_rss(
         start_nu=start_nu,
         lattice_path=continuous_path,
         warm_start=warm_start,
+        goal_y_line=goal_y_line,
+        goal_y_line_penalty=goal_y_line_penalty,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
@@ -515,6 +529,7 @@ def optimize_with_ilqr(
     run_cfg: RunConfig,
     start_nu: Optional[Tuple[float, float, float]] = None,
     warm_start: Optional[bool] = None,
+    goal_y_line: Optional[float] = None,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Box-iLQR (3-DOF dynamics + costmap).
@@ -522,6 +537,8 @@ def optimize_with_ilqr(
     Same interface as optimize_with_diffusion/optimize_with_mppi but uses
     iterative LQR with log-barrier control constraints. Requires differentiable
     dynamics and cost — uses JAX autodiff for Jacobians/Hessians.
+    When goal_y_line is set, the terminal cost uses a smooth goal-line heuristic
+    (clamped Euclidean distance) instead of point-distance, which is differentiable.
     """
     from medea_ice_ship.jax_ilqr_planner import jax_ilqr_optimize
 
@@ -537,6 +554,7 @@ def optimize_with_ilqr(
         start_nu=start_nu,
         lattice_path=continuous_path,
         warm_start=warm_start,
+        goal_y_line=goal_y_line,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)

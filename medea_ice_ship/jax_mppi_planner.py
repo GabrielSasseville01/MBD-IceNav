@@ -22,6 +22,8 @@ from medea_ice_ship.config import get_default_simulation_config
 from medea_ice_ship.jax_mbd_planner import (
     make_dynamics_rollout,
     make_cost_fn,
+    make_goal_line_cost_fn,
+    make_goal_arrival_x_cost_fn,
     _warm_start_from_path,
     _jax_backend_info,
 )
@@ -119,6 +121,8 @@ def jax_mppi_optimize(
     start_nu: Optional[Tuple[float, float, float]] = None,
     lattice_path: Optional[np.ndarray] = None,
     warm_start: Optional[bool] = None,
+    goal_y_line: Optional[float] = None,
+    goal_y_line_penalty: float = 1e6,
 ) -> np.ndarray:
     """
     Optimize trajectory using JAX MPPI with 3-DOF dynamics.
@@ -158,9 +162,11 @@ def jax_mppi_optimize(
     seed = getattr(run_cfg, "planning_diffusion_seed", None) or 42
 
     costmap_weight = getattr(run_cfg, "planning_jax_mbd_costmap_weight", 1.0)
+    costmap_normalizer = getattr(run_cfg, "planning_jax_mbd_costmap_normalizer", 1.0)
     goal_weight = getattr(run_cfg, "planning_jax_mbd_goal_weight", 0.1)
     length_weight = getattr(run_cfg, "planning_jax_mbd_length_weight", 1.0)
     smoothness_weight = getattr(run_cfg, "planning_jax_mbd_smoothness_weight", 0.005)
+    goal_x_weight = getattr(run_cfg, "planning_jax_mbd_goal_x_weight", 0.0)
     surge_max = getattr(run_cfg, "planning_jax_mbd_surge_max", 2e6)
     sway_max = getattr(run_cfg, "planning_jax_mbd_sway_max", 5e5)
     yaw_max = getattr(run_cfg, "planning_jax_mbd_yaw_max", 5e8)
@@ -225,16 +231,33 @@ def jax_mppi_optimize(
         v_init = jnp.array(v_init, dtype=jnp.float32)
 
     # ── Cost function ─────────────────────────────────────────────────
+    cost_truncate_y = goal_y_line  # suppress cost after goal line crossing
     cost_fn = make_cost_fn(
         grid, meta, goal, rollout_fn, eta0, nu0,
         action_center, action_scale,
         costmap_weight=costmap_weight,
+        costmap_normalizer=costmap_normalizer,
         goal_weight=goal_weight,
         length_weight=length_weight,
         smoothness_weight=smoothness_weight,
         ship_length=L,
         ship_beam=B,
+        cost_truncate_y=cost_truncate_y,
     )
+    if goal_y_line is not None:
+        _gl_fn = make_goal_line_cost_fn(
+            rollout_fn, eta0, nu0, action_center, action_scale,
+            goal_y_line, goal_y_line_penalty,
+        )
+        _base_fn = cost_fn
+        cost_fn = lambda u_norm: _base_fn(u_norm) + _gl_fn(u_norm)  # noqa: E731
+    if goal_y_line is not None and goal_x_weight > 0.0:
+        _gx_fn = make_goal_arrival_x_cost_fn(
+            rollout_fn, eta0, nu0, action_center, action_scale,
+            goal_x=float(goal[0]), goal_y_line=goal_y_line, weight=goal_x_weight,
+        )
+        _prev_fn = cost_fn
+        cost_fn = lambda u_norm: _prev_fn(u_norm) + _gx_fn(u_norm)  # noqa: E731
 
     # ── Run MPPI ──────────────────────────────────────────────────────
     ws_label = "warm-started from A*" if v_init is not None else "cold start (no A* prior)"

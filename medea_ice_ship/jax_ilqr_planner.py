@@ -92,14 +92,32 @@ def make_stage_cost(
     return stage_cost
 
 
-def make_terminal_cost(goal_xy: jnp.ndarray, goal_weight: float = 1.0):
-    """Build terminal cost phi(x_T) = goal_weight * ||eta_T[:2] - goal||."""
+def make_terminal_cost(
+    goal_xy: jnp.ndarray,
+    goal_weight: float = 1.0,
+    goal_y_line: Optional[float] = None,
+):
+    """
+    Build terminal cost phi(x_T).
+
+    When goal_y_line is None: phi = goal_weight * ||eta_T[:2] - goal||.
+    When goal_y_line is set: phi = goal_weight * ||(dx, max(0, goal_y - y_T))||,
+    which drives the ship to reach y >= goal_y_line while centering x on goal_x.
+    This smooth formulation is differentiable everywhere, suitable for iLQR.
+    """
     gw = jnp.float32(goal_weight)
-    goal = jnp.array(goal_xy, dtype=jnp.float32)
+    goal = jnp.array(goal_xy[:2], dtype=jnp.float32)
+    _use_line = goal_y_line is not None
+    _goal_y = jnp.float32(goal_y_line) if goal_y_line is not None else jnp.float32(0.0)
 
     def terminal_cost(x: jnp.ndarray) -> jnp.ndarray:
         eta = x[:3]
-        return gw * jnp.sqrt(jnp.sum((eta[:2] - goal) ** 2) + jnp.float32(1e-4))
+        dx = eta[0] - goal[0]
+        if _use_line:
+            dy = jnp.maximum(jnp.float32(0.0), _goal_y - eta[1])
+        else:
+            dy = eta[1] - goal[1]
+        return gw * jnp.sqrt(dx * dx + dy * dy + jnp.float32(1e-4))
 
     return terminal_cost
 
@@ -343,6 +361,7 @@ def jax_ilqr_optimize(
     start_nu: Optional[Tuple[float, float, float]] = None,
     lattice_path: Optional[np.ndarray] = None,
     warm_start: Optional[bool] = None,
+    goal_y_line: Optional[float] = None,
 ) -> np.ndarray:
     """
     Optimize trajectory using Box-iLQR (3-DOF dynamics + costmap).
@@ -449,7 +468,7 @@ def jax_ilqr_optimize(
     )
 
     goal_xy = jnp.array(goal[:2], dtype=jnp.float32)
-    terminal_cost_fn = make_terminal_cost(goal_xy, goal_weight=goal_weight)
+    terminal_cost_fn = make_terminal_cost(goal_xy, goal_weight=goal_weight, goal_y_line=goal_y_line)
 
     # ── Warm-start ────────────────────────────────────────────────────
     u_init = np.zeros((H, 3), dtype=np.float32)

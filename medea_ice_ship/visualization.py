@@ -36,6 +36,31 @@ except ImportError:
     _HAS_SHAPELY = False
 
 
+# ── Shared plot/movie style ────────────────────────────────────────────────
+# Use these consistently across the map PNG, 2D ship movie, A* search movie,
+# and MBD denoising movie so all outputs share the "dark-water + off-white
+# ice" look. The ice colormap mirrors the per-floe RGB formula used by
+# animate_ice_ship_2d: low thickness → near-white (#F0FAFF), high thickness
+# → light blue (#8CAAE7). All ice stays on the whiter side so it contrasts
+# well with the dark water background.
+WATER_COLOR    = "#1A4D70"
+ICE_EDGE_COLOR = "#3A6D90"
+
+
+def _make_ice_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+    t = np.linspace(0.0, 1.0, 256)
+    rgb = np.stack([
+        (240.0 - 100.0 * t) / 255.0,
+        (250.0 -  80.0 * t) / 255.0,
+        (255.0 -  40.0 * t) / 255.0,
+    ], axis=1)
+    return LinearSegmentedColormap.from_list("ice", rgb)
+
+
+ICE_CMAP = _make_ice_cmap()
+
+
 def _rigid_correct_positions_if_thick_ice(positions_history, bonds, thicknesses, max_fracture_thickness, n_elements, initial_floe_of=None, rotations_history=None):
     """When all thicknesses > max_fracture_thickness, return (positions_history, rotations_history) with each
     component drawn rigidly: same relative positions and same rotation as frame 0 (no gaps, no spin).
@@ -415,6 +440,8 @@ def animate_lattice_search(
     fps: int = 15,
     figsize: tuple = (10, 8),
     show_edge_costs: bool = True,
+    world_polygons=None,
+    thicknesses=None,
 ):
     """
     Generate a movie showing the A* lattice graph search evolution.
@@ -471,22 +498,23 @@ def animate_lattice_search(
     ax.set_aspect("equal")
     ax.set_xlim(ox, ox + w)
     ax.set_ylim(oy, oy + h)
+    ax.set_facecolor(WATER_COLOR)
 
-    # Static: costmap background (log scale so open water, thin ice, thick ice are all visible)
-    grid_max = float(np.nanmax(grid))
-    grid_min = float(np.nanmin(grid[grid > 0])) if np.any(grid > 0) else 1.0
-    vmin = max(0.5, grid_min * 0.5)
-    vmax = max(2.0, grid_max)
-    # Avoid 0 for LogNorm (would be -inf)
-    grid_display = np.where(grid > 0, grid, vmin)
-    im = ax.imshow(
-        grid_display,
-        extent=[ox, ox + w, oy, oy + h],
-        origin="lower",
-        cmap="viridis",
-        alpha=0.85,
-        norm=LogNorm(vmin=vmin, vmax=vmax),
-    )
+    # Static: actual ice polygons (no costmap dilation/inflation shown).
+    if world_polygons is not None and len(world_polygons) > 0:
+        patches = [MplPolygon(p, closed=True) for p in world_polygons]
+        pc = PatchCollection(patches, cmap=ICE_CMAP, edgecolor=ICE_EDGE_COLOR,
+                              linewidth=0.3, alpha=0.95)
+        if thicknesses is not None and len(thicknesses) == len(world_polygons):
+            t_arr = np.asarray(thicknesses, dtype=float)
+            pc.set_array(t_arr)
+            pc.set_clim(float(t_arr.min()), float(t_arr.max()))
+            ax.add_collection(pc)
+            fig.colorbar(pc, ax=ax, shrink=0.5, label="Thickness [m]",
+                         location="left")
+        else:
+            pc.set_facecolor("#E8F2FF")
+            ax.add_collection(pc)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
 
@@ -1645,12 +1673,16 @@ def animate_ice_ship_2d(
             x_max = max(x_max, float(all_pos[:, 0].max() + 20))
             y_min = min(y_min, float(all_pos[:, 1].min() - 20))
             y_max = max(y_max, float(all_pos[:, 1].max() + 20))
-    water_color = '#1A4D70'
+    water_color = WATER_COLOR
     ship_color = '#404040'
     if n_elements > 0 and len(thicknesses) > 0:
-        thickness_norm = (thicknesses - thicknesses.min()) / (thicknesses.max() - thicknesses.min() + 0.01)
-        ice_colors = [f'#{int(240-100*t):02x}{int(250-80*t):02x}{int(255-40*t):02x}' for t in thickness_norm]
+        _tmin = float(np.asarray(thicknesses).min())
+        _tmax = float(np.asarray(thicknesses).max())
+        thickness_norm = (np.asarray(thicknesses) - _tmin) / (_tmax - _tmin + 0.01)
+        ice_colors = [ICE_CMAP(float(t)) for t in thickness_norm]
     else:
+        _tmin = 0.0
+        _tmax = 1.0
         ice_colors = []
 
     # When thick-ice rigid display is active, draw one merged polygon per floe (no internal cell edges).
@@ -1752,6 +1784,17 @@ def animate_ice_ship_2d(
         return
 
     fig, ax = plt.subplots(figsize=figsize)
+    # Static thickness colorbar (lives on its own axes, survives ax.clear()
+    # between frames). Skipped when there are no floes.
+    if n_elements > 0 and len(thicknesses) > 0:
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+        _sm = ScalarMappable(cmap=ICE_CMAP,
+                              norm=Normalize(vmin=_tmin, vmax=_tmax))
+        _sm.set_array([])
+        fig.colorbar(_sm, ax=ax, shrink=0.5, label="Thickness [m]",
+                     location="left")
+
     def rotate_polygon(poly, angle):
         c, s = np.cos(angle), np.sin(angle)
         return poly @ np.array([[c, -s], [s, c]]).T

@@ -262,13 +262,16 @@ class LatticePlanner:
     def _heuristic(self, x: float, y: float, goal: Tuple[float, float]) -> float:
         """
         Compute heuristic cost to goal.
-        
-        Uses Euclidean distance (admissible for Dubins paths).
-        When goal_y_line is set, uses vertical distance to the line
-        (admissible: always <= true path length).
+
+        Euclidean distance to the goal point in both x and y.  When goal_y_line
+        is set, dy is clamped to zero once the line is reached so the ship is
+        guided toward the target x position (goal[0]) even after crossing y_line.
+        This is admissible: straight-line distance is always <= true path length.
         """
         if self.goal_y_line is not None:
-            return max(0.0, self.goal_y_line - y)
+            dy = max(0.0, self.goal_y_line - y)
+            dx = x - goal[0]
+            return np.sqrt(dx * dx + dy * dy)
         return np.sqrt((x - goal[0])**2 + (y - goal[1])**2)
     
     def _compute_path_cost(self, path: np.ndarray, primitive: Primitive) -> float:

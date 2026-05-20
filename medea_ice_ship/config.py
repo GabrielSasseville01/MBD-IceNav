@@ -431,7 +431,7 @@ class RunConfig:
     # Barrier schedule shape.  κ=1 → linear; κ>1 → slow then fast tightening.
     planning_jax_mbd_eb_kappa: float = 1.0
     # --- JAX MPPI (used when --planner mppi) ---
-    planning_mppi_horizon: int = 300
+    planning_mppi_horizon: int = 600
     # More samples than MBD because MPPI relies on breadth per iteration.
     planning_mppi_nsample: int = 2048
     # More iterations so the nominal sequence converges (noise shrinks effectively
