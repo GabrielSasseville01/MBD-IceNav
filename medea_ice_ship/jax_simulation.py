@@ -1541,10 +1541,12 @@ def simulate_jax_chunked_replan(
     use_ship_dynamics = ship_trajectory is not None
     _physics_scan_time = 0.0   # cumulative wall-clock time inside _run_jax_segment
     _physics_scan_calls = 0    # number of scan segment calls
+    _chunk_loop_t0 = time.perf_counter()   # wall-clock when chunk loop started
 
     while frame_start < n_frames:
         frame_end = min(frame_start + chunk, n_frames)
         K = frame_end - frame_start   # actual frames in this chunk
+        _chunk_iter_t0 = time.perf_counter()
 
         # ── Replan callback (if any) ───────────────────────────────────────────
         # Call at every chunk boundary including frame 0, matching the
@@ -1724,6 +1726,24 @@ def simulate_jax_chunked_replan(
 
         state      = final_state
         ship_state = final_ship
+
+        # ── Per-chunk progress (lets cluster jobs report liveness) ───────────
+        if verbose:
+            _n_chunks_total = int(np.ceil(n_frames / chunk))
+            _chunks_done    = _physics_scan_calls
+            _wall_elapsed   = time.perf_counter() - _chunk_loop_t0
+            _chunk_wall     = time.perf_counter() - _chunk_iter_t0
+            _eta_s = (_wall_elapsed / max(_chunks_done, 1)) * (_n_chunks_total - _chunks_done)
+            print(
+                f"  [JAX-chunked] chunk {_chunks_done}/{_n_chunks_total} "
+                f"frame={frame_end}/{n_frames} "
+                f"chunk_wall={_chunk_wall:.2f}s  "
+                f"elapsed={_wall_elapsed:.1f}s  "
+                f"eta={_eta_s/60:.1f}min  "
+                f"ship_y={float(ship_xy[1]):.1f}",
+                flush=True,
+            )
+
         frame_start = frame_end
 
     # ── Physics timing report ──────────────────────────────────────────────────
