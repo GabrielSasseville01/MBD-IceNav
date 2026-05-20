@@ -1,57 +1,53 @@
 #!/usr/bin/env python3
 """
-SLURM submitter for the planner-weight tuning grid sweep.
+SLURM job-array submitter for the planner-weight tuning grid sweep.
 
 See docs/EXPERIMENT_PROTOCOL.md for the full methodology.
 
-Three tuning groups per block, run sequentially:
+Three tuning groups per block (12 scenarios × N grid points × planners × seeds):
 
-    astar            64 grid pts × 12 scn × 1 planner × 2 seeds → 1 536 trials
-    shared_trajopt   64 grid pts × 12 scn × 4 planners × 2 seeds → 6 144 trials
-    eb_mbd_barrier   27 grid pts × 12 scn × 1 planner × 2 seeds →   648 trials
+    Group              Grid    Planners    Array tasks    Trials/task    Total trials
+    astar              4³ = 64       1          12×64 =  768            2          1 536
+    shared_trajopt     4³ = 64       4          12×64 =  768            8          6 144
+    eb_mbd_barrier     3³ = 27       1          12×27 =  324            2            648
 
-SLURM granularity: one job per (block, group, grid_idx, scenario). Inside
-each job, planners × seeds run sequentially. With this bundling the per-
-block job count is:
-
-    astar          → 768
-    shared_trajopt → 768  (each job: 8 trials)
-    eb_mbd_barrier → 324
-
-i.e. ~1 860 jobs per block, ~3 720 across both. Tunable via --bundle.
+The job array dimension is (scenarios × grid_points). Each array task
+decodes its SLURM_ARRAY_TASK_ID, reads the grid overrides from
+outputs/tuning/{group}/grid.json, and runs the (planners × seeds) loop
+sequentially.
 
 Outputs land at:
-    {output_dir}/tuning/{group}/grid_{idx}/{block}/{scenario}/{planner}/seed_{seed}.json
-
-The grid index → overrides mapping is written to
-    {output_dir}/tuning/{group}/grid.json
-once per group/block invocation, so the per-trial JSONs can be re-keyed
-during scoring.
+    {output_dir}/tuning/{group}/grid_{idx:04d}/{block}/{scenario}/{planner}/seed_{seed}.json
 
 EB-MBD barrier tuning is conditional on the winning shared_trajopt
 weights — pass them via --base-overrides-file pointing at
 tuned_weights/{block}/shared_trajopt.json (produced by score_tuning.py).
 
-Usage examples
---------------
-Dry-run for A* group on block A:
+Usage
+-----
+Count tasks:
+    uv run python submit_tuning.py --group astar --count
+
+Dry-run (write the array scripts, print sbatch commands):
     uv run python submit_tuning.py --block A --group astar --dry-run
 
-Submit shared_trajopt for both blocks:
-    uv run python submit_tuning.py --group shared_trajopt --submit
+Submit:
+    uv run python submit_tuning.py --block A --group astar --submit
 
-Submit EB-MBD barrier (after shared_trajopt scoring is done):
+Submit EB-MBD (after shared_trajopt scoring is done):
     uv run python submit_tuning.py --block A --group eb_mbd_barrier \\
         --base-overrides-file tuned_weights/A/shared_trajopt.json --submit
 
-Count jobs without writing scripts:
-    uv run python submit_tuning.py --group shared_trajopt --count
+Re-submit specific failed tasks of an existing array:
+    uv run python submit_tuning.py --block A --group astar \\
+        --array-spec '42,108-115' --submit
 """
 from __future__ import annotations
 
 import argparse
 import itertools
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -75,14 +71,12 @@ GRID: dict[str, dict[str, list]] = {
     },
 }
 
-# ── Planners scored by each group ─────────────────────────────────────────
 PLANNERS_BY_GROUP: dict[str, list[str]] = {
     "astar":          ["astar"],
     "shared_trajopt": ["mbd", "mppi", "rss", "ilqr"],
     "eb_mbd_barrier": ["eb-mbd"],
 }
 
-# ── Tuning eval set (12 stratified scenarios per block) ───────────────────
 TUNING_SCENARIOS: dict[str, list[str]] = {
     "A": [
         "A_conc05_thick", "A_conc05_bimodal",
@@ -106,42 +100,80 @@ TUNING_SEEDS = [0, 1]
 
 GROUPS = list(GRID.keys())
 
-# ── SLURM template ─────────────────────────────────────────────────────────
-SLURM_TEMPLATE = """\
+DEFAULT_ACCOUNT = "rrg-bengioy-ad"
+DEFAULT_CPUS    = 4
+DEFAULT_MEM     = "16G"
+DEFAULT_TIME    = "1:00:00"
+
+# ── SLURM array template ──────────────────────────────────────────────────
+SLURM_ARRAY_TEMPLATE = """\
 #!/bin/bash
-#SBATCH --job-name=tune-{group}-{block}-{scenario}-g{grid_idx:04d}
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=4:00:00
-#SBATCH --output=slurm_logs/tune_{group}_{block}_{scenario}_g{grid_idx:04d}_%j.out
-#SBATCH --error=slurm_logs/tune_{group}_{block}_{scenario}_g{grid_idx:04d}_%j.err
+#SBATCH --account={account}
+#SBATCH --job-name=tune-{group}-{block}
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={mem}
+#SBATCH --time={time}
+#SBATCH --array={array_spec}
+#SBATCH --output=slurm_logs/tune_{group}_{block}_%A_%a.out
+#SBATCH --error=slurm_logs/tune_{group}_{block}_%A_%a.err
 
 set -e
 cd "${{SLURM_SUBMIT_DIR:-.}}"
 export PATH="${{HOME}}/.local/bin:${{PATH}}"
 
-# Add bundled nvidia CUDA libs so JAX can find them (no-op on CPU nodes)
+# Add bundled nvidia CUDA libs so JAX can find them (no-op on CPU-only nodes)
 NVIDIA_LIBS=$(find .venv/lib -path "*/nvidia/*/lib" -type d 2>/dev/null | tr '\\n' ':')
 export LD_LIBRARY_PATH="${{NVIDIA_LIBS}}${{LD_LIBRARY_PATH}}"
 
-# Per-grid-point overrides written by submit_tuning.py
-OVERRIDES_JSON='{overrides_json}'
+# ── Array decode ──────────────────────────────────────────────────────────
+SCENARIOS=({scenarios_bash})
+N_SCENARIOS=${{#SCENARIOS[@]}}
+N_GRID={n_grid}
+
+TASK_ID=$SLURM_ARRAY_TASK_ID
+SCENARIO_IDX=$((TASK_ID % N_SCENARIOS))
+GRID_IDX=$((TASK_ID / N_SCENARIOS))
+SCENARIO=${{SCENARIOS[$SCENARIO_IDX]}}
+GRID_IDX_PADDED=$(printf '%04d' $GRID_IDX)
+
+# ── Load grid overrides ───────────────────────────────────────────────────
+GRID_JSON="{output_dir}/tuning/{group}/grid.json"
+OVERRIDES_JSON=$(uv run python -c "
+import json
+g = json.load(open('$GRID_JSON'))
+print(json.dumps(g[str($GRID_IDX)]))
+")
+
+OUTPUT_SUBPATH="tuning/{group}/grid_${{GRID_IDX_PADDED}}"
+
+echo "─── Task $TASK_ID: block={block} scenario=$SCENARIO grid=$GRID_IDX ───"
+echo "Overrides: $OVERRIDES_JSON"
 {base_overrides_export}
 
-{trial_lines}
+# ── Run all (planner × seed) trials for this (scenario, grid) ──────────────
+{trial_loop}
 """
 
-_TRIAL_LINE_TEMPLATE = (
-    'uv run python run_experiment_trial.py'
-    ' --block {block}'
-    ' --scenario {scenario}'
-    ' --planner {planner}'
-    ' --seed {seed}'
-    ' --output-dir {output_dir}'
-    ' --output-subpath {output_subpath}'
-    ' --overrides-json "$OVERRIDES_JSON"'
-    '{base_overrides_arg}'
-)
+_TRIAL_LOOP_TEMPLATE = """\
+for PLANNER in {planners_bash}; do
+    for SEED in {seeds_bash}; do
+        OUT_JSON="{output_dir}/${{OUTPUT_SUBPATH}}/{block}/${{SCENARIO}}/${{PLANNER}}/seed_${{SEED}}.json"
+        if [ -f "$OUT_JSON" ]; then
+            echo "SKIP $OUT_JSON (exists)"
+            continue
+        fi
+        echo "▸ planner=$PLANNER seed=$SEED"
+        uv run python run_experiment_trial.py \\
+            --block {block} \\
+            --scenario "$SCENARIO" \\
+            --planner "$PLANNER" \\
+            --seed "$SEED" \\
+            --output-dir {output_dir} \\
+            --output-subpath "$OUTPUT_SUBPATH" \\
+            --overrides-json "$OVERRIDES_JSON"{base_overrides_arg}
+    done
+done
+"""
 
 
 def _enumerate_grid(group: str) -> list[dict]:
@@ -153,7 +185,7 @@ def _enumerate_grid(group: str) -> list[dict]:
 
 
 def _write_grid_index(output_root: Path, group: str, grid: list[dict]) -> Path:
-    """Write the {grid_idx: overrides} map to {tuning_dir}/{group}/grid.json."""
+    """Write the {grid_idx: overrides} map to outputs/tuning/{group}/grid.json."""
     grid_path = output_root / "tuning" / group / "grid.json"
     grid_path.parent.mkdir(parents=True, exist_ok=True)
     grid_path.write_text(json.dumps(
@@ -163,100 +195,127 @@ def _write_grid_index(output_root: Path, group: str, grid: list[dict]) -> Path:
     return grid_path
 
 
-def _write_slurm_script(
-    *, scripts_dir: Path,
-    group: str, block: str, scenario: str, grid_idx: int,
-    overrides: dict, output_dir: str,
+def _compute_array_spec(
+    n_scenarios: int, n_grid: int,
+    scenario_filter: str | None, scenario_list: list[str],
+    grid_filter: int | None,
+    explicit_spec: str | None,
+) -> str:
+    """Return a SLURM --array spec string.
+
+    If --array-spec is given, use it verbatim. Otherwise compute from
+    --scenario / --grid-idx filters; defaults to the full range.
+    """
+    if explicit_spec is not None:
+        return explicit_spec
+
+    total = n_scenarios * n_grid
+    if scenario_filter is None and grid_filter is None:
+        return f"0-{total - 1}"
+
+    scenario_indices = (range(n_scenarios) if scenario_filter is None
+                        else [scenario_list.index(scenario_filter)])
+    grid_indices = (range(n_grid) if grid_filter is None
+                    else [grid_filter])
+
+    task_ids = sorted({
+        grid_idx * n_scenarios + scn_idx
+        for grid_idx in grid_indices
+        for scn_idx in scenario_indices
+    })
+    return ",".join(str(t) for t in task_ids)
+
+
+def _build_array_script(
+    *, group: str, block: str,
+    grid: list[dict], output_dir: str,
+    account: str, cpus: int, mem: str, time: str,
+    array_spec: str,
     base_overrides_file: str | None,
-) -> Path:
-    output_subpath = f"tuning/{group}/grid_{grid_idx:04d}"
+) -> str:
+    scenarios     = TUNING_SCENARIOS[block]
+    scenarios_bash = " ".join(shlex.quote(s) for s in scenarios)
+    planners      = PLANNERS_BY_GROUP[group]
+    planners_bash = " ".join(shlex.quote(p) for p in planners)
+    seeds_bash    = " ".join(str(s) for s in TUNING_SEEDS)
 
     base_overrides_arg = (
-        f' --overrides-file "{base_overrides_file}"' if base_overrides_file else ""
+        f' \\\n            --overrides-file "{base_overrides_file}"'
+        if base_overrides_file else ""
     )
     base_overrides_export = (
-        f'# Conditional on tuned weights from previous group:\n'
-        f'BASE_OVERRIDES_FILE="{base_overrides_file}"'
+        f'echo "Base overrides: {base_overrides_file}"'
         if base_overrides_file else ""
     )
 
-    trial_lines = []
-    for planner in PLANNERS_BY_GROUP[group]:
-        for seed in TUNING_SEEDS:
-            trial_lines.append(_TRIAL_LINE_TEMPLATE.format(
-                block=block,
-                scenario=scenario,
-                planner=planner,
-                seed=seed,
-                output_dir=output_dir,
-                output_subpath=output_subpath,
-                base_overrides_arg=base_overrides_arg,
-            ))
-    trial_lines_str = "\n".join(trial_lines)
-
-    # JSON must survive shell single-quoting: escape any embedded single quotes.
-    overrides_json = json.dumps(overrides).replace("'", "'\"'\"'")
-
-    content = SLURM_TEMPLATE.format(
-        group=group,
+    trial_loop = _TRIAL_LOOP_TEMPLATE.format(
+        planners_bash=planners_bash,
+        seeds_bash=seeds_bash,
+        output_dir=output_dir,
         block=block,
-        scenario=scenario,
-        grid_idx=grid_idx,
-        overrides_json=overrides_json,
-        base_overrides_export=base_overrides_export,
-        trial_lines=trial_lines_str,
+        base_overrides_arg=base_overrides_arg,
     )
 
-    path = scripts_dir / f"tune_{group}_{block}_{scenario}_g{grid_idx:04d}.sh"
-    path.write_text(content)
-    return path
-
-
-def _all_results_exist(output_dir: Path, group: str, grid_idx: int,
-                       block: str, scenario: str) -> bool:
-    """True iff every (planner × seed) JSON for this (group, grid, scn) exists."""
-    base = (output_dir / "tuning" / group / f"grid_{grid_idx:04d}"
-            / block / scenario)
-    for planner in PLANNERS_BY_GROUP[group]:
-        for seed in TUNING_SEEDS:
-            if not (base / planner / f"seed_{seed}.json").exists():
-                return False
-    return True
+    return SLURM_ARRAY_TEMPLATE.format(
+        account=account,
+        group=group,
+        block=block,
+        cpus=cpus,
+        mem=mem,
+        time=time,
+        array_spec=array_spec,
+        scenarios_bash=scenarios_bash,
+        n_grid=len(grid),
+        output_dir=output_dir,
+        base_overrides_export=base_overrides_export,
+        trial_loop=trial_loop,
+    )
 
 
 def main():
     p = argparse.ArgumentParser(
-        description="Submit SLURM jobs for the planner-weight tuning grid."
+        description="Submit a SLURM job array for the planner-weight tuning grid."
     )
     p.add_argument("--block", choices=["A", "B"],
                    help="Submit only this block (default: both)")
     p.add_argument("--group", choices=GROUPS, required=True,
                    help="Tuning group: astar | shared_trajopt | eb_mbd_barrier")
     p.add_argument("--scenario",
-                   help="Submit only this scenario ID (must be in the tuning eval set)")
+                   help="Restrict array to one scenario ID (must be in the tuning eval set)")
     p.add_argument("--grid-idx", type=int,
-                   help="Submit only this grid index (for re-runs / debugging)")
+                   help="Restrict array to one grid index (for re-runs / debugging)")
+    p.add_argument("--array-spec", default=None,
+                   help=("Verbatim SLURM --array spec, e.g. '0-100', '42,108', "
+                         "'0-767%%50'. Overrides --scenario / --grid-idx filters. "
+                         "Default: full range."))
     p.add_argument("--base-overrides-file", default=None,
-                   help=("Path to a JSON of base overrides applied BEFORE the grid "
-                         "overrides. Required for --group eb_mbd_barrier so the "
-                         "previously tuned shared_trajopt weights are reused; "
-                         "typically tuned_weights/{block}/shared_trajopt.json."))
+                   help=("JSON of base overrides applied BEFORE the grid overrides. "
+                         "Required for --group eb_mbd_barrier; typically "
+                         "tuned_weights/{block}/shared_trajopt.json."))
+    p.add_argument("--account", default=DEFAULT_ACCOUNT,
+                   help=f"Alliance account (default: {DEFAULT_ACCOUNT})")
+    p.add_argument("--cpus", type=int, default=DEFAULT_CPUS,
+                   help=f"--cpus-per-task (default: {DEFAULT_CPUS})")
+    p.add_argument("--mem", default=DEFAULT_MEM,
+                   help=f"--mem (default: {DEFAULT_MEM})")
+    p.add_argument("--time", default=DEFAULT_TIME,
+                   help=f"--time (default: {DEFAULT_TIME})")
     p.add_argument("--output-dir", default="outputs",
                    help="Root output directory (default: outputs)")
     p.add_argument("--scripts-dir", default="slurm_scripts",
-                   help="Directory to write per-job sbatch scripts")
+                   help="Directory to write per-array sbatch scripts")
     p.add_argument("--dry-run", action="store_true",
-                   help="Print sbatch commands without executing")
+                   help="Write the array script(s) and print sbatch commands without submitting")
     p.add_argument("--submit", action="store_true",
-                   help="Actually submit all jobs via sbatch")
+                   help="Write the array script(s) and submit via sbatch")
     p.add_argument("--count", action="store_true",
-                   help="Print the number of jobs that would be submitted and exit")
+                   help="Print the number of array tasks and total trials, then exit")
     args = p.parse_args()
 
     if not (args.dry_run or args.submit or args.count):
         p.error("Specify one of --dry-run, --submit, --count")
 
-    if args.group == "eb_mbd_barrier" and not args.base_overrides_file:
+    if args.group == "eb_mbd_barrier" and not args.base_overrides_file and not args.count:
         p.error("--base-overrides-file is required for --group eb_mbd_barrier "
                 "(should point at the tuned shared_trajopt weights for the block).")
 
@@ -264,66 +323,83 @@ def main():
     output_dir   = Path(args.output_dir)
     scripts_dir  = Path(args.scripts_dir)
 
-    if not args.count:
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        Path("slurm_logs").mkdir(exist_ok=True)
-
     grid = _enumerate_grid(args.group)
-    if not args.count:
-        grid_path = _write_grid_index(output_dir, args.group, grid)
-        print(f"Grid index ({len(grid)} points) → {grid_path}", file=sys.stderr)
-
-    # Enumerate jobs
-    jobs = []
-    for block in blocks:
-        scenarios = TUNING_SCENARIOS[block]
-        if args.scenario:
-            if args.scenario not in scenarios:
-                p.error(f"--scenario {args.scenario!r} is not in the tuning eval set "
-                        f"for block {block}: {scenarios}")
-            scenarios = [args.scenario]
-        for scenario in scenarios:
-            for grid_idx, overrides in enumerate(grid):
-                if args.grid_idx is not None and grid_idx != args.grid_idx:
-                    continue
-                jobs.append((block, scenario, grid_idx, overrides))
+    n_grid = len(grid)
+    n_scn  = len(TUNING_SCENARIOS["A"])  # 12 for both blocks
+    n_trials_per_task = len(PLANNERS_BY_GROUP[args.group]) * len(TUNING_SEEDS)
 
     if args.count:
-        n_trials_per_job = len(PLANNERS_BY_GROUP[args.group]) * len(TUNING_SEEDS)
-        print(f"{len(jobs)} jobs  ×  {n_trials_per_job} trials/job  =  "
-              f"{len(jobs) * n_trials_per_job} trials")
+        total_tasks  = n_grid * n_scn * len(blocks)
+        total_trials = total_tasks * n_trials_per_task
+        print(f"{total_tasks} array tasks across {len(blocks)} block(s) "
+              f"×  {n_trials_per_task} trials/task  =  {total_trials} trials")
         return
 
-    # Submit
-    n_submitted = 0
-    n_skipped   = 0
-    for block, scenario, grid_idx, overrides in jobs:
-        if _all_results_exist(output_dir, args.group, grid_idx, block, scenario):
-            n_skipped += 1
-            continue
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    Path("slurm_logs").mkdir(exist_ok=True)
+    _write_grid_index(output_dir, args.group, grid)
 
-        script_path = _write_slurm_script(
-            scripts_dir=scripts_dir,
-            group=args.group, block=block, scenario=scenario,
-            grid_idx=grid_idx, overrides=overrides,
-            output_dir=str(output_dir),
+    for block in blocks:
+        array_spec = _compute_array_spec(
+            n_scenarios=n_scn, n_grid=n_grid,
+            scenario_filter=args.scenario, scenario_list=TUNING_SCENARIOS[block],
+            grid_filter=args.grid_idx,
+            explicit_spec=args.array_spec,
+        )
+
+        script = _build_array_script(
+            group=args.group, block=block,
+            grid=grid, output_dir=str(output_dir),
+            account=args.account, cpus=args.cpus, mem=args.mem, time=args.time,
+            array_spec=array_spec,
             base_overrides_file=args.base_overrides_file,
         )
 
+        script_path = scripts_dir / f"tune_array_{args.group}_{block}.sh"
+        script_path.write_text(script)
+
+        # Report sizing
+        n_tasks = (array_spec.count(",") + array_spec.count("-")
+                   + (1 if "," not in array_spec and "-" not in array_spec else 0))
+        # Quick task-count for ranges: just parse it
+        try:
+            n_tasks = _count_array_spec(array_spec)
+        except ValueError:
+            n_tasks = "?"
+        print(f"[{block}/{args.group}] array_spec={array_spec}  "
+              f"({n_tasks} tasks × {n_trials_per_task} trials)  → {script_path}")
+
         if args.dry_run:
-            print(f"sbatch {script_path}")
+            print(f"  sbatch {script_path}")
         elif args.submit:
             ret = subprocess.run(["sbatch", str(script_path)],
                                  capture_output=True, text=True)
             if ret.returncode != 0:
-                print(f"ERROR submitting {script_path}: {ret.stderr.strip()}",
+                print(f"  ERROR submitting {script_path}: {ret.stderr.strip()}",
                       file=sys.stderr)
             else:
-                print(ret.stdout.strip())
-        n_submitted += 1
+                print(f"  {ret.stdout.strip()}")
 
-    print(f"\nDone. {n_submitted} jobs {'submitted' if args.submit else 'listed'}, "
-          f"{n_skipped} already complete (skipped).", file=sys.stderr)
+    print("\nDone.", file=sys.stderr)
+
+
+def _count_array_spec(spec: str) -> int:
+    """Count the number of tasks implied by a SLURM array spec."""
+    # Strip any %N concurrency suffix
+    spec = spec.split("%")[0]
+    n = 0
+    for part in spec.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            # Handle stride a-b:s
+            if ":" in hi:
+                hi, stride = hi.split(":")
+                n += (int(hi) - int(lo)) // int(stride) + 1
+            else:
+                n += int(hi) - int(lo) + 1
+        else:
+            n += 1
+    return n
 
 
 if __name__ == "__main__":
