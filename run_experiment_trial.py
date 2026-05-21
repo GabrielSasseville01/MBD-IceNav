@@ -138,11 +138,15 @@ def _make_plan_cfg(planner: str, horizon: int = DEFAULT_HORIZON,
         planning_margin=COSTMAP_MARGIN,
         # A* must plan paths that cross the goal line, not merely approach it
         planning_goal_tolerance=0.0,
-        # Fine-grained A* for the 300×750 m synthetic map
-        planning_resolution=1.0,
-        planning_num_headings=32,
+        # Coarsened A* lattice for tractability on AMD CPU clusters.
+        # State space = (W/res)·(H/res)·num_headings: at res=2, headings=16
+        # this is ~900k states (vs 7.2M at res=1, headings=32). Max iterations
+        # lowered to 100k so A* fails fast on dense scenes; on failure the trial
+        # falls back to the straight-line trajectory — which is itself a result.
+        planning_resolution=2.0,
+        planning_num_headings=16,
         planning_turning_radius=50.0,
-        planning_max_iterations=500_000,
+        planning_max_iterations=100_000,
     )
 
     if planner == "ilqr":
