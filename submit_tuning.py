@@ -103,7 +103,7 @@ GROUPS = list(GRID.keys())
 DEFAULT_ACCOUNT = "rrg-bengioy-ad"
 DEFAULT_CPUS    = 4
 DEFAULT_MEM     = "16G"
-DEFAULT_TIME    = "1:00:00"
+DEFAULT_TIME    = "2:30:00"
 
 # ── SLURM array template ──────────────────────────────────────────────────
 SLURM_ARRAY_TEMPLATE = """\
