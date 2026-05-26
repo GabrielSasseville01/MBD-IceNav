@@ -1,12 +1,354 @@
 # DPDEM: Dilated-Polyhedron-based Discrete Element Method
 
-Implementation of ice–ship interaction simulation based on:
+Ice–ship interaction simulator + ice-navigation planner benchmark. Physics from:
 
 > Liu et al. (2021) — *Dilated-polyhedron-based DEM analysis of the ice resistance on ship hulls in escort operations in level ice* — Marine Structures 80
 
 > Wang et al. (2024) — *Interaction between ice cover and floating platform simulated by dilated-polyhedron-based DEM* — Ocean Engineering 301
 
 The main entry point is **MEDEA ship–ice fracture**: satellite-derived ice floes (MEDEA Fram Strait) with DPDEM-style bond fracture and ship–ice interaction. The physics are fully **JAX-accelerated** (JIT-compiled, GPU/TPU-ready via `jax.lax.scan`). The run script supports several toy scenarios, five planners (lattice A*, diffusion-MPC, MPPI, SQP, GradCEM), and multiple visualizations.
+
+Example outputs from a single planned run on the full MEDEA map (lattice planner, `outputs/my_run/`):
+
+| 2D fracture | 3D fracture | Costmap + planned/actual path |
+|:-:|:-:|:-:|
+| <video src="outputs/my_run/medea_ship_fracture.mp4" controls width="280"></video> | <video src="outputs/my_run/medea_ship_fracture_3d.mp4" controls width="280"></video> | <video src="outputs/my_run/costmap_medea_ship_fracture.mp4" controls width="280"></video> |
+| [`medea_ship_fracture.mp4`](outputs/my_run/medea_ship_fracture.mp4) | [`medea_ship_fracture_3d.mp4`](outputs/my_run/medea_ship_fracture_3d.mp4) | [`costmap_medea_ship_fracture.mp4`](outputs/my_run/costmap_medea_ship_fracture.mp4) |
+
+> The HTML5 `<video>` tags above render in most local markdown viewers (VS Code preview, MkDocs, etc.) but **not in GitHub's rendered README** — on GitHub, use the file links below each cell instead.
+
+---
+
+## TL;DR — first five minutes
+
+```bash
+# 1. Install (uv is the supported toolchain)
+uv sync
+
+# 2. Smallest possible run: 3 synthetic floes, straight path, ~30 s
+uv run python run_medea_ship_fracture.py --simple --output-dir outputs/hello
+
+# 3. Same field, but plan a path through the ice with the default planner (diffusion-MPC)
+uv run python run_medea_ship_fracture.py --simple --plan --output-dir outputs/hello_plan
+
+# 4. Full MEDEA Fram-Strait map with lattice A* (reproduces outputs/my_run)
+uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice \
+    --output-dir outputs/my_run
+```
+
+After (4), look in `outputs/my_run/` for `medea_ship_fracture.mp4`, `medea_ship_fracture_3d.mp4`, `costmap_medea_ship_fracture.mp4`, `lattice_search_medea.mp4`, and `hull_impact_medea.png`. Step (4) needs the MEDEA data file in `data/` — see [Data and dependencies](#data-and-dependencies).
+
+---
+
+## Repository tour
+
+```
+DPDEM/
+├── run_medea_ship_fracture.py   ← main entry point (simulate + plan + animate)
+├── run_experiment_trial.py      ← single (scenario, planner, seed) trial for the benchmark
+├── run_smoke_test.py            ← runs one planner against every scenario locally
+├── submit_experiments.py        ← submit the full benchmark to SLURM
+├── submit_tuning.py             ← hyper-parameter tuning over SLURM job arrays
+├── medea_ice_ship/              ← simulation + planners library (JAX backend)
+│   ├── jax_simulation.py        ← JIT'd physics (chunked-replan and full-scan)
+│   ├── jax_costmap.py           ← GPU-native costmap rasterisation
+│   ├── jax_mbd_planner.py       ← model-based diffusion MPC + EB-MBD
+│   ├── jax_mppi_planner.py / jax_sqp_planner.py / jax_gradcem_planner.py
+│   ├── planning.py              ← lattice A* (motion primitives, Dubins-like)
+│   ├── ice_field_generator.py   ← random convex-polygon ice fields (AUTO-IceNav style)
+│   ├── synthetic_map.py         ← fixed 300×750 m synthetic scenarios used by the benchmark
+│   ├── ocean_current.py / seanet.py     ← uniform & learned currents
+│   ├── config.py                ← all simulation + run parameters (dataclasses)
+│   └── …                        ← bonds, geometry, vessel dynamics, visualization
+├── dpdem/                       ← lower-level DPDEM modules (planning, control, navigation, …)
+├── examples/                    ← self-contained toy demos (see "Toy problems" below)
+├── scripts/                     ← data preprocessing + SeaNet training
+├── slurm_scripts/               ← pre-generated SLURM sbatch files (Block A grid)
+├── data/                        ← MEDEA PNG, polygons pkl, ridge costmap, SeaNet weights
+├── docs/                        ← deeper notes: DIFFUSION_MPC, RIDGE_COSTMAP, EXPERIMENTS, …
+└── outputs/                     ← all generated artefacts land here (one sub-dir per run)
+```
+
+### Workflow at a glance
+
+```
+                                ┌──────────────────────────────┐
+                                │ Ice field source             │
+                                │  • --simple    (3 floes)     │
+                                │  • --full-map  (MEDEA pkl)   │
+                                │  • --toy-sparse / examples/* │
+                                │  • synthetic_map (benchmark) │
+                                └──────────────┬───────────────┘
+                                               │ polygons, centroids, thicknesses
+                                               ▼
+┌──────────────────┐   costmap   ┌──────────────────────────────┐
+│ Planner          │ ◄────────── │ jax_costmap.build_costmap_jax │
+│  lattice A*      │             │  (KE/disk rasterisation, GPU) │
+│  diffusion-MPC   │             └──────────────────────────────┘
+│  MPPI            │
+│  SQP             │   plan      ┌──────────────────────────────┐
+│  GradCEM         │ ──────────► │ Ship reference trajectory     │
+└──────────────────┘             └──────────────┬───────────────┘
+                                                ▼
+                                ┌──────────────────────────────┐
+                                │ jax_simulation               │
+                                │  • DPDEM physics (Eqs. 7–11) │
+                                │  • bond fracture (Eqs. 14–19)│
+                                │  • 3-DOF ship + PD tracking  │
+                                │  • receding-horizon replan   │
+                                └──────────────┬───────────────┘
+                                               ▼
+                                ┌──────────────────────────────┐
+                                │ visualization                │
+                                │  2D / 3D / costmap / lattice │
+                                │  / hull impact / denoising   │
+                                └──────────────────────────────┘
+```
+
+Every run writes to one **`--output-dir`** (default `outputs/default/`). The simulation is deterministic from `--seed`; rerunning with the same flags reproduces every artefact bit-for-bit.
+
+---
+
+## Install
+
+```bash
+# Recommended: uv (https://docs.astral.sh/uv/)
+uv sync
+
+# Alternative: pip
+pip install -r requirements.txt
+```
+
+All commands in this README assume `uv run python ...`. With plain `pip` install, drop the `uv run` prefix.
+
+The first JAX-backed run JIT-compiles the physics kernel (~30–60 s); subsequent runs reuse the cached compilation.
+
+---
+
+## Running the full MEDEA-map simulation
+
+The MEDEA Fram-Strait satellite scene is the headline scenario. The ship travels diagonally from bottom-left to top-right through a real ice field, and the planner has to find a navigable path. **Requires `data/ice_floes_MEDEA_fram_20100629.pkl`** (see [Data and dependencies](#data-and-dependencies)).
+
+```bash
+# 1. Straight diagonal, no planning — ship just plows through
+uv run python run_medea_ship_fracture.py --full-map --output-dir outputs/medea_straight
+
+# 2. Lattice A* (reproduces outputs/my_run shown at the top of this README)
+uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice \
+    --output-dir outputs/my_run
+
+# 3. Diffusion-MPC (default planner — fully GPU)
+uv run python run_medea_ship_fracture.py --full-map --plan \
+    --output-dir outputs/medea_diffusion
+
+# 4. MPPI (importance-weighted sampling)
+uv run python run_medea_ship_fracture.py --full-map --plan --planner mppi \
+    --output-dir outputs/medea_mppi
+
+# 5. SQP (multiple-shooting) or GradCEM (gradient + cross-entropy)
+uv run python run_medea_ship_fracture.py --full-map --plan --planner sqp     --output-dir outputs/medea_sqp
+uv run python run_medea_ship_fracture.py --full-map --plan --planner gradcem --output-dir outputs/medea_gradcem
+```
+
+Each command produces, in `--output-dir`:
+
+| File | Description |
+|------|-------------|
+| `medea_ship_fracture.mp4` | 2D top-down animation (ice floes, bonds, ship hull, fracture). |
+| `medea_ship_fracture_3d.mp4` | Same simulation with z-tilt, submergence, 3D hull. |
+| `costmap_medea_ship_fracture.mp4` | Costmap background, **red** = initial plan, **blue** = actual ship path. |
+| `lattice_search_medea.mp4` | A* node expansion + chosen path (only with `--planner lattice`). |
+| `hull_impact_medea.png` | Accumulated impact vectors on the ship hull (AUTO-IceNav style). |
+
+Useful add-on flags for these commands:
+- `--warm-start` — sampling/gradient planners seed from an A* path instead of cold-starting.
+- `--kinematic-ship` — disable ship dynamics, place the hull on the plan each frame (sanity check that the plan is feasible).
+- `--plan-only` — plan once, save costmap+path PNG, exit (no simulation; fastest way to debug a planner).
+- `--no-3d` — skip the 3D MP4 (saves ~half the rendering time).
+- `--quick` — simulation only, no animations.
+- `--gif` — write GIFs instead of MP4 (slower, larger files).
+
+Open-water example, no planning:
+
+<video src="outputs/my_run/medea_ship_fracture.mp4" controls width="380"></video>
+
+Costmap movie (red = plan, blue = actual):
+
+<video src="outputs/my_run/costmap_medea_ship_fracture.mp4" controls width="380"></video>
+
+---
+
+## Generating your own synthetic maps
+
+There are three independent ways to build a custom ice scene:
+
+### 1. `--simple` / `--toy-sparse` (zero code)
+
+`run_medea_ship_fracture.py` ships with two built-in synthetic scenes:
+
+| Flag | Scene |
+|------|-------|
+| `--simple` | 3 hand-placed floes, straight left→right path, no MEDEA data required. |
+| `--toy-sparse` | Sparser synthetic field for plan-vs-execute comparisons. |
+
+Combine with `--plan`, `--planner …`, `--thick-ice M`, `--seed N`, etc. as for `--full-map`.
+
+### 2. Random convex-polygon fields — `ice_field_generator.generate_ice_field`
+
+`medea_ice_ship/ice_field_generator.py` produces AUTO-IceNav-style random convex-polygon ice fields at a target concentration. The simplest way to use it for a one-off scene:
+
+```python
+from medea_ice_ship.ice_field_generator import generate_ice_field
+
+field = generate_ice_field(
+    concentration=0.35,            # 35% area coverage
+    map_shape=(1400.0, 1400.0),    # (length_y, width_x) in metres
+    ice_start_y=0.0,               # leave clear water below this y
+    min_radius=5.0, max_radius=80.0,
+    thickness_range=(0.3, 3.5),    # m
+    seed=42,
+)
+# field keys: polygons, centroids, thicknesses, concentration, domain
+```
+
+`examples/benchmark_planners.py` is the canonical end-to-end example — it generates random fields at a list of concentrations, runs each selected planner, and saves planned/actual paths + a metrics CSV:
+
+```bash
+# Plan-only (no physics) — fastest path comparison across planners
+uv run python examples/benchmark_planners.py --no-sim \
+    --concentrations 0.2 0.3 0.4 0.5 --output-dir outputs/my_benchmark
+
+# Full sim (slower) — adds result_*.png and benchmark_results.csv
+uv run python examples/benchmark_planners.py \
+    --planners lattice diffusion-mpc mppi --concentrations 0.3 \
+    --output-dir outputs/my_benchmark
+```
+
+### 3. Fixed-grid synthetic benchmark — `medea_ice_ship.synthetic_map`
+
+For the formal benchmark we use a **fixed 300 × 750 m corridor**, ship at (150, 50) heading +y, goal line y = 700. Scenarios vary concentration (5–70 %), thickness mode (`uniform_thin` / `uniform_thick` / `bimodal`), and presence of a uniform current. The scenario grid is enumerated by `synthetic_map.list_scenarios('A')` and `list_scenarios('B')`.
+
+Run a single trial:
+
+```bash
+uv run python run_experiment_trial.py \
+    --block A \
+    --scenario A_conc30_thin \
+    --planner mbd \
+    --seed 0 \
+    --output-dir outputs/my_experiment
+```
+
+Run one planner against every scenario locally (smoke test):
+
+```bash
+uv run python run_smoke_test.py --planner astar --with-plots
+uv run python run_smoke_test.py --planner mbd   --with-plots --with-denoising-movie
+```
+
+Submit the whole grid to SLURM:
+
+```bash
+uv run python submit_experiments.py        # generate + submit sbatch files in slurm_scripts/
+```
+
+See [`docs/EXPERIMENT_PROTOCOL.md`](docs/EXPERIMENT_PROTOCOL.md) and [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for the experiment design, and `scripts/README_SLURM.md` for SLURM specifics.
+
+---
+
+## Toy problems
+
+Standalone scripts under `examples/` exercise individual planner behaviours without needing the MEDEA data. They are the fastest way to develop intuition for each planner.
+
+### Bimodal floe — multimodal collapse demo
+
+A single large floe centred on the straight-line path, leaving two equivalent corridors. Showcases how vanilla MBD averages the two modes and steers straight into the floe, vs how **EB-MBD** picks one corridor cleanly.
+
+```bash
+uv run python examples/toy_mbd_bimodal.py
+uv run python examples/toy_mbd_bimodal.py --use-best-sample
+uv run python examples/toy_mbd_bimodal.py --nsample 256 --ndiffuse 30
+```
+
+Outputs land in `outputs/toy_mbd_bimodal/`:
+
+| File | Description |
+|------|-------------|
+| `bimodal_costmap.png` | Costmap + the two ideal bypass routes. |
+| `bimodal_result.png` | Final mean trajectory vs global-best sample. |
+| `eb_MBD.mp4` | EB-MBD denoising evolution. |
+| `denoising/replan_0000_denoising.mp4` | Per-iteration sampled-trajectory fan. |
+| `bimodal_*_histogram.mp4`, `cost_category_analysis.mp4`, … | Diagnostic per-iteration histograms and cost-category breakdowns. |
+
+<video src="outputs/toy_mbd_bimodal/eb_MBD.mp4" controls width="380"></video>
+
+### MBD scenario suite — five stress tests
+
+`examples/toy_mbd_scenarios.py` packages five synthetic costmaps designed to break specific MBD failure modes (thin corridors, sequential gates, asymmetric corridors, clutter, hard rectangular obstacles). Detailed flag table is in [§9 below](#9-mbd-scenario-experiments-toy_mbd_scenariospy).
+
+```bash
+# One scenario × one method
+uv run python examples/toy_mbd_scenarios.py --scenario thin_corridor --method eb_homotopy_mbd
+
+# One scenario × every method (writes a comparison table)
+uv run python examples/toy_mbd_scenarios.py --scenario sequential_gates --run-all-methods
+```
+
+Each (scenario, method) directory contains `costmap.png`, `result.png`, `trajectory_fan.mp4`, optional `eb_barrier_schedule.mp4` / `homotopy_class_evolution.png`, and a `denoising/` movie folder.
+
+### Wall-with-opening planner toy
+
+Densely packed ice with one gap; tests planner ability to detour to the opening rather than head straight.
+
+```bash
+uv run python examples/toy_planner_opening.py
+uv run python examples/toy_planner_opening.py --planner diffusion-mpc
+uv run python examples/toy_planner_opening.py --damage-cost     # damage-aware costmap
+```
+
+Outputs (`outputs/toy_planner/`): `toy_planner_lattice_search.mp4`, `toy_planner_opening.mp4`, `toy_planner_opening_costmap.mp4`, `toy_planner_hull_impact.png`.
+
+### Thin-ice corridor toy
+
+Dense 10 m ice everywhere except a 1 m horizontal strip; tests whether a damage-aware planner routes through the thin strip.
+
+```bash
+uv run python examples/toy_planner_thin_corridor.py
+uv run python examples/toy_planner_thin_corridor.py --no-damage-cost   # baseline
+```
+
+Outputs (`outputs/toy_planner_thin_corridor/`): `toy_thin_corridor.mp4`, `toy_thin_corridor_3d.mp4`, `toy_thin_corridor_costmap.mp4`, `toy_thin_corridor_lattice_search.mp4`, `toy_thin_corridor_hull_impact.png`.
+
+### Other useful examples
+
+| Script | Purpose |
+|--------|---------|
+| `examples/visualize_costmap.py` | Render the costmap built from a simple ice field. |
+| `examples/visualize_planned_path.py` | Plan a path and overlay it on the costmap. |
+| `examples/visualize_diffusion.py` | Animate the MBD denoising trajectory distribution. |
+| `examples/benchmark_planners.py` | Random-ice planner benchmark (see [§10](#10-planner-benchmark-random-ice-fields-all-planners)). |
+| `examples/autonomous_navigation.py` | End-to-end navigator using `dpdem.navigation.AutonomousNavigator`. |
+| `examples/ship_dynamics_demo.py`, `thick_ice_unbreakable_demo.py` | Focused physics demos. |
+
+---
+
+## Output gallery (what to look for in `--output-dir`)
+
+| File pattern | Generated when | Description |
+|--------------|----------------|-------------|
+| `*_ship_fracture.mp4` | Always (unless `--quick`) | 2D top-down: floes, bonds, ship hull, fracture over time. |
+| `*_ship_fracture_3d.mp4` | Always unless `--no-3d` | Same run with z-tilt, submergence, 3D hull. |
+| `costmap_*.mp4` | `--plan` | Costmap background + red plan + blue actual path. |
+| `lattice_search_*.mp4` | `--plan --planner lattice` (unless `--no-lattice-search-movie`) | A* expansion + chosen path. |
+| `hull_impact_*.png` | When collisions occurred | Accumulated impact vectors on the hull. |
+| `plan_only_*.png` | `--plan-only` | Costmap + planned path + ice thickness (no simulation). |
+| `replan_NNNN_*` (density, top5, costs, terminal_scatter, denoising) | `--mbd-viz-dir DIR` (with diffusion-MPC) | Per-replan MBD diagnostics; add `--mbd-denoising-movie` for the per-replan denoising MP4. |
+| `eb_barrier_schedule.mp4` | EB methods (toy scenarios / `--eb-mbd`) | Barrier offset c(t) tightening over reverse diffusion. |
+| `homotopy_class_evolution.png` | homotopy methods | Sample-class assignments across diffusion iterations. |
+| `trajectory_fan.mp4` | toy scenario suite | Sampled trajectory fan + crossing histogram. |
+| `benchmark_results.csv` | `examples/benchmark_planners.py` (with sim) | Per-(concentration, planner) metrics: lengths, costs, impulse, fuel proxy. |
+
+File format defaults to **MP4**. Use `--gif` to write GIFs (slower, larger, single-threaded). All file paths above are relative to whatever you pass as `--output-dir` (default `outputs/default/`).
 
 ---
 
@@ -52,27 +394,9 @@ Use `--no-dpdem-bonds` to fall back to the legacy force-vs-strength model.
 
 ---
 
-## Quick start
+## Full command reference
 
-```bash
-# Install (uv recommended)
-uv sync
-# or: pip install -r requirements.txt
-
-# Simple synthetic ice field (3 floes, straight path, fast)
-uv run python run_medea_ship_fracture.py --simple
-
-# Same with planned path through ice (diffusion-MPC, cold start)
-uv run python run_medea_ship_fracture.py --simple --plan
-```
-
-Outputs go to `outputs/default/` by default (override with `--output-dir`). Use `--quick` to run simulation only (no animations).
-
----
-
-## Toy examples and commands
-
-All commands use `run_medea_ship_fracture.py` unless noted. Use `uv run python ...` to run with the project environment.
+The sections above (full-MEDEA, synthetic maps, toy problems) cover the common workflows. This section catalogues every command-line invocation in detail. All commands use `run_medea_ship_fracture.py` unless noted. Use `uv run python ...` to run with the project environment.
 
 ### 1. Simple straight (no planning)
 
@@ -360,22 +684,9 @@ uv run python examples/benchmark_planners.py --n-frames 200 --replan-every 150
 
 ---
 
-## Generated visualizations
+## Common flags (reference)
 
-| Output | When | Description |
-|--------|------|--------------|
-| **2D animation** | Always (unless `--quick`) | Top-down view: ice floes, bonds, ship hull; fracture and motion over time. `simple_ship_fracture.mp4` or `medea_ship_fracture.mp4`. |
-| **3D animation** | Always unless `--no-3d` | Same run with z/tilt and submergence; 3D hull. `simple_ship_fracture_3d.mp4` or `medea_ship_fracture_3d.mp4`. |
-| **Costmap movie** | When `--plan` | Costmap as background, ice outline, **red** = initial planned path, **blue** = actual ship path. `costmap_simple_ship_fracture.mp4` or `costmap_medea_ship_fracture.mp4`. |
-| **Lattice search movie** | When `--plan --planner lattice` (only for pure lattice; not for diffusion-mpc/mppi) and not `--no-lattice-search-movie` | A* search expansion and chosen path on the costmap. `lattice_search_simple.mp4` or `lattice_search_medea.mp4`. |
-| **Plan-only PNG** | When `--plan-only` | Costmap + planned path + ice thickness; saved to `plan_only_medea.png` (or `plan_only_simple` / `plan_only_toy_sparse`). No simulation. |
-| **Hull impact plot** | When ship has collisions (and not `--quick`) | Impulse vectors on the hull (AUTO-IceNav style). `hull_impact_simple.png` or `hull_impact_medea.png`. |
-
-File format: **MP4** by default; use `--gif` for GIF (slower, larger, no parallel workers). All paths are under the directory given by `--output-dir` (default `outputs/default`).
-
----
-
-## Common flags
+Shown by `run_medea_ship_fracture.py --help`; the ones most relevant for getting started are in the Quick-start and full-MEDEA sections above. Full reference:
 
 | Flag | Effect |
 |------|--------|
