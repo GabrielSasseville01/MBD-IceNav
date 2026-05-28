@@ -15,13 +15,15 @@ Usage:
         --output-dir outputs/experiments
 
 Planners:
-    astar       A* lattice planner (standalone, no trajectory optimizer)
-    mbd         Model-Based Diffusion (cold start, no A* warm-start)
-    eb-mbd      EB-MBD with emerging-barrier constraint (eb_c_max=800,
-                eb_mu=50000, eb_kappa=1.0)
-    mppi        Model Predictive Path Integral
-    rss         Random Single Shooting
-    ilqr        Box-iLQR
+    astar         A* lattice planner (standalone, no trajectory optimizer)
+    mbd           Model-Based Diffusion (cold start, no A* warm-start)
+    eb-mbd        EB-MBD with emerging-barrier constraint (eb_c_max=800,
+                  eb_mu=50000, eb_kappa=1.0)
+    astar-eb-mbd  EB-MBD warm-started from the A* lattice path (same EB
+                  parameters as eb-mbd; falls back to cold start if A* fails)
+    mppi          Model Predictive Path Integral
+    rss           Random Single Shooting
+    ilqr          Box-iLQR
 
 All planners share the same KE-based costmap and cost function:
   costmap integral (KE collision) + path length + x-arrival at goal line
@@ -77,7 +79,7 @@ from medea_ice_ship.planning import (
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────
-PLANNERS = ["astar", "mbd", "eb-mbd", "eb-mbd-ice", "mppi", "rss", "ilqr"]
+PLANNERS = ["astar", "mbd", "eb-mbd", "astar-eb-mbd", "mppi", "rss", "ilqr"]
 SEEDS    = [0, 1, 2, 3, 4]
 
 DT            = 0.05      # s — physics timestep (matches RunConfig default)
@@ -93,8 +95,11 @@ COSTMAP_MARGIN = 30.0     # m  (default 200 m is designed for 1400×1400 m maps)
 EB_C_MAX         = 600.0
 EB_MU            = 50000.0
 EB_KAPPA         = 1.0
-EB_GOAL_X_WEIGHT = 1.0
-EB_LENGTH_WEIGHT = 1.0
+
+# Terminal Euclidean goal-distance penalty weight (replaces goal-x cost +
+# path-length cost + goal-line constraint).  Matches the toy scenarios in
+# examples/toy_mbd_scenarios.py.
+TERMINAL_GOAL_DISTANCE_WEIGHT = 1.0
 
 
 # ── Config builder ─────────────────────────────────────────────────────────
@@ -129,11 +134,15 @@ def _make_plan_cfg(planner: str, horizon: int = DEFAULT_HORIZON,
         planning_ilqr_warm_start=False,
         # RSS: override to N=2048
         planning_rss_nsample=2048,
-        # Replanning uses goal_y_line, not a soft goal weight (overridden for iLQR below)
+        # Cost stack (matches examples/toy_mbd_scenarios.py): costmap integral
+        # + terminal Euclidean distance to goal_xy.  No path-length term, no
+        # goal-x soft cost, no goal-line conditioned distance term.  All MBD
+        # variants + MPPI + RSS get the Euclidean pull via
+        # terminal_goal_distance_weight at each call site; iLQR re-enables
+        # goal_weight=1.0 below to recover the same Euclidean terminal.
         planning_jax_mbd_goal_weight=0.0,
-        # Shared cost weights: path length + x-arrival at goal line (same as EB-MBD)
-        planning_jax_mbd_goal_x_weight=EB_GOAL_X_WEIGHT,
-        planning_jax_mbd_length_weight=EB_LENGTH_WEIGHT,
+        planning_jax_mbd_goal_x_weight=0.0,
+        planning_jax_mbd_length_weight=0.0,
         # Smaller margin for the synthetic map
         planning_margin=COSTMAP_MARGIN,
         # A* must plan paths that cross the goal line, not merely approach it
@@ -150,10 +159,10 @@ def _make_plan_cfg(planner: str, horizon: int = DEFAULT_HORIZON,
     )
 
     if planner == "ilqr":
-        # iLQR uses a smooth differentiable goal-line terminal cost instead of
-        # the non-differentiable big-M, so a large goal_weight is needed to provide
-        # gradient toward the goal line throughout the backward pass.
-        cfg = replace(cfg, planning_jax_mbd_goal_weight=100.0)
+        # iLQR uses make_terminal_cost(goal_xy, goal_weight, goal_y_line=None)
+        # which evaluates 1.0 * ||eta_T[:2] - goal_xy|| — matching the terminal
+        # Euclidean cost the MBD planners get via terminal_goal_distance_weight.
+        cfg = replace(cfg, planning_jax_mbd_goal_weight=TERMINAL_GOAL_DISTANCE_WEIGHT)
 
     if overrides:
         unknown = [k for k in overrides if not hasattr(cfg, k)]
@@ -224,17 +233,15 @@ def _straight_line_path(start_pose):
 def _make_reject_sampling_filter(plan_cfg):
     """
     Build a sample_filter_fn for standard MBD: at each denoising step, drop
-    samples that are OOB (any hull corner outside [X_LO, X_HI] in x or ship
-    centre below Y_LO in y) OR whose last waypoint does not cross the goal
-    line. No replacement — invalid samples are simply discarded.
-
-    Mirrors examples/toy_mbd_bimodal.py:1987-2017, parameterised with the
-    synthetic-map bounds.
+    samples whose hull or trajectory exits the map (left/right via hull-corner
+    check, bottom via ship-centre y).  Goal-reaching is not enforced here —
+    the terminal Euclidean cost provides the goal pull.  No replacement;
+    invalid samples are simply discarded.  Matches the reject filter in
+    examples/toy_mbd_scenarios.py.
     """
     _x_lo = float(X_LO)
     _x_hi = float(X_HI)
     _y_lo = float(Y_LO)
-    _goal = float(GOAL_Y_LINE)
     _half_l = plan_cfg.ship_length / 2.0
     _half_w = plan_cfg.ship_beam / 2.0
     _dx = np.array([0.0,  _half_l,  _half_l, -_half_l, -_half_l], dtype=np.float32)
@@ -251,9 +258,7 @@ def _make_reject_sampling_filter(plan_cfg):
                   - s[:, :, None] * _dy[None, None, :])
         hull_oob = ((hull_x < _x_lo) | (hull_x > _x_hi)).any(axis=(1, 2))
         y_oob = (ys < _y_lo).any(axis=1)
-        oob = hull_oob | y_oob
-        reaches_goal = ys[:, -1] >= _goal
-        return (~oob) & reaches_goal
+        return ~(hull_oob | y_oob)
 
     return sample_filter_fn
 
@@ -331,31 +336,77 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
             except Exception:
                 path = None
 
+        elif planner == "astar-eb-mbd":
+            # EB-MBD warm-started from the A* lattice path.  Build the dpdem
+            # CostMap, plan with A*, then hand that path to EB-MBD as the
+            # warm-start (lattice_path).  Falls back to cold start from the
+            # straight-line path if A* fails.
+            try:
+                astar_map, astar_bounds = _build_cost_map_astar(
+                    world_polygons, centroids, thicknesses, plan_cfg)
+                lattice = create_medea_lattice_planner(
+                    astar_map, astar_bounds, start_pose, goal, plan_cfg,
+                    goal_y_line=goal_y,
+                )
+                astar_path = plan_path(lattice, start_pose, goal, plan_cfg,
+                                       cost_map=astar_map)
+            except Exception:
+                astar_path = None
+
+            if astar_path is not None and len(astar_path) >= 2 and np.all(np.isfinite(astar_path)):
+                seed_path  = astar_path
+                warm_start = True
+            else:
+                seed_path  = init_path
+                warm_start = False
+
+            cost_map = _build_cost_map(centroids, thicknesses, radii, plan_cfg)
+            path = optimize_with_diffusion(
+                seed_path, start_pose, goal, cost_map, plan_cfg,
+                start_nu=(2.0, 0.0, 0.0),
+                warm_start=warm_start,
+                goal_y_line=None,
+                terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                use_eb_mbd=True,
+                eb_x_min=float(cost_map.x_origin),
+                eb_x_max=float(cost_map.x_origin + cost_map.width),
+                eb_y_min=float(cost_map.y_origin),
+                eb_c_max=EB_C_MAX,
+                eb_mu=EB_MU,
+                eb_kappa=EB_KAPPA,
+            )
+
         else:
             # JAX-based planners use JaxCostMapResult.
             cost_map = _build_cost_map(centroids, thicknesses, radii, plan_cfg)
 
             if planner == "mbd":
-                # Standard MBD: same cost terms as EB-MBD (KE + length + x-goal,
-                # no big-M), constraints enforced by reject-sampling instead of
-                # log barriers. Drop samples that are OOB or fail to reach the
-                # goal line; no replacement.
+                # Standard MBD: costmap integral + terminal Euclidean goal pull
+                # (no goal-line constraint, no big-M).  OOB on left/right/bottom
+                # is enforced by reject-sampling — invalid samples are dropped
+                # without replacement.
                 path = optimize_with_diffusion(
                     init_path, start_pose, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
-                    goal_y_line=goal_y,
+                    goal_y_line=None,
                     goal_y_line_penalty=0.0,
+                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                     oob_penalty=0.0,
                     sample_filter_fn=_make_reject_sampling_filter(plan_cfg),
                 )
 
             elif planner == "eb-mbd":
+                # EB-MBD: same cost as vanilla MBD (costmap + terminal Euclidean),
+                # OOB on left/right/bottom enforced by the emerging log-barrier
+                # constraint.  With goal_y_line=None the EB constraint is wired
+                # to make_oob_constraint_fn(x_min, x_max, y_min).
                 path = optimize_with_diffusion(
                     init_path, start_pose, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
-                    goal_y_line=goal_y,
+                    goal_y_line=None,
+                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                     use_eb_mbd=True,
                     eb_x_min=float(cost_map.x_origin),
                     eb_x_max=float(cost_map.x_origin + cost_map.width),
@@ -363,46 +414,45 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
                     eb_c_max=EB_C_MAX,
                     eb_mu=EB_MU,
                     eb_kappa=EB_KAPPA,
-                )
-
-            elif planner == "eb-mbd-ice":
-                path = optimize_with_diffusion(
-                    init_path, start_pose, goal, cost_map, plan_cfg,
-                    start_nu=(2.0, 0.0, 0.0),
-                    warm_start=False,
-                    goal_y_line=goal_y,
-                    use_eb_mbd=True,
-                    eb_x_min=float(cost_map.x_origin),
-                    eb_x_max=float(cost_map.x_origin + cost_map.width),
-                    eb_y_min=float(cost_map.y_origin),
-                    eb_c_max=EB_C_MAX,
-                    eb_mu=EB_MU,
-                    eb_kappa=EB_KAPPA,
-                    eb_ice_as_constraint=True,
                 )
 
             elif planner == "mppi":
+                # MPPI: same cost stack as MBD (costmap + terminal Euclidean
+                # goal pull).  No reject/EB/AL mechanism, so OOB is handled by
+                # Big-M: x-OOB via make_cost_fn's default 1e8 (left/right map
+                # edges), y-bottom via a per-call Big-M against Y_LO.
                 path = optimize_with_mppi(
                     init_path, start_pose, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
-                    goal_y_line=goal_y,
+                    goal_y_line=None,
+                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    y_bottom=float(Y_LO),
                 )
 
             elif planner == "rss":
+                # RSS: same cost stack as MPPI/MBD.  Big-M OOB on x (default)
+                # and on y-bottom (Y_LO).
                 path = optimize_with_rss(
                     init_path, start_pose, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
-                    goal_y_line=goal_y,
+                    goal_y_line=None,
+                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    y_bottom=float(Y_LO),
                 )
 
             elif planner == "ilqr":
+                # iLQR uses make_terminal_cost with goal_y_line=None, so its
+                # terminal cost is 1.0 * ||eta_T[:2] - goal_xy|| — matching the
+                # Euclidean pull MBD gets via terminal_goal_distance_weight.
+                # y_bottom adds a per-step Big-M on eta_y < Y_LO.
                 path = optimize_with_ilqr(
                     init_path, start_pose, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
-                    goal_y_line=goal_y,
+                    goal_y_line=None,
+                    y_bottom=float(Y_LO),
                 )
 
             else:
@@ -520,21 +570,32 @@ def run_trial(block: str, scenario_id: str, planner: str, seed: int,
     print(f"  {len(sat_polygons)} floes, actual conc={field['concentration']:.1%}",
           flush=True)
 
-    # ── Tessellate + bonds ─────────────────────────────────────────────────
-    print("Tessellating...", flush=True)
-    polygons, centroids, parent_ids = tessellate_all_floes(
-        sat_polygons, sat_centroids,
-        cells_per_100m2=plan_cfg.cells_per_100m2_simple,
-        seed=seed,
-    )
-    thicknesses = sat_thicknesses[parent_ids]
-    areas       = np.array([polygon_area(p) for p in polygons])
-    radii       = np.sqrt(areas / np.pi)
-    bonds       = create_proximity_bonds(
-        centroids, radii,
-        threshold_factor=plan_cfg.bond_threshold_factor,
-    )
-    print(f"  {len(polygons)} cells, {len(bonds)} bonds", flush=True)
+    # ── Tessellate + bonds (or skip both for rigid-floe scenarios) ─────────
+    if spec.no_fracture:
+        print("Skipping tessellation (rigid floes, no fracture)...", flush=True)
+        polygons    = list(sat_polygons)
+        centroids   = np.asarray(sat_centroids)
+        parent_ids  = np.arange(len(polygons))
+        thicknesses = np.asarray(sat_thicknesses)
+        areas       = np.array([polygon_area(p) for p in polygons])
+        radii       = np.sqrt(areas / np.pi)
+        bonds       = []
+        print(f"  {len(polygons)} rigid floes, 0 bonds", flush=True)
+    else:
+        print("Tessellating...", flush=True)
+        polygons, centroids, parent_ids = tessellate_all_floes(
+            sat_polygons, sat_centroids,
+            cells_per_100m2=plan_cfg.cells_per_100m2_simple,
+            seed=seed,
+        )
+        thicknesses = sat_thicknesses[parent_ids]
+        areas       = np.array([polygon_area(p) for p in polygons])
+        radii       = np.sqrt(areas / np.pi)
+        bonds       = create_proximity_bonds(
+            centroids, radii,
+            threshold_factor=plan_cfg.bond_threshold_factor,
+        )
+        print(f"  {len(polygons)} cells, {len(bonds)} bonds", flush=True)
 
     # ── Ship properties ────────────────────────────────────────────────────
     ship_props = ShipProperties(
@@ -609,6 +670,7 @@ def run_trial(block: str, scenario_id: str, planner: str, seed: int,
         "concentration":     spec.concentration,
         "thickness_mode":    spec.thickness_mode,
         "with_currents":     spec.with_currents,
+        "no_fracture":       spec.no_fracture,
         "planner":           planner,
         "seed":              seed,
         "horizon":           horizon,
@@ -636,10 +698,13 @@ def _parse_args():
     p = argparse.ArgumentParser(
         description="Run a single ice-navigation experiment trial."
     )
-    p.add_argument("--block",       required=True, choices=["A", "B"],
-                   help="Experiment block (A or B)")
+    p.add_argument("--block",       required=True, choices=["A", "B", "C"],
+                   help="Experiment block (A, B, or C). C is the rigid-floe "
+                        "twin of A: same scenario factorial, no tessellation, "
+                        "no bonds — floes cannot fracture.")
     p.add_argument("--scenario",
-                   help="Scenario ID, e.g. A_conc30_thin or B_conc50_bimodal")
+                   help="Scenario ID, e.g. A_conc30_thin, B_conc50_bimodal, "
+                        "or C_conc30_thin_curr")
     p.add_argument("--planner",     choices=PLANNERS,
                    help="Planner to evaluate")
     p.add_argument("--seed",        type=int, choices=SEEDS,

@@ -234,6 +234,7 @@ def optimize_with_diffusion(
     return_cost_components: bool = False,
     goal_y_line: Optional[float] = None,
     goal_y_line_penalty: float = 1e6,
+    terminal_goal_distance_weight: float = 0.0,
     denoising_movie_dir: Optional[str] = None,
     cost_truncate_y: Optional[float] = None,
     sample_filter_fn=None,
@@ -300,6 +301,7 @@ def optimize_with_diffusion(
         return_cost_components=return_cost_components,
         goal_y_line=goal_y_line,
         goal_y_line_penalty=goal_y_line_penalty,
+        terminal_goal_distance_weight=terminal_goal_distance_weight,
         denoising_movie_dir=denoising_movie_dir,
         cost_truncate_y=cost_truncate_y,
         sample_filter_fn=sample_filter_fn,
@@ -353,6 +355,9 @@ def optimize_with_mppi(
     warm_start: Optional[bool] = None,
     goal_y_line: Optional[float] = None,
     goal_y_line_penalty: float = 1e6,
+    terminal_goal_distance_weight: float = 0.0,
+    y_bottom: Optional[float] = None,
+    y_bottom_penalty: float = 1e8,
 ) -> np.ndarray:
     """
     Optimize a path using JAX MPPI (3-DOF dynamics + costmap).
@@ -377,6 +382,9 @@ def optimize_with_mppi(
         warm_start=warm_start,
         goal_y_line=goal_y_line,
         goal_y_line_penalty=goal_y_line_penalty,
+        terminal_goal_distance_weight=terminal_goal_distance_weight,
+        y_bottom=y_bottom,
+        y_bottom_penalty=y_bottom_penalty,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
@@ -484,6 +492,9 @@ def optimize_with_rss(
     warm_start: Optional[bool] = None,
     goal_y_line: Optional[float] = None,
     goal_y_line_penalty: float = 1e6,
+    terminal_goal_distance_weight: float = 0.0,
+    y_bottom: Optional[float] = None,
+    y_bottom_penalty: float = 1e8,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Random Single Shooting.
@@ -508,6 +519,9 @@ def optimize_with_rss(
         warm_start=warm_start,
         goal_y_line=goal_y_line,
         goal_y_line_penalty=goal_y_line_penalty,
+        terminal_goal_distance_weight=terminal_goal_distance_weight,
+        y_bottom=y_bottom,
+        y_bottom_penalty=y_bottom_penalty,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)
@@ -530,6 +544,8 @@ def optimize_with_ilqr(
     start_nu: Optional[Tuple[float, float, float]] = None,
     warm_start: Optional[bool] = None,
     goal_y_line: Optional[float] = None,
+    y_bottom: Optional[float] = None,
+    y_bottom_penalty: float = 1e8,
 ) -> np.ndarray:
     """
     Optimize a path using JAX Box-iLQR (3-DOF dynamics + costmap).
@@ -555,6 +571,8 @@ def optimize_with_ilqr(
         lattice_path=continuous_path,
         warm_start=warm_start,
         goal_y_line=goal_y_line,
+        y_bottom=y_bottom,
+        y_bottom_penalty=y_bottom_penalty,
     )
 
     optimized_traj = _align_headings_to_path_direction(optimized_traj)

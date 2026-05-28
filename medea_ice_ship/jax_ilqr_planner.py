@@ -48,21 +48,30 @@ def make_stage_cost(
     smoothness_weight: float = 0.005,
     ship_length: float = 0.0,
     ship_beam: float = 0.0,
+    y_bottom: Optional[float] = None,
+    y_bottom_penalty: float = 1e8,
 ):
     """
     Build per-step running cost l(x, u) for iLQR.
 
     l(x, u) = (costmap_w * costmap(eta) + length_w) * ||nu[:2]|| * dt_action
              + smooth_w * ||u||^2
+             + (y_bottom_penalty if eta_y < y_bottom else 0)
 
     where x = [eta (3), nu (3)] is the 6D state and u is the normalised
-    3D control.  This cost is differentiable via JAX autodiff.
+    3D control.  When ``y_bottom`` is set, a per-step Big-M fires on any
+    waypoint whose ship-centre y dips below ``y_bottom`` — matching how
+    MPPI/RSS handle the same constraint.  Discontinuous but ``jnp.where``
+    has zero gradient on each side, so iLQR's autodiff still works.
     """
     query = _make_query(grid, meta)
     cw = jnp.float32(costmap_weight / costmap_normalizer)
     lw = jnp.float32(length_weight)
     sw = jnp.float32(smoothness_weight)
     dt = jnp.float32(dt_action)
+    _use_yb = y_bottom is not None and y_bottom_penalty > 0.0
+    _y_bottom = jnp.float32(y_bottom if y_bottom is not None else 0.0)
+    _yb_pen = jnp.float32(y_bottom_penalty)
 
     half_l = float(ship_length) / 2.0
     half_w = float(ship_beam) / 2.0
@@ -87,7 +96,10 @@ def make_stage_cost(
         speed = jnp.sqrt(nu[0] ** 2 + nu[1] ** 2 + jnp.float32(1e-8))
         seg_len = speed * dt
         cm = _point_cost(eta)
-        return (cw * cm + lw) * seg_len + sw * jnp.sum(u ** 2)
+        base = (cw * cm + lw) * seg_len + sw * jnp.sum(u ** 2)
+        if _use_yb:
+            base = base + jnp.where(eta[1] < _y_bottom, _yb_pen, jnp.float32(0.0))
+        return base
 
     return stage_cost
 
@@ -362,6 +374,8 @@ def jax_ilqr_optimize(
     lattice_path: Optional[np.ndarray] = None,
     warm_start: Optional[bool] = None,
     goal_y_line: Optional[float] = None,
+    y_bottom: Optional[float] = None,
+    y_bottom_penalty: float = 1e8,
 ) -> np.ndarray:
     """
     Optimize trajectory using Box-iLQR (3-DOF dynamics + costmap).
@@ -465,6 +479,8 @@ def jax_ilqr_optimize(
         smoothness_weight=smoothness_weight,
         ship_length=L,
         ship_beam=B,
+        y_bottom=y_bottom,
+        y_bottom_penalty=y_bottom_penalty,
     )
 
     goal_xy = jnp.array(goal[:2], dtype=jnp.float32)

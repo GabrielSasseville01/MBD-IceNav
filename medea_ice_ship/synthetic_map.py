@@ -9,7 +9,8 @@ Map geometry (fixed):
 
 Block A — full factorial (no currents and with currents):
     concentrations : [0.05, 0.10, 0.20, 0.30, 0.40, 0.50]
-    thickness modes: uniform_thin (0.3 m), uniform_thick (0.5 m), bimodal
+    thickness modes: uniform_thin (1.0 m), uniform_thick (3.0 m),
+                     bimodal (80 % at 1.0 m + 20 % at 3.0 m)
     currents       : False, True
     → 6 × 3 × 2 = 36 scenarios
 
@@ -17,6 +18,12 @@ Block B — concentration trend (no currents):
     concentrations : [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
     thickness modes: uniform_thin, uniform_thick, bimodal
     → 7 × 3 = 21 scenarios
+
+Block C — Block A grid with rigid floes (no tessellation, no fracture):
+    Identical scenario factorial to Block A, but each satellite floe is
+    treated as a single rigid body (no internal Voronoi cells, no bonds),
+    so fracture cannot occur. Used to isolate the effect of fracture on
+    planner performance. → 36 scenarios.
 """
 from __future__ import annotations
 
@@ -55,20 +62,22 @@ BLOCK_B_CONCENTRATIONS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
 
 THICKNESS_MODES = ["uniform_thin", "uniform_thick", "bimodal"]
 
-BIMODAL_THICK_FRACTION = 0.10   # 10 % of floes get 1.5 m
-BIMODAL_THICK_VALUE    = 1.5    # m
-BIMODAL_THIN_VALUE     = 0.3    # m
-UNIFORM_THIN_VALUE     = 0.3    # m
-UNIFORM_THICK_VALUE    = 0.5    # m
+BIMODAL_THICK_FRACTION = 0.20   # 20 % of floes get 3.0 m
+BIMODAL_THICK_VALUE    = 3.0    # m
+BIMODAL_THIN_VALUE     = 1.0    # m
+UNIFORM_THIN_VALUE     = 1.0    # m
+UNIFORM_THICK_VALUE    = 3.0    # m
 
 
 @dataclass(frozen=True)
 class ScenarioSpec:
-    block:          str    # 'A' or 'B'
+    block:          str    # 'A', 'B', or 'C'
     scenario_id:    str    # human-readable key, e.g. 'A_conc05_thin_curr'
     concentration:  float
     thickness_mode: str    # 'uniform_thin' | 'uniform_thick' | 'bimodal'
     with_currents:  bool
+    no_fracture:    bool = False   # If True, skip tessellation + bonds: each
+                                   # satellite floe stays as one rigid body.
 
 
 def _scenario_id(block: str, conc: float, tm: str, curr: bool) -> str:
@@ -105,7 +114,22 @@ def list_scenarios(block: str) -> List[ScenarioSpec]:
             for conc in BLOCK_B_CONCENTRATIONS
             for tm   in THICKNESS_MODES
         ]
-    raise ValueError(f"Unknown block: {block!r}  (expected 'A' or 'B')")
+    if block == "C":
+        # Block A grid, rigid floes (no_fracture=True)
+        return [
+            ScenarioSpec(
+                block="C",
+                scenario_id=_scenario_id("C", conc, tm, curr),
+                concentration=conc,
+                thickness_mode=tm,
+                with_currents=curr,
+                no_fracture=True,
+            )
+            for conc in BLOCK_A_CONCENTRATIONS
+            for tm   in THICKNESS_MODES
+            for curr in [False, True]
+        ]
+    raise ValueError(f"Unknown block: {block!r}  (expected 'A', 'B', or 'C')")
 
 
 def get_scenario(block: str, scenario_id: str) -> ScenarioSpec:

@@ -407,14 +407,6 @@ class RunConfig:
     # weighted-mean Ybar_final.  Useful for diagnosing mean-aggregation failures in
     # non-convex cost landscapes.
     planning_jax_mbd_use_best_sample: bool = False
-    # --- Homotopy-class MBD seeding and classification ---
-    # When True, each homotopy class is warm-started from a geometric path that routes
-    # through that class's passage sequence (Hernandez et al. reference-frame seeding).
-    # Fixes exploration failure for topologically complex classes (e.g. sequential gates).
-    planning_jax_mbd_homotopy_per_class_seeds: bool = True
-    # When True, use the Hernandez reference-frame classifier (ray cross-product side test)
-    # instead of the default mean-x proximity classifier.
-    planning_jax_mbd_use_rf_classifier: bool = False
     # --- EB-MBD (Emerging-Barrier MBD): constraint enforcement via log-barrier ---
     # When True, replaces big-M OOB/goal penalties with an emerging log-barrier.
     # See: Mishra & Manchester (2026) "EB-MBD: Emerging-Barrier Model-Based Diffusion".

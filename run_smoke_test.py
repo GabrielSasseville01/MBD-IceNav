@@ -11,7 +11,7 @@ Usage:
                                     [--scenario ID] [--with-plots] [--with-movies]
                                     [--with-search-movie] [--output-dir DIR]
 
---planner            Which planner to run: astar (default), mbd, eb-mbd, eb-mbd-ice, mppi, rss, ilqr.
+--planner            Which planner to run: astar (default), mbd, eb-mbd, astar-eb-mbd, mppi, rss, ilqr.
 
 --with-plots         Generate a map PNG per trial showing the ice field at t=0,
                      the ship's actual trajectory, and the first planned path.
@@ -74,6 +74,7 @@ from run_experiment_trial import (
     DT, MAX_SIM_TIME, REPLAN_EVERY, GOAL_TOL,
     DEFAULT_HORIZON,
     EB_C_MAX, EB_MU, EB_KAPPA, PLANNERS,
+    TERMINAL_GOAL_DISTANCE_WEIGHT,
 )
 
 DEFAULT_PLANNER = "astar"
@@ -179,17 +180,27 @@ def _run_trial_for_plot(
     sat_thicknesses = field["thicknesses"]
     print(f"  {len(sat_polygons)} floes, conc={field['concentration']:.1%}", flush=True)
 
-    print("Tessellating...", flush=True)
-    polygons, centroids, parent_ids = tessellate_all_floes(
-        sat_polygons, sat_centroids,
-        cells_per_100m2=plan_cfg.cells_per_100m2_simple,
-        seed=SEED,
-    )
-    thicknesses = sat_thicknesses[parent_ids]
-    radii = np.sqrt(np.array([polygon_area(p) for p in polygons]) / np.pi)
-    bonds = create_proximity_bonds(centroids, radii,
-                                   threshold_factor=plan_cfg.bond_threshold_factor)
-    print(f"  {len(polygons)} cells, {len(bonds)} bonds", flush=True)
+    if spec.no_fracture:
+        print("Skipping tessellation (rigid floes, no fracture)...", flush=True)
+        polygons    = list(sat_polygons)
+        centroids   = np.asarray(sat_centroids)
+        parent_ids  = np.arange(len(polygons))
+        thicknesses = np.asarray(sat_thicknesses)
+        radii       = np.sqrt(np.array([polygon_area(p) for p in polygons]) / np.pi)
+        bonds       = []
+        print(f"  {len(polygons)} rigid floes, 0 bonds", flush=True)
+    else:
+        print("Tessellating...", flush=True)
+        polygons, centroids, parent_ids = tessellate_all_floes(
+            sat_polygons, sat_centroids,
+            cells_per_100m2=plan_cfg.cells_per_100m2_simple,
+            seed=SEED,
+        )
+        thicknesses = sat_thicknesses[parent_ids]
+        radii = np.sqrt(np.array([polygon_area(p) for p in polygons]) / np.pi)
+        bonds = create_proximity_bonds(centroids, radii,
+                                       threshold_factor=plan_cfg.bond_threshold_factor)
+        print(f"  {len(polygons)} cells, {len(bonds)} bonds", flush=True)
 
     ship_props = ShipProperties(
         plan_cfg.ship_length, plan_cfg.ship_beam,
@@ -235,9 +246,29 @@ def _run_trial_for_plot(
                 else:
                     path = plan_path(lattice, sp, goal, plan_cfg, cost_map=astar_map)
 
-            else:
+            elif planner == "astar-eb-mbd":
+                # EB-MBD warm-started from the A* lattice path. Falls back to
+                # cold start from the straight-line if A* fails.
+                try:
+                    astar_map, astar_bounds = _build_cost_map_astar(
+                        world_polygons, centroids_cb, thicknesses_cb, plan_cfg)
+                    lattice = create_medea_lattice_planner(
+                        astar_map, astar_bounds, sp, goal, plan_cfg,
+                        goal_y_line=goal_y)
+                    astar_path = plan_path(lattice, sp, goal, plan_cfg,
+                                           cost_map=astar_map)
+                except Exception:
+                    astar_path = None
+
+                if (astar_path is not None and len(astar_path) >= 2
+                        and np.all(np.isfinite(astar_path))):
+                    seed_path  = astar_path
+                    warm_start = True
+                else:
+                    seed_path  = init
+                    warm_start = False
+
                 cost_map = _build_cost_map(centroids_cb, thicknesses_cb, radii, plan_cfg)
-                kw = dict(start_nu=(2.0, 0.0, 0.0), warm_start=False, goal_y_line=goal_y)
                 _dmovie = None
                 _viz_polys = None
                 _viz_thicks = None
@@ -246,12 +277,41 @@ def _run_trial_for_plot(
                     _viz_polys = list(world_polygons)
                     _viz_thicks = np.asarray(thicknesses_cb).copy()
                     first_denoising_done[0] = True
+                path = optimize_with_diffusion(
+                    seed_path, sp, goal, cost_map, plan_cfg,
+                    start_nu=(2.0, 0.0, 0.0), warm_start=warm_start,
+                    goal_y_line=None,
+                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    use_eb_mbd=True,
+                    eb_x_min=float(cost_map.x_origin),
+                    eb_x_max=float(cost_map.x_origin + cost_map.width),
+                    eb_y_min=float(cost_map.y_origin),
+                    eb_c_max=EB_C_MAX, eb_mu=EB_MU, eb_kappa=EB_KAPPA,
+                    denoising_movie_dir=_dmovie,
+                    viz_world_polygons=_viz_polys,
+                    viz_thicknesses=_viz_thicks,
+                )
+
+            else:
+                cost_map = _build_cost_map(centroids_cb, thicknesses_cb, radii, plan_cfg)
+                _dmovie = None
+                _viz_polys = None
+                _viz_thicks = None
+                if with_denoising_movie and not first_denoising_done[0]:
+                    _dmovie = str(out_dir)
+                    _viz_polys = list(world_polygons)
+                    _viz_thicks = np.asarray(thicknesses_cb).copy()
+                    first_denoising_done[0] = True
+                # MBD/EB-MBD: no goal-line constraint; terminal Euclidean pull.
+                # MPPI/RSS: keep Big-M goal_y_line (no constraint mechanism).
+                # iLQR: goal_y_line=None so make_terminal_cost uses Euclidean.
                 if planner == "mbd":
-                    # Standard MBD: KE + length + x-goal (no big-M), constraints
-                    # enforced by reject-sampling instead of log barriers.
                     path = optimize_with_diffusion(
-                        init, sp, goal, cost_map, plan_cfg, **kw,
+                        init, sp, goal, cost_map, plan_cfg,
+                        start_nu=(2.0, 0.0, 0.0), warm_start=False,
+                        goal_y_line=None,
                         goal_y_line_penalty=0.0,
+                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                         oob_penalty=0.0,
                         sample_filter_fn=_make_reject_sampling_filter(plan_cfg),
                         denoising_movie_dir=_dmovie,
@@ -260,35 +320,42 @@ def _run_trial_for_plot(
                     )
                 elif planner == "eb-mbd":
                     path = optimize_with_diffusion(
-                        init, sp, goal, cost_map, plan_cfg, **kw,
+                        init, sp, goal, cost_map, plan_cfg,
+                        start_nu=(2.0, 0.0, 0.0), warm_start=False,
+                        goal_y_line=None,
+                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                         use_eb_mbd=True,
                         eb_x_min=float(cost_map.x_origin),
                         eb_x_max=float(cost_map.x_origin + cost_map.width),
                         eb_y_min=float(cost_map.y_origin),
                         eb_c_max=EB_C_MAX, eb_mu=EB_MU, eb_kappa=EB_KAPPA,
-                        denoising_movie_dir=_dmovie,
-                        viz_world_polygons=_viz_polys,
-                        viz_thicknesses=_viz_thicks,
-                    )
-                elif planner == "eb-mbd-ice":
-                    path = optimize_with_diffusion(
-                        init, sp, goal, cost_map, plan_cfg, **kw,
-                        use_eb_mbd=True,
-                        eb_x_min=float(cost_map.x_origin),
-                        eb_x_max=float(cost_map.x_origin + cost_map.width),
-                        eb_y_min=float(cost_map.y_origin),
-                        eb_c_max=EB_C_MAX, eb_mu=EB_MU, eb_kappa=EB_KAPPA,
-                        eb_ice_as_constraint=True,
                         denoising_movie_dir=_dmovie,
                         viz_world_polygons=_viz_polys,
                         viz_thicknesses=_viz_thicks,
                     )
                 elif planner == "mppi":
-                    path = optimize_with_mppi(init, sp, goal, cost_map, plan_cfg, **kw)
+                    path = optimize_with_mppi(
+                        init, sp, goal, cost_map, plan_cfg,
+                        start_nu=(2.0, 0.0, 0.0), warm_start=False,
+                        goal_y_line=None,
+                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                        y_bottom=float(Y_LO),
+                    )
                 elif planner == "rss":
-                    path = optimize_with_rss(init, sp, goal, cost_map, plan_cfg, **kw)
+                    path = optimize_with_rss(
+                        init, sp, goal, cost_map, plan_cfg,
+                        start_nu=(2.0, 0.0, 0.0), warm_start=False,
+                        goal_y_line=None,
+                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                        y_bottom=float(Y_LO),
+                    )
                 elif planner == "ilqr":
-                    path = optimize_with_ilqr(init, sp, goal, cost_map, plan_cfg, **kw)
+                    path = optimize_with_ilqr(
+                        init, sp, goal, cost_map, plan_cfg,
+                        start_nu=(2.0, 0.0, 0.0), warm_start=False,
+                        goal_y_line=None,
+                        y_bottom=float(Y_LO),
+                    )
                 else:
                     raise ValueError(f"Unknown planner: {planner!r}")
 
@@ -340,7 +407,8 @@ def _run_trial_for_plot(
     out_rec = {
         "block": spec.block, "scenario_id": spec.scenario_id,
         "concentration": spec.concentration, "thickness_mode": spec.thickness_mode,
-        "with_currents": spec.with_currents, "planner": planner, "seed": SEED,
+        "with_currents": spec.with_currents, "no_fracture": spec.no_fracture,
+        "planner": planner, "seed": SEED,
         **metrics,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -403,7 +471,7 @@ def _run_trial_for_plot(
                   flush=True)
 
     denoising_mp4_path = None
-    if with_denoising_movie and planner in ("mbd", "eb-mbd", "eb-mbd-ice"):
+    if with_denoising_movie and planner in ("mbd", "eb-mbd", "astar-eb-mbd"):
         _dp = out_dir / "replan_0000_denoising.mp4"
         if _dp.exists():
             denoising_mp4_path = _dp
@@ -417,8 +485,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--planner", choices=PLANNERS, default=DEFAULT_PLANNER,
                    help=f"Planner to run (default: {DEFAULT_PLANNER})")
-    p.add_argument("--block", choices=["A", "B"],
-                   help="Restrict to one block (default: both)")
+    p.add_argument("--block", choices=["A", "B", "C"],
+                   help="Restrict to one block (default: all A, B, C). "
+                        "C is the rigid-floe twin of A (no tessellation).")
     p.add_argument("--scenario",
                    help="Run only this scenario ID, e.g. A_conc05_thin (implies --block)")
     p.add_argument("--output-dir", default=str(OUTPUT_DIR),
@@ -456,7 +525,7 @@ def main():
         from medea_ice_ship.synthetic_map import get_scenario
         scenarios = [get_scenario(block, args.scenario)]
     else:
-        blocks    = [args.block] if args.block else ["A", "B"]
+        blocks    = [args.block] if args.block else ["A", "B", "C"]
         scenarios = [spec for block in blocks for spec in list_scenarios(block)]
 
     n_total   = len(scenarios)
@@ -495,7 +564,7 @@ def main():
         need_plots    = with_plots  and not (json_exists and png_exists)
         need_movie    = with_movies and not mp4_exists
         need_search   = with_search_movie and planner == "astar" and not search_mp4_exists
-        need_denoising = with_denoising_movie and planner in ("mbd", "eb-mbd", "eb-mbd-ice") and not denoising_mp4_exists
+        need_denoising = with_denoising_movie and planner in ("mbd", "eb-mbd", "astar-eb-mbd") and not denoising_mp4_exists
 
         if json_exists and not need_plots and not need_movie and not need_search and not need_denoising:
             artifacts = "JSON"

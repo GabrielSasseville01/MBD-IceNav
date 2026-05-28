@@ -20,6 +20,8 @@ from medea_ice_ship.jax_mbd_planner import (
     make_cost_fn,
     make_goal_line_cost_fn,
     make_goal_arrival_x_cost_fn,
+    make_terminal_goal_euclidean_cost_fn,
+    make_y_bottom_cost_fn,
     _warm_start_from_path,
     _jax_backend_info,
 )
@@ -97,6 +99,9 @@ def jax_rss_optimize(
     warm_start: Optional[bool] = None,
     goal_y_line: Optional[float] = None,
     goal_y_line_penalty: float = 1e6,
+    terminal_goal_distance_weight: float = 0.0,
+    y_bottom: Optional[float] = None,
+    y_bottom_penalty: float = 1e8,
 ) -> np.ndarray:
     """
     Optimize trajectory using Random Single Shooting.
@@ -228,6 +233,21 @@ def jax_rss_optimize(
         )
         _prev_fn = cost_fn
         cost_fn = lambda u_norm: _prev_fn(u_norm) + _gx_fn(u_norm)  # noqa: E731
+    if terminal_goal_distance_weight > 0.0:
+        _td_fn = make_terminal_goal_euclidean_cost_fn(
+            rollout_fn, eta0, nu0, action_center, action_scale,
+            goal_xy=(float(goal[0]), float(goal[1])),
+            weight=terminal_goal_distance_weight,
+        )
+        _prev_td = cost_fn
+        cost_fn = lambda u_norm: _prev_td(u_norm) + _td_fn(u_norm)  # noqa: E731
+    if y_bottom is not None and y_bottom_penalty > 0.0:
+        _yb_fn = make_y_bottom_cost_fn(
+            rollout_fn, eta0, nu0, action_center, action_scale,
+            y_min=float(y_bottom), penalty=y_bottom_penalty,
+        )
+        _prev_yb = cost_fn
+        cost_fn = lambda u_norm: _prev_yb(u_norm) + _yb_fn(u_norm)  # noqa: E731
 
     # ── Run RSS ───────────────────────────────────────────────────────
     ws_label = "with A* warm-start candidate" if v_init is not None else "cold start"

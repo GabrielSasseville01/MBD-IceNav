@@ -690,48 +690,6 @@ def generate_al_multiplier_plot(diag: dict, out_path: str) -> None:
     print(f"  Saved: {out_path}", flush=True)
 
 
-def generate_homotopy_class_plot(diag: dict, out_path: str) -> None:
-    """Plot per-class sample counts and mean costs across diffusion steps."""
-    class_counts = diag.get("class_counts", [])
-    class_costs  = diag.get("class_costs", [])
-    best_class   = diag.get("best_class", [])
-    n_classes    = diag.get("n_classes", 1)
-    if not class_counts:
-        return
-
-    counts_arr = np.array(class_counts)   # (steps, n_classes)
-    costs_arr  = np.array(class_costs)    # (steps, n_classes)
-    steps      = np.arange(len(class_counts))
-
-    cmap   = plt.cm.get_cmap("tab10", n_classes)
-    colors = [cmap(c) for c in range(n_classes)]
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-
-    for c in range(n_classes):
-        axes[0].plot(steps, counts_arr[:, c], color=colors[c], label=f"cls {c}")
-    axes[0].set_ylabel("Sample count")
-    axes[0].set_title(f"H-MBD: per-class sample counts ({n_classes} classes)")
-    axes[0].legend(fontsize=7, ncol=min(n_classes, 4)); axes[0].grid(True, alpha=0.3)
-
-    finite_costs = np.where(np.isfinite(costs_arr), costs_arr, np.nan)
-    for c in range(n_classes):
-        axes[1].plot(steps, finite_costs[:, c], color=colors[c], label=f"cls {c}")
-    # Mark which class was leading at each step
-    if best_class:
-        bc_arr = np.array(best_class)
-        best_costs = np.array([finite_costs[s, bc_arr[s]] for s in steps])
-        axes[1].plot(steps, best_costs, "k--", lw=1.5, label="best class", zorder=5)
-    axes[1].set_ylabel("Mean sample cost")
-    axes[1].set_xlabel("Diffusion step (N → 1)")
-    axes[1].legend(fontsize=7, ncol=min(n_classes, 4)); axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120)
-    plt.close(fig)
-    print(f"  Saved: {out_path}", flush=True)
-
-
 # ── Reject-sampling filter (same for all scenarios) ──────────────────────────────
 
 def _make_reject_filter(cost_map, run_cfg):
@@ -752,9 +710,27 @@ def _make_reject_filter(cost_map, run_cfg):
                   - s[:, :, None] * _dy[None, None, :])
         oob = ((hull_x < _x_lo) | (hull_x > _x_hi)).any(axis=(1, 2))
         oob |= (ys < Y_MIN).any(axis=1)
-        reaches_goal = ys[:, -1] >= GOAL_LINE
-        return (~oob) & reaches_goal
+        # Goal-reaching requirement dropped — terminal Euclidean cost provides
+        # the goal pull instead of a hard reject filter.
+        # Backup: reaches_goal = ys[:, -1] >= GOAL_LINE; return (~oob) & reaches_goal
+        return ~oob
     return _filter
+
+
+def _dilate_costmap(cm: JaxCostMapResult, inflate_m: float) -> JaxCostMapResult:
+    """
+    Return a copy of `cm` whose grid is dilated by `inflate_m` metres
+    (max-filter by ceil(inflate_m / resolution) cells in each direction).
+    Used to build the A*/RRT/lattice search costmap with a beam-wide
+    clearance margin, while keeping the un-inflated map for MBD cost eval.
+    """
+    if inflate_m <= 0.0:
+        return cm
+    infl_cells = max(1, int(np.ceil(inflate_m / cm.resolution)))
+    new_grid = maximum_filter(
+        np.asarray(cm.cost_map), size=2 * infl_cells + 1
+    ).astype(np.float32)
+    return replace(cm, cost_map=new_grid)
 
 
 # ── Single-method run ────────────────────────────────────────────────────────────
@@ -767,38 +743,36 @@ def run_one_method(
     run_cfg,
     args,
     out_dir: Path,
+    cost_map_search=None,
 ) -> dict:
     """
     Run one planning method on the given scenario and produce all outputs.
     Returns a metrics dict.
 
-    method: "mbd" | "eb_mbd" | "eb_rrt_mbd" | "eb_astar_mbd" | "reject_mbd" |
-            "al_mbd" | "sa_mbd" | "homotopy_mbd" | "eb_homotopy_mbd" | "al_homotopy_mbd"
+    method: "mbd" | "eb_mbd" | "eb_rrt_mbd" | "eb_astar_mbd" | "reject_mbd" | "al_mbd"
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Path-search costmap defaults to the cost-eval one when not supplied
+    # (preserves single-map behaviour for backward-compat).
+    if cost_map_search is None:
+        cost_map_search = cost_map
+
     # Method flags
-    use_eb          = method == "eb_mbd"
-    use_eb_rrt      = method == "eb_rrt_mbd"
-    use_eb_astar    = method == "eb_astar_mbd"
-    use_al          = method in ("al_mbd", "al_homotopy_mbd")
-    use_rej         = method == "reject_mbd"
-    use_sa          = method == "sa_mbd"
-    use_homotopy    = method == "homotopy_mbd"
-    use_eb_homotopy = method == "eb_homotopy_mbd"
-    use_al_homotopy = method == "al_homotopy_mbd"
+    use_eb       = method == "eb_mbd"
+    use_eb_rrt   = method == "eb_rrt_mbd"
+    use_eb_astar = method == "eb_astar_mbd"
+    use_al       = method == "al_mbd"
+    use_rej      = method == "reject_mbd"
     _algo_map = {
-        "mbd":             "MBD",
-        "eb_mbd":          "EB-MBD",
-        "eb_rrt_mbd":      "EB-RRT-MBD",
-        "eb_astar_mbd":    "EB-A*-MBD",
-        "reject_mbd":      "Reject-MBD",
-        "sa_mbd":          "SA-MBD",
-        "homotopy_mbd":    "H-MBD",
-        "eb_homotopy_mbd": "EB-H-MBD",
-        "al_homotopy_mbd": "AL-H-MBD",
+        "mbd":          "MBD",
+        "eb_mbd":       "EB-MBD",
+        "eb_rrt_mbd":   "EB-RRT-MBD",
+        "eb_astar_mbd": "EB-A*-MBD",
+        "reject_mbd":   "Reject-MBD",
+        "al_mbd":       "AL-MBD",
     }
-    algo_name = _algo_map.get(method, "AL-MBD")
+    algo_name = _algo_map.get(method, method.upper())
 
     sample_filter_fn = _make_reject_filter(cost_map, run_cfg) if use_rej else None
 
@@ -808,7 +782,7 @@ def run_one_method(
         print(f"  RRT: searching for feasible path ...", flush=True)
         _rrt_t0 = time.perf_counter()
         rrt_lattice_path = rrt_path_on_costmap(
-            cost_map,
+            cost_map_search,    # inflated map: keep clear of obstacles
             start_xy=(sc.start[0], sc.start[1]),
             goal_xy=sc.goal,
             max_iters=8000,
@@ -829,7 +803,7 @@ def run_one_method(
         print(f"  A*: searching for feasible path ...", flush=True)
         _astar_t0 = time.perf_counter()
         rrt_lattice_path = astar_path_on_costmap(
-            cost_map,
+            cost_map_search,    # inflated map: keep clear of obstacles
             start_xy=(sc.start[0], sc.start[1]),
             goal_xy=sc.goal,
             cost_threshold_frac=0.1,
@@ -854,14 +828,28 @@ def run_one_method(
         lattice_path=rrt_lattice_path,
         warm_start=(use_eb_rrt or use_eb_astar) and rrt_lattice_path is not None,
         return_diagnostics=True,
-        goal_y_line=GOAL_LINE,
-        goal_y_line_penalty=1e6,
+        # ── Goal handling (NEW): terminal Euclidean penalty only ─────────
+        # Removed: the goal-y-line hard constraint (Big-M for vanilla MBD,
+        # EB barrier for EB-*-MBD, last-step clause for AL-MBD) and the
+        # goal-x soft cost.  Replaced by a single smooth terminal cost
+        # weight * ||traj[-1, :2] - goal_xy||.
+        goal_y_line=None,
+        goal_y_line_penalty=0.0,
+        terminal_goal_distance_weight=args.terminal_goal_distance_weight,
+        # No Big-M OOB penalty.  Reject-MBD enforces OOB via its reject filter,
+        # EB-MBD via the emerging barrier, AL-MBD via dual-ascent constraints.
+        # Vanilla MBD gets no OOB handling (by design).
+        # Backup: drop this arg to restore the legacy 1e8 Big-M (vanilla/AL).
+        oob_penalty=0.0,
+        # ── Backup (old goal-line constraint setup) ─────────────────────
+        # goal_y_line=GOAL_LINE,
+        # goal_y_line_penalty=1e6,
         denoising_movie_dir=str(out_dir / "denoising"),
         cost_truncate_y=Y_MAX,
         sample_filter_fn=sample_filter_fn,
         max_resample_iters=None,
-        # EB-MBD (also active for EB-H-MBD, EB-RRT-MBD, EB-A*-MBD)
-        use_eb_mbd=use_eb or use_eb_homotopy or use_eb_rrt or use_eb_astar,
+        # EB-MBD (also active for EB-RRT-MBD, EB-A*-MBD)
+        use_eb_mbd=use_eb or use_eb_rrt or use_eb_astar,
         eb_x_min=X_MIN, eb_x_max=X_MAX, eb_y_min=Y_MIN,
         eb_c_max=args.eb_c_max, eb_mu=args.eb_mu, eb_kappa=args.eb_kappa,
         eb_oob_cost=args.eb_oob_cost,
@@ -869,12 +857,6 @@ def run_one_method(
         use_al_mbd=use_al,
         al_x_min=X_MIN, al_x_max=X_MAX, al_y_min=Y_MIN,
         al_rho=args.al_rho, al_M_max=args.al_M_max,
-        # SA-MBD
-        use_sa_mbd=use_sa,
-        sa_lambda=args.sa_lambda,
-        # Homotopy-MBD (also active for EB-H-MBD and AL-H-MBD)
-        use_homotopy_mbd=use_homotopy or use_eb_homotopy or use_al_homotopy,
-        homotopy_n_obs_max=args.homotopy_n_obs_max,
         # Hard rectangular obstacles (EB/AL only)
         obstacle_rects=sc.obstacle_rects,
     )
@@ -884,7 +866,7 @@ def run_one_method(
     mean_traj = np.array(diag["mean_trajectories"][-1])
     mean_cost = diag["cost_of_mean"][-1] if diag["cost_of_mean"] else float("nan")
 
-    if (use_eb or use_eb_rrt or use_eb_astar or use_al or use_homotopy or use_eb_homotopy or use_al_homotopy) and diag.get("best_base_cost_trajectory") is not None:
+    if (use_eb or use_eb_rrt or use_eb_astar or use_al) and diag.get("best_base_cost_trajectory") is not None:
         best_cost = diag["best_base_cost"]
         best_traj = diag["best_base_cost_trajectory"]
     else:
@@ -947,7 +929,7 @@ def run_one_method(
         str(out_dir / "trajectory_fan.mp4"),
     )
 
-    if use_eb or use_eb_rrt or use_eb_astar or use_eb_homotopy:
+    if use_eb or use_eb_rrt or use_eb_astar:
         print("  Generating EB barrier movie...", flush=True)
         generate_eb_barrier_movie(diag, str(out_dir / "eb_barrier_schedule.mp4"))
 
@@ -961,10 +943,6 @@ def run_one_method(
             print(f"  AL summary: mult_mean {m_means[0]:.4f}→{m_means[-1]:.4f}"
                   f"  mult_max {m_maxes[0]:.4f}→{m_maxes[-1]:.4f}"
                   f"  c_viol {cviol[0]:.3f}→{cviol[-1]:.3f}", flush=True)
-
-    if (use_homotopy or use_eb_homotopy or use_al_homotopy) and diag.get("class_counts"):
-        print("  Generating homotopy class evolution plot...", flush=True)
-        generate_homotopy_class_plot(diag, str(out_dir / "homotopy_class_evolution.png"))
 
     print(f"  Done. Outputs in {out_dir}", flush=True)
     return metrics
@@ -1178,13 +1156,17 @@ def run_lattice_method(
     geo_info: dict,
     run_cfg,
     out_dir: Path,
+    cost_map_search: JaxCostMapResult = None,
 ) -> dict:
     """Run A* lattice planner on the scenario and produce a result plot."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dpdem_cm = _to_dpdem_costmap(cost_map)
-    bounds   = {"x_origin": cost_map.x_origin, "y_origin": cost_map.y_origin,
-                "width": cost_map.width, "height": cost_map.height}
+    # Lattice planner searches on the inflated map (clearance margin); the
+    # raw (un-inflated) map is reserved for downstream cost-eval comparisons.
+    cost_map_for_search = cost_map_search if cost_map_search is not None else cost_map
+    dpdem_cm = _to_dpdem_costmap(cost_map_for_search)
+    bounds   = {"x_origin": cost_map_for_search.x_origin, "y_origin": cost_map_for_search.y_origin,
+                "width": cost_map_for_search.width, "height": cost_map_for_search.height}
 
     # Use tight goal tolerance so the path actually reaches y=GOAL_LINE.
     # Default 150 m stops at y=1200, which our metric (y >= 1350) rejects.
@@ -1278,8 +1260,7 @@ def main():
         help="Scenario to run",
     )
     _method_choices = ["mbd", "eb_mbd", "eb_rrt_mbd", "eb_astar_mbd", "reject_mbd",
-                       "al_mbd", "sa_mbd", "homotopy_mbd", "eb_homotopy_mbd",
-                       "al_homotopy_mbd", "lattice"]
+                       "al_mbd", "lattice"]
     parser.add_argument(
         "--method",
         choices=_method_choices,
@@ -1289,29 +1270,34 @@ def main():
     )
     parser.add_argument(
         "--run-all-methods", action="store_true",
-        help="Run all methods (lattice + MBD variants including H-MBD) and print a comparison table",
+        help="Run all methods (lattice + MBD variants) and print a comparison table",
     )
     parser.add_argument("--output-root", default="outputs/scenarios")
     parser.add_argument("--nsample",     type=int,   default=512)
     parser.add_argument("--ndiffuse",    type=int,   default=50)
     parser.add_argument("--temperature", type=float, default=0.01)
-    parser.add_argument("--horizon",     type=int,   default=1200)
+    parser.add_argument("--horizon",     type=int,   default=700)
+    # Terminal Euclidean goal-distance penalty (replaces goal-line constraint
+    # and goal-x soft cost).  Cost = weight * ||traj[-1, :2] - goal_xy||.
+    parser.add_argument("--terminal-goal-distance-weight", type=float, default=1.0)
     # EB-MBD
     parser.add_argument("--eb-c-max",  type=float, default=1500.0)
     parser.add_argument("--eb-mu",     type=float, default=50000.0)
     parser.add_argument("--eb-kappa",  type=float, default=1.0)
-    # EB/AL OOB cost (linear cost per m of OOB violation)
-    parser.add_argument("--eb-oob-cost", type=float, default=5.0)
+    # EB/AL OOB cost (linear cost per m of OOB violation).
+    # Default 0.0 so OOB is handled purely by EB barriers (EB-MBD) or AL
+    # constraints (AL-MBD).  Backup: previous default was 5.0.
+    parser.add_argument("--eb-oob-cost", type=float, default=0.0)
     # AL-MBD
     parser.add_argument("--al-rho",   type=float, default=50.0)
     parser.add_argument("--al-M-max", type=float, default=1000.0)
-    # SA-MBD
-    parser.add_argument("--sa-lambda", type=float, default=0.05)
-    # H-MBD
-    parser.add_argument("--no-inflation", action="store_true",
-                        help="Disable ship-beam dilation of obstacles in the costmap")
-    parser.add_argument("--homotopy-n-obs-max", type=int, default=3,
-                        help="Max obstacles to track for H-signature (2^n classes)")
+    # Inflation is OFF by default: the cost function already uses 5-point hull
+    # sampling that covers the ship footprint, so inflating the costmap by
+    # beam/2 on top of that double-counts the clearance and makes geometrically
+    # safe trajectories look costly. Pass --inflation to re-enable for A/B.
+    parser.add_argument("--inflation", action="store_true",
+                        help="Re-enable ship-beam dilation of costmap obstacles "
+                             "(off by default — see comment in source)")
     args = parser.parse_args()
 
     if args.method is None and not args.run_all_methods:
@@ -1332,26 +1318,51 @@ def main():
         planning_jax_mbd_horizon=args.horizon,
         planning_jax_mbd_n_substeps=1,
         planning_jax_mbd_dt_substep=1.0,
-        planning_jax_mbd_goal_x_weight=sc.goal_x_weight,
+        # Goal-x soft cost disabled — replaced by terminal Euclidean penalty.
+        # Backup: planning_jax_mbd_goal_x_weight=sc.goal_x_weight,
+        planning_jax_mbd_goal_x_weight=0.0,
+        # Cost stack for all MBD methods:
+        #   costmap_weight (1.0) · costmap_integral
+        # + length_weight (1.0) · path_length
+        # + terminal_goal_distance_weight (CLI) · ||traj[-1, :2] - goal_xy||
+        # goal_weight and smoothness_weight stay at the config defaults (0).
+        # TEMP: path-length penalty disabled (competes with terminal Euclidean
+        # in the goal-unreachable regime).  Set back to 1.0 to re-enable.
+        # Backup: planning_jax_mbd_length_weight=1.0,
         planning_jax_mbd_length_weight=0.0,
     )
 
-    inflate = not args.no_inflation
+    # Two costmaps:
+    #   cost_map        — un-inflated, used by MBD cost evaluation (hull sampling
+    #                     already covers the ship footprint).
+    #   cost_map_search — dilated by SHIP_BEAM (28 m) to give A*/RRT/lattice a
+    #                     clearance margin large enough that the rolled-out
+    #                     warmstart doesn't graze obstacles even when the ship
+    #                     banks ~110° entering a corridor.
+    # The --inflation CLI flag (if passed) re-enables inflation in cost_map too,
+    # for A/B comparison only.
+    inflate_cost = args.inflation
     print(f"\nBuilding costmap for '{sc.name}' "
-          f"({'no inflation' if not inflate else 'with ship-beam inflation'}) ...", flush=True)
-    cost_map, geo_info = sc.costmap_fn(run_cfg, inflate=inflate)
+          f"({'no inflation' if not inflate_cost else 'with ship-beam inflation'}) ...", flush=True)
+    cost_map, geo_info = sc.costmap_fn(run_cfg, inflate=inflate_cost)
+    inflate_search_m = float(run_cfg.ship_beam)   # 28 m
+    print(f"Building search costmap (A*/RRT/lattice): dilated by {inflate_search_m:.0f} m"
+          f" = ship_beam ...", flush=True)
+    cost_map_search = _dilate_costmap(cost_map, inflate_search_m)
 
     all_methods = ["lattice", "mbd", "eb_mbd", "eb_rrt_mbd", "eb_astar_mbd",
-                   "reject_mbd", "al_mbd", "sa_mbd", "homotopy_mbd", "eb_homotopy_mbd", "al_homotopy_mbd"]
+                   "reject_mbd", "al_mbd"]
     methods = all_methods if args.run_all_methods else args.method
     all_metrics: list[dict] = []
 
     for method in methods:
         method_dir = out_root / method
         if method == "lattice":
-            m = run_lattice_method(sc, cost_map, geo_info, run_cfg, method_dir)
+            m = run_lattice_method(sc, cost_map, geo_info, run_cfg, method_dir,
+                                   cost_map_search=cost_map_search)
         else:
-            m = run_one_method(method, sc, cost_map, geo_info, run_cfg, args, method_dir)
+            m = run_one_method(method, sc, cost_map, geo_info, run_cfg, args, method_dir,
+                               cost_map_search=cost_map_search)
         all_metrics.append(m)
 
     if len(all_metrics) > 1:

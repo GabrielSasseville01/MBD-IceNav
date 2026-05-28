@@ -22,21 +22,32 @@ Example outputs from a single planned run on the full MEDEA map (lattice planner
 ## TL;DR — first five minutes
 
 ```bash
-# 1. Install (uv is the supported toolchain)
+# 1. Install (uv is the supported toolchain).
 uv sync
 
-# 2. Smallest possible run: 3 synthetic floes, straight path, ~30 s
-uv run python run_medea_ship_fracture.py --simple --output-dir outputs/hello
+# 2. Smallest planned run: 3 synthetic floes, lattice A* through the field, ~1 min.
+#    --polygon-replan is required for the lattice planner during receding-horizon replans
+#    (otherwise the JAX costmap is missing a method the legacy lattice planner needs).
+uv run python run_medea_ship_fracture.py --simple --plan --planner lattice \
+    --polygon-replan --output-dir outputs/hello
 
-# 3. Same field, but plan a path through the ice with the default planner (diffusion-MPC)
-uv run python run_medea_ship_fracture.py --simple --plan --output-dir outputs/hello_plan
+# 3. Full MEDEA Fram-Strait map with the default planner (diffusion-MPC).
+uv run python run_medea_ship_fracture.py --full-map --plan \
+    --output-dir outputs/medea_diffusion
 
-# 4. Full MEDEA Fram-Strait map with lattice A* (reproduces outputs/my_run)
+# 4. Same map, lattice A*. --fast-lattice tunes A* for the 1.5 km map; --polygon-replan is
+#    again needed for replans.
 uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice \
-    --output-dir outputs/my_run
+    --fast-lattice --polygon-replan --output-dir outputs/medea_lattice
 ```
 
-After (4), look in `outputs/my_run/` for `medea_ship_fracture.mp4`, `medea_ship_fracture_3d.mp4`, `costmap_medea_ship_fracture.mp4`, `lattice_search_medea.mp4`, and `hull_impact_medea.png`. Step (4) needs the MEDEA data file in `data/` — see [Data and dependencies](#data-and-dependencies).
+After (3) or (4), look in the output directory for `medea_ship_fracture.mp4`, `medea_ship_fracture_3d.mp4`, `costmap_medea_ship_fracture.mp4`, and (for lattice runs) `lattice_search_medea.mp4` + `hull_impact_medea.png`. Steps (3) and (4) need `data/ice_floes_MEDEA_fram_20100629.pkl` — see [Data and dependencies](#data-and-dependencies).
+
+> **Known sharp edges in the current code, worth knowing before you experiment.**
+> - **Lattice + replanning requires `--polygon-replan`.** During receding-horizon replans the costmap is rebuilt via `build_costmap_jax` (returns `JaxCostMapResult`, no `world_to_grid`); the legacy lattice planner needs `world_to_grid` and crashes. `--polygon-replan` switches replans to `build_costmap_from_ice_state` (legacy `CostMap`) and the lattice path works. Sampling planners (diffusion-MPC, MPPI, SQP, GradCEM) consume `JaxCostMapResult` directly and don't need this flag. Alternative: `--no-replan` (a single up-front plan, no replans).
+> - **`--simple` without `--plan` looks stationary.** The bare `--simple` mode hard-codes `n_frames_simple = 300` (15 s) and the AUTO-IceNav 3-DOF ship can't traverse the ~260 m reference path in that time — `--plan` recomputes `n_frames` from `planning_target_speed`. `--kinematic-ship` is a silent no-op on the current JAX backend, so it does **not** rescue this case.
+> - **Diffusion-MPC on `--simple`** uses the full-map-sized horizon (~2.8 km) and over-shoots the 150 m field. Use `--planner lattice` for `--simple --plan`.
+> - **`outputs/my_run/*.mp4`** at the top of this README were generated 2026-03-05, before the recent JAX refactor. They're representative of the kind of output to expect but won't reproduce bit-for-bit against current `main`.
 
 ---
 
@@ -130,22 +141,23 @@ The first JAX-backed run JIT-compiles the physics kernel (~30–60 s); subsequen
 The MEDEA Fram-Strait satellite scene is the headline scenario. The ship travels diagonally from bottom-left to top-right through a real ice field, and the planner has to find a navigable path. **Requires `data/ice_floes_MEDEA_fram_20100629.pkl`** (see [Data and dependencies](#data-and-dependencies)).
 
 ```bash
-# 1. Straight diagonal, no planning — ship just plows through
+# 1. Straight diagonal, no planning — fixed reference trajectory through the ice field.
 uv run python run_medea_ship_fracture.py --full-map --output-dir outputs/medea_straight
 
-# 2. Lattice A* (reproduces outputs/my_run shown at the top of this README)
+# 2. Lattice A* — needs --fast-lattice (A* tuning for the 1.5 km map) and --polygon-replan
+#    (legacy CostMap during replans; see "sharp edges" note in TL;DR).
 uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice \
-    --output-dir outputs/my_run
+    --fast-lattice --polygon-replan --output-dir outputs/medea_lattice
 
-# 3. Diffusion-MPC (default planner — fully GPU)
+# 3. Diffusion-MPC (default planner — fully GPU).
 uv run python run_medea_ship_fracture.py --full-map --plan \
     --output-dir outputs/medea_diffusion
 
-# 4. MPPI (importance-weighted sampling)
+# 4. MPPI (importance-weighted sampling).
 uv run python run_medea_ship_fracture.py --full-map --plan --planner mppi \
     --output-dir outputs/medea_mppi
 
-# 5. SQP (multiple-shooting) or GradCEM (gradient + cross-entropy)
+# 5. SQP (multiple-shooting) or GradCEM (gradient + cross-entropy).
 uv run python run_medea_ship_fracture.py --full-map --plan --planner sqp     --output-dir outputs/medea_sqp
 uv run python run_medea_ship_fracture.py --full-map --plan --planner gradcem --output-dir outputs/medea_gradcem
 ```
@@ -162,7 +174,7 @@ Each command produces, in `--output-dir`:
 
 Useful add-on flags for these commands:
 - `--warm-start` — sampling/gradient planners seed from an A* path instead of cold-starting.
-- `--kinematic-ship` — disable ship dynamics, place the hull on the plan each frame (sanity check that the plan is feasible).
+- `--no-replan` — single up-front plan, no receding-horizon replanning. Side-effect: also avoids the lattice + `JaxCostMapResult` issue, so it can be used in place of `--polygon-replan`.
 - `--plan-only` — plan once, save costmap+path PNG, exit (no simulation; fastest way to debug a planner).
 - `--no-3d` — skip the 3D MP4 (saves ~half the rendering time).
 - `--quick` — simulation only, no animations.
@@ -226,7 +238,15 @@ uv run python examples/benchmark_planners.py \
 
 ### 3. Fixed-grid synthetic benchmark — `medea_ice_ship.synthetic_map`
 
-For the formal benchmark we use a **fixed 300 × 750 m corridor**, ship at (150, 50) heading +y, goal line y = 700. Scenarios vary concentration (5–70 %), thickness mode (`uniform_thin` / `uniform_thick` / `bimodal`), and presence of a uniform current. The scenario grid is enumerated by `synthetic_map.list_scenarios('A')` and `list_scenarios('B')`.
+For the formal benchmark we use a **fixed 300 × 750 m corridor**, ship at (150, 50) heading +y, goal line y = 700. Scenarios vary concentration (5–70 %), thickness mode (`uniform_thin` / `uniform_thick` / `bimodal`), and presence of a uniform current. The scenario grid is enumerated by `synthetic_map.list_scenarios('A')`, `list_scenarios('B')`, and `list_scenarios('C')`.
+
+The benchmark is split into three blocks:
+
+| Block | Grid | Notes |
+|-------|------|-------|
+| **A** | 36 scenarios × 7 planners × 5 seeds = 1 260 trials | Fracturable floes (tessellated, DPDEM bonds). |
+| **B** | 21 scenarios × 7 planners × 5 seeds =   735 trials | Adds ocean currents on top of selected A configurations. |
+| **C** | 36 scenarios × 7 planners × 5 seeds = 1 260 trials | Same grid as A but **rigid floes** (no tessellation, no fracture). |
 
 Run a single trial:
 
@@ -246,10 +266,27 @@ uv run python run_smoke_test.py --planner astar --with-plots
 uv run python run_smoke_test.py --planner mbd   --with-plots --with-denoising-movie
 ```
 
+Run a specific block — e.g. all seeds × all planners × block C only:
+
+```bash
+uv run python submit_experiments.py --block C --submit
+```
+
+Smoke test (seed 0, all artifacts) for one block — loop every planner over block C:
+
+```bash
+for planner in astar mbd eb-mbd astar-eb-mbd mppi rss ilqr; do
+    uv run python run_smoke_test.py --planner "$planner" --block C \
+        --with-movies --with-search-movie --with-denoising-movie
+done
+```
+
 Submit the whole grid to SLURM:
 
 ```bash
+# Default (no --block): enumerates A + B + C.
 uv run python submit_experiments.py        # generate + submit sbatch files in slurm_scripts/
+uv run python submit_experiments.py --block A   # restrict to one block (e.g. prior A-only behaviour)
 ```
 
 See [`docs/EXPERIMENT_PROTOCOL.md`](docs/EXPERIMENT_PROTOCOL.md) and [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for the experiment design, and `scripts/README_SLURM.md` for SLURM specifics.
@@ -398,9 +435,9 @@ Use `--no-dpdem-bonds` to fall back to the legacy force-vs-strength model.
 
 The sections above (full-MEDEA, synthetic maps, toy problems) cover the common workflows. This section catalogues every command-line invocation in detail. All commands use `run_medea_ship_fracture.py` unless noted. Use `uv run python ...` to run with the project environment.
 
-### 1. Simple straight (no planning)
+### 1. Simple straight (no planning) — *currently mostly visual debugging only*
 
-Minimal synthetic ice field (3 floes), ship on a straight path left → right. No MEDEA data required.
+Minimal synthetic ice field (3 floes), no planning. **Caveat (current code state):** the bare `--simple` path uses `n_frames_simple = 300 × dt = 0.05 s` (15 s of sim time) and the AUTO-IceNav 3-DOF ship can't cover the ~260 m reference trajectory in that time — the ship looks stationary. `--kinematic-ship` is currently a silent no-op on the JAX backend, so it does not rescue this. Use this mode if you want to inspect the static ice field and bond network at `t=0`; otherwise jump to §3 (lattice with `--plan`).
 
 ```bash
 uv run python run_medea_ship_fracture.py --simple
@@ -411,7 +448,7 @@ uv run python run_medea_ship_fracture.py --simple
 
 ### 2. Simple straight with thick ice
 
-Same as above but override ice thickness (e.g. 10 m) for all cells. Useful to test fracture vs unbreakable ice.
+Override ice thickness (e.g. 10 m) for all cells. Useful for testing fracture vs unbreakable ice. Same dynamics caveat as §1.
 
 ```bash
 uv run python run_medea_ship_fracture.py --simple --thick-ice 10
@@ -421,10 +458,10 @@ Optional: `--thrust-cap 25e6` (25 MN) to cap ship thrust; `--no-thrust-cap` for 
 
 ### 3. Lattice planner (A* on motion primitives)
 
-Plan a path through the simple ice field with **lattice A*** (costmap + Dubins-like primitives), then simulate the ship following that path with receding-horizon replanning.
+Plan a path through the simple ice field with **lattice A*** (costmap + Dubins-like primitives), then simulate the ship following that path with receding-horizon replanning. `--polygon-replan` is required: during replans the runner otherwise builds a `JaxCostMapResult` (no `world_to_grid`) and the legacy lattice planner crashes. `--polygon-replan` falls back to the same `build_costmap_from_ice_state` used at initial plan time. Alternatively, `--no-replan` disables replanning entirely.
 
 ```bash
-uv run python run_medea_ship_fracture.py --simple --plan --planner lattice
+uv run python run_medea_ship_fracture.py --simple --plan --planner lattice --polygon-replan
 ```
 
 - **Planner:** A* on motion primitives (AUTO-IceNav style).
@@ -437,14 +474,16 @@ Plan and optimize control sequences using **model-based diffusion** (3-DOF dynam
 
 ```bash
 # Cold start (default): diffusion runs from scratch, no A* warm-start
-uv run python run_medea_ship_fracture.py --simple --plan
+uv run python run_medea_ship_fracture.py --full-map --plan
 
 # Warm start: run A* first, use result to seed diffusion
-uv run python run_medea_ship_fracture.py --simple --plan --warm-start
+uv run python run_medea_ship_fracture.py --full-map --plan --warm-start
 ```
 
 - **Planner:** Model-based diffusion over control sequences (3-DOF dynamics, costmap, path/waypoint rewards). Fully JAX/GPU-accelerated.
 - **Generated:** 2D, 3D, costmap movie, hull impact plot.
+
+> **Heads up:** the diffusion-MPC default horizon (`planning_jax_mbd_horizon=700`, `dt_substep=1.0 s` ≈ 2.8 km at the 4 m/s target speed) is tuned for the full MEDEA scene. On the small `--simple` field (~150 m wide) the planned trajectory will extend well past the costmap. Use `--planner lattice` for `--simple` (§3), or override the horizon explicitly if you need diffusion-MPC there.
 
 ### 4b. MPPI planner (Model Predictive Path Integral)
 
@@ -456,20 +495,16 @@ uv run python run_medea_ship_fracture.py --simple --plan --planner mppi
 
 - **Planner:** MPPI (JAX, GPU-friendly). Cold start by default; add `--warm-start` for A* seed.
 
-### 5. Kinematic ship (path verification)
+### 5. Kinematic ship (path verification) — *currently unsupported on JAX backend*
 
-Ship is placed exactly on the planned path each frame (no dynamics). Use to check that the planned path is feasible and that red (plan) and blue (actual) coincide.
+The historical purpose of this mode is to place the ship exactly on the planned path each frame (no dynamics) for a sanity check that red (plan) and blue (actual) coincide. **In the current code, `--kinematic-ship` is a silent no-op:** both `simulate_jax_chunked_replan` and `simulate_full_jax_scan` run AUTO-IceNav dynamics regardless. Treat the commands below as a placeholder until the kinematic path is restored.
 
 ```bash
-# Lattice plan, kinematic execution
-uv run python run_medea_ship_fracture.py --simple --plan --planner lattice --kinematic-ship
-
-# Diffusion-MPC or MPPI plan, kinematic execution
+# These currently behave the same as the corresponding --plan runs without --kinematic-ship.
+uv run python run_medea_ship_fracture.py --simple --plan --planner lattice --polygon-replan --kinematic-ship
 uv run python run_medea_ship_fracture.py --simple --plan --kinematic-ship
 uv run python run_medea_ship_fracture.py --simple --plan --planner mppi --kinematic-ship
 ```
-
-Use a dedicated output dir to compare: e.g. `--output-dir outputs/simple_lattice` or `outputs/simple_diffusion`.
 
 ### 6. Full MEDEA map (diagonal ship)
 
@@ -477,7 +512,7 @@ Use the full satellite ice map; ship goes diagonal bottom-left → top-right. Re
 
 ```bash
 uv run python run_medea_ship_fracture.py --full-map
-uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice
+uv run python run_medea_ship_fracture.py --full-map --plan --planner lattice --fast-lattice --polygon-replan
 uv run python run_medea_ship_fracture.py --full-map --plan
 uv run python run_medea_ship_fracture.py --full-map --plan --planner mppi
 ```

@@ -11,9 +11,10 @@ Usage (dry-run: print commands only):
 Usage (single block):
     uv run python submit_experiments.py --block A --dry-run
 
-Total jobs: 1 710
-    Block A: 36 scenarios × 6 planners × 5 seeds = 1 080
-    Block B: 21 scenarios × 6 planners × 5 seeds =   630
+Total jobs: 3 255
+    Block A: 36 scenarios × 7 planners × 5 seeds = 1 260
+    Block B: 21 scenarios × 7 planners × 5 seeds =   735
+    Block C: 36 scenarios × 7 planners × 5 seeds = 1 260  (A grid, rigid floes)
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import sys
 from pathlib import Path
 
 # ── Experiment grid ────────────────────────────────────────────────────────
-PLANNERS = ["astar", "mbd", "eb-mbd", "mppi", "rss", "ilqr"]
+PLANNERS = ["astar", "mbd", "eb-mbd", "astar-eb-mbd", "mppi", "rss", "ilqr"]
 SEEDS    = [0, 1, 2, 3, 4]
 
 # ── SLURM template ─────────────────────────────────────────────────────────
@@ -89,8 +90,8 @@ def main():
     p = argparse.ArgumentParser(
         description="Submit SLURM jobs for the ice-navigation experiment suite."
     )
-    p.add_argument("--block", choices=["A", "B"],
-                   help="Submit only this block (default: both A and B)")
+    p.add_argument("--block", choices=["A", "B", "C"],
+                   help="Submit only this block (default: A, B, and C)")
     p.add_argument("--planner", choices=PLANNERS,
                    help="Submit only this planner")
     p.add_argument("--scenario",
@@ -112,7 +113,7 @@ def main():
     if not args.dry_run and not args.submit and not args.count:
         p.error("Specify --dry-run, --submit, or --count")
 
-    blocks       = [args.block] if args.block else ["A", "B"]
+    blocks       = [args.block] if args.block else ["A", "B", "C"]
     scripts_dir  = Path(args.scripts_dir)
     output_dir   = args.output_dir
 
