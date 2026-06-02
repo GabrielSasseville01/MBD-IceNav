@@ -63,6 +63,7 @@ from scipy.ndimage import maximum_filter
 
 from medea_ice_ship.config import get_default_run_config
 from medea_ice_ship.jax_costmap import JaxCostMapResult, build_costmap_jax
+from medea_ice_ship.jax_dial_mpc_planner import dial_mpc_optimize
 from medea_ice_ship.jax_mbd_planner import jax_mbd_optimize, rrt_path_on_costmap, astar_path_on_costmap
 from medea_ice_ship.planning import create_medea_lattice_planner, plan_path
 from medea_ice_ship.visualization import _animation_writer
@@ -948,6 +949,114 @@ def run_one_method(
     return metrics
 
 
+# ── DIAL-MPC runner ──────────────────────────────────────────────────────────────
+
+def run_dial_mpc_method(
+    sc: ScenarioCfg,
+    cost_map,
+    geo_info: dict,
+    run_cfg,
+    args,
+    out_dir: Path,
+) -> dict:
+    """
+    Run DIAL-MPC (single-shot mode) on the scenario.
+
+    The cost being optimised is identical to the other MBD variants
+    (costmap integral + terminal Euclidean goal + length / smoothness as
+    configured in ``run_cfg``).  DIAL-MPC's contribution is in *how* the
+    control sequence is searched: quadratic-spline node parameterisation
+    + MPPI score-ascent + dual-loop annealing schedule (eqs. 5-7 of the
+    paper).
+
+    EB barrier / AL multiplier / hard rectangular obstacles are not
+    supported (they are MBD-paper additions, not part of DIAL-MPC).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    algo_name = "DIAL-MPC"
+
+    print(f"\n[{sc.name}] Running {algo_name} ...", flush=True)
+    _t0 = time.perf_counter()
+    final_traj, diag = dial_mpc_optimize(
+        cost_map=cost_map,
+        start_pose=sc.start,
+        goal=sc.goal,
+        run_cfg=run_cfg,
+        start_nu=(2.0, 0.0, 0.0),
+        return_diagnostics=True,
+        # DIAL-MPC knobs (see paper eq. 5-7 / dial_config.py)
+        H_node=args.dial_hnode,
+        Nsample=args.dial_nsample,
+        Ndiffuse=args.dial_ndiffuse,
+        temp_sample=args.dial_temp_sample,
+        horizon_diffuse_factor=args.dial_horizon_diffuse_factor,
+        traj_diffuse_factor=args.dial_traj_diffuse_factor,
+        sigma_scale=args.dial_sigma_scale,
+        # Cost passthroughs (match the other MBD methods on these scenarios)
+        terminal_goal_distance_weight=args.terminal_goal_distance_weight,
+        oob_penalty=1e8,
+    )
+    planning_time = time.perf_counter() - _t0
+
+    mean_traj = np.array(diag["mean_trajectories"][-1])
+    mean_cost = diag["cost_of_mean"][-1] if diag["cost_of_mean"] else float("nan")
+
+    cost_mins_arr = np.array(diag["cost_mins"])
+    global_min_step = int(cost_mins_arr.argmin())
+    best_cost = float(cost_mins_arr[global_min_step])
+    best_traj = diag["sample_trajectories"][global_min_step][0]
+
+    path_length = float(np.sum(np.linalg.norm(np.diff(mean_traj[:, :2], axis=0), axis=1)))
+    traj_cost   = float(sum(cost_map.get_cost_world(float(x), float(y))
+                            for x, y in mean_traj[:, :2]))
+    _ys = mean_traj[:, 1]
+    _xs = mean_traj[:, 0]
+    _cross    = int(np.argmax(_ys >= GOAL_LINE)) if np.any(_ys >= GOAL_LINE) else -1
+    x_at_goal = float(mean_traj[_cross, 0]) if _cross >= 0 else float("nan")
+    _oob_xs   = (_xs < X_MIN) | (_xs > X_MAX)
+    _oob_ys   = (_ys < Y_MIN)
+    traj_oob  = bool(np.any(_oob_xs | _oob_ys))
+    _goal_x_ok = _cross >= 0 and X_MIN <= x_at_goal <= X_MAX
+    reaches_goal_clean = _cross >= 0 and _goal_x_ok and not traj_oob
+
+    metrics = {
+        "method":        algo_name,
+        "planning_time": planning_time,
+        "traj_cost":     traj_cost,
+        "path_length":   path_length,
+        "reaches_goal":  reaches_goal_clean,
+        "traj_oob":      traj_oob,
+        "x_at_goal":     x_at_goal,
+        "goal_x":        sc.goal[0],
+    }
+
+    print(f"\n{'─'*58}", flush=True)
+    print(f"  PLANNING METRICS  ({algo_name})  —  {sc.name}", flush=True)
+    print(f"{'─'*58}", flush=True)
+    print(f"  Planning time  : {planning_time:.1f} s", flush=True)
+    print(f"  Traj cost      : {traj_cost:.1f}  (raw costmap)", flush=True)
+    print(f"  Path length    : {path_length:.1f} m", flush=True)
+    print(f"  Reaches goal   : {'yes' if reaches_goal_clean else 'NO'}"
+          f"{' (OOB!)' if _cross >= 0 and not reaches_goal_clean else ''}", flush=True)
+    if _cross >= 0:
+        print(f"  x at goal      : {x_at_goal:.1f} m  (goal x = {sc.goal[0]:.0f} m)", flush=True)
+    print(f"  OOB violation  : {'YES' if traj_oob else 'no'}", flush=True)
+    print(f"{'─'*58}\n", flush=True)
+
+    plot_costmap(cost_map, geo_info, sc, str(out_dir / "costmap.png"))
+    plot_result(cost_map, geo_info, sc, mean_traj, best_traj,
+                mean_cost, best_cost, algo_name, str(out_dir / "result.png"))
+
+    print(f"  Generating trajectory fan movie...", flush=True)
+    generate_trajectory_fan_movie(
+        diag, cost_map, geo_info, sc, algo_name,
+        str(out_dir / "trajectory_fan.mp4"),
+    )
+
+    print(f"  Done. Outputs in {out_dir}", flush=True)
+    return metrics
+
+
 # ── Comparison table ─────────────────────────────────────────────────────────────
 
 def print_comparison_table(all_metrics: list[dict], sc: ScenarioCfg,
@@ -1260,7 +1369,7 @@ def main():
         help="Scenario to run",
     )
     _method_choices = ["mbd", "eb_mbd", "eb_rrt_mbd", "eb_astar_mbd", "reject_mbd",
-                       "al_mbd", "lattice"]
+                       "al_mbd", "lattice", "dial_mpc"]
     parser.add_argument(
         "--method",
         choices=_method_choices,
@@ -1291,6 +1400,22 @@ def main():
     # AL-MBD
     parser.add_argument("--al-rho",   type=float, default=50.0)
     parser.add_argument("--al-M-max", type=float, default=1000.0)
+    # DIAL-MPC (paper-named hyperparameters, defaults from dial-mpc/dial_config.py
+    # adapted for this scenario suite's larger horizon).
+    parser.add_argument("--dial-hnode",                   type=int,   default=25,
+                        help="Number of spline control-node intervals (paper Hnode)")
+    parser.add_argument("--dial-nsample",                 type=int,   default=2048,
+                        help="Samples per inner iteration (paper N_W / Nsample)")
+    parser.add_argument("--dial-ndiffuse",                type=int,   default=10,
+                        help="Inner diffusion iterations (paper N; default = Ndiffuse_init)")
+    parser.add_argument("--dial-temp-sample",             type=float, default=0.05,
+                        help="MPPI softmax temperature (paper lambda / temp_sample)")
+    parser.add_argument("--dial-horizon-diffuse-factor",  type=float, default=0.9,
+                        help="Action-level annealing rate (paper beta_2 in eq. 6)")
+    parser.add_argument("--dial-traj-diffuse-factor",     type=float, default=0.5,
+                        help="Trajectory-level annealing rate (paper beta_1 in eq. 5)")
+    parser.add_argument("--dial-sigma-scale",             type=float, default=1.0,
+                        help="Overall scaling of the DIAL noise kernel")
     # Inflation is OFF by default: the cost function already uses 5-point hull
     # sampling that covers the ship footprint, so inflating the costmap by
     # beam/2 on top of that double-counts the clearance and makes geometrically
@@ -1351,7 +1476,7 @@ def main():
     cost_map_search = _dilate_costmap(cost_map, inflate_search_m)
 
     all_methods = ["lattice", "mbd", "eb_mbd", "eb_rrt_mbd", "eb_astar_mbd",
-                   "reject_mbd", "al_mbd"]
+                   "reject_mbd", "al_mbd", "dial_mpc"]
     methods = all_methods if args.run_all_methods else args.method
     all_metrics: list[dict] = []
 
@@ -1360,6 +1485,8 @@ def main():
         if method == "lattice":
             m = run_lattice_method(sc, cost_map, geo_info, run_cfg, method_dir,
                                    cost_map_search=cost_map_search)
+        elif method == "dial_mpc":
+            m = run_dial_mpc_method(sc, cost_map, geo_info, run_cfg, args, method_dir)
         else:
             m = run_one_method(method, sc, cost_map, geo_info, run_cfg, args, method_dir,
                                cost_map_search=cost_map_search)

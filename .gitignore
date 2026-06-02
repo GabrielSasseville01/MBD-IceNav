@@ -31,3 +31,6 @@ outputs/
 
 # OS
 .DS_Store
+
+# Local notes
+ship_velocity_in_planning.md

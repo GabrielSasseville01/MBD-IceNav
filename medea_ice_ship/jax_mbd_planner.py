@@ -3058,8 +3058,14 @@ def jax_mbd_optimize(
     import time as _time
     _t0 = _time.perf_counter()
     _diagnostics = None
-    # Run diagnostics mode when explicitly requested OR when a denoising movie is wanted
-    _need_diagnostics = return_diagnostics or (denoising_movie_dir is not None)
+    # Run diagnostics mode when explicitly requested OR when a denoising movie
+    # is wanted OR when a sample_filter_fn is provided (the fast-path `run_mbd`
+    # has no filter parameter and silently drops it).
+    _need_diagnostics = (
+        return_diagnostics
+        or (denoising_movie_dir is not None)
+        or (sample_filter_fn is not None and not use_eb_mbd and not use_al_mbd)
+    )
     if _need_diagnostics:
         if use_al_mbd:
             _diagnostics = run_al_mbd_with_diagnostics(
