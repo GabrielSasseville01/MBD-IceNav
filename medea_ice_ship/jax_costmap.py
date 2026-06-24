@@ -67,6 +67,11 @@ class JaxCostMapResult:
     width:      float
     height:     float
     base_cost:  float = 0.1
+    # Adaptive-velocity mode: cells store the per-v² KE coefficient (no v
+    # baked in, no base_cost floor applied). Downstream cost integrals must
+    # multiply by v²(t) from the rollout and apply max(base_cost, ...) at
+    # query time. When False (default), cells are the final cost as before.
+    adaptive_velocity: bool = False
 
     def get_cost_world(self, x: float, y: float) -> float:
         """Sample costmap at world coordinates (x, y).
@@ -199,6 +204,7 @@ def build_costmap_jax(
     ke_cost_scale: float = 1e-6,
     ice_resistance_weight: float = 0.0,
     masses: Optional[np.ndarray] = None,
+    adaptive_velocity: bool = False,
 ) -> Tuple["JaxCostMapResult", dict]:
     """
     Build a planning costmap from current ice element positions using JAX.
@@ -252,18 +258,23 @@ def build_costmap_jax(
         else:
             masses_arr = np.asarray(masses, dtype=float)
 
-        # Per-element KE constant (computed in float64 to avoid overflow)
-        v   = max(float(ship_speed), 1e-6)
+        # Per-element KE constant (computed in float64 to avoid overflow).
+        # In adaptive_velocity mode we bake v=1 so the stored value is the
+        # per-v² coefficient; the cost integral multiplies by v_rollout² at
+        # query time. The clip ceiling is scaled by ship_speed² so saturation
+        # at the design velocity matches the non-adaptive build.
+        v_baked = 1.0 if adaptive_velocity else max(float(ship_speed), 1e-6)
+        clip_hi = 1e8 / (max(float(ship_speed), 1e-6) ** 2) if adaptive_velocity else 1e8
         M_s = float(ship_mass)
         m_i = masses_arr.astype(np.float64)
         ke_constants = (
             float(collision_cost)
-            * v * v
+            * v_baked * v_baked
             * m_i * M_s * (m_i + 2.0 * M_s)
             / (2.0 * (M_s + m_i) ** 2)
             * float(ke_cost_scale)
         )
-        ke_constants_f32 = np.clip(ke_constants, 0.0, 1e8).astype(np.float32)
+        ke_constants_f32 = np.clip(ke_constants, 0.0, clip_hi).astype(np.float32)
 
         grid_jax = _rasterize_elements_ke(
             jnp.array(centroids,        dtype=jnp.float32),
@@ -288,13 +299,17 @@ def build_costmap_jax(
             sic_safe = np.maximum(sic, 1e-6)
             grid_np = grid_np * np.power(sic_safe, ice_resistance_weight)
 
-        # Open-water floor
-        grid_np = np.maximum(grid_np, float(base_cost))
+        # Open-water floor. Skipped in adaptive_velocity mode: the floor
+        # must not be v²-scaled, so the cost integral applies it at query.
+        if not adaptive_velocity:
+            grid_np = np.maximum(grid_np, float(base_cost))
         grid_jax = jnp.array(grid_np, dtype=jnp.float32)
 
     else:
-        # Empty ice field
-        grid_jax = jnp.full((rows, cols), float(base_cost), dtype=jnp.float32)
+        # Empty ice field. In adaptive mode the grid is all zeros (per-v²
+        # coefficient is zero in open water); the floor is applied at query.
+        floor_value = 0.0 if adaptive_velocity else float(base_cost)
+        grid_jax = jnp.full((rows, cols), floor_value, dtype=jnp.float32)
 
     # Ship-footprint dilation
     if ship_length is not None and ship_beam is not None and ship_length > 0 and ship_beam > 0:
@@ -316,8 +331,218 @@ def build_costmap_jax(
         width=float(width),
         height=float(height),
         base_cost=float(base_cost),
+        adaptive_velocity=bool(adaptive_velocity),
     )
 
+    bounds = {
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+        "x_origin": float(x_origin),
+        "y_origin": float(y_origin),
+        "width": float(width),
+        "height": float(height),
+    }
+    return result, bounds
+
+
+@partial(jax.jit, static_argnames=("rows", "cols"))
+def _rasterize_elements_exp_sdf(
+    centroids:   jnp.ndarray,   # (n, 2)
+    radii:       jnp.ndarray,   # (n,)
+    weights:     jnp.ndarray,   # (n,) non-dimensional ∈ [0, 1]
+    x_origin:    float,
+    y_origin:    float,
+    resolution:  float,
+    rows: int,
+    cols: int,
+    decay_length: float,
+    obs_cost_buffer_factor: float = 0.0,
+) -> jnp.ndarray:               # (rows, cols) float32
+    """
+    Smooth exponential-SDF cost field (v2 cost reshape).
+
+    For each floe i with centroid c_i, effective radius r_i_eff, and
+    non-dimensional weight w_i ∈ [0, 1]:
+
+        d_i(x, y) = max(0, ||(x, y) - c_i|| - r_i_eff)
+        c_i(x, y) = w_i * exp(-d_i / L)
+
+    Per-cell cost is the max over floes. Inside a floe, c_i = w_i; far away,
+    c_i decays to 0 with characteristic distance L. The key property: there
+    is a non-zero gradient EVERYWHERE pointing away from the nearest floe,
+    unlike the v1 parabola which is zero outside r_i_eff.
+    """
+    c_idx = jnp.arange(cols, dtype=jnp.float32)
+    r_idx = jnp.arange(rows, dtype=jnp.float32)
+    cell_x = x_origin + (c_idx + 0.5) * resolution   # (cols,)
+    cell_y = y_origin + (r_idx + 0.5) * resolution   # (rows,)
+    XX, YY = jnp.meshgrid(cell_x, cell_y)            # (rows, cols)
+    L_safe = jnp.maximum(jnp.float32(decay_length), jnp.float32(1e-6))
+
+    def element_contribution(centroid, radius, weight):
+        eff_r = radius * (1.0 + obs_cost_buffer_factor) + 0.5 * resolution
+        dist = jnp.sqrt((XX - centroid[0]) ** 2 + (YY - centroid[1]) ** 2 + 1e-12)
+        outer_d = jnp.maximum(0.0, dist - eff_r)
+        return weight * jnp.exp(-outer_d / L_safe)
+
+    contributions = jax.vmap(element_contribution)(
+        centroids.astype(jnp.float32),
+        radii.astype(jnp.float32),
+        weights.astype(jnp.float32),
+    )
+    return jnp.max(contributions, axis=0)
+
+
+def build_costmap_jax_v2(
+    centroids: np.ndarray,
+    thicknesses: np.ndarray,
+    radii: np.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    *,
+    resolution: float = 2.0,
+    margin: float = 20.0,
+    base_cost: float = 0.0,
+    peak_cost: float = 1.0,
+    decay_length: Optional[float] = None,
+    obs_cost_buffer_factor: float = 0.1,
+    ship_length: Optional[float] = None,
+    ship_beam:   Optional[float] = None,
+    planning_clearance_margin: float = 0.0,
+    ship_speed: float = 4.0,
+    ship_mass: float = 23e6,
+    ke_cost_scale: float = 1e-6,
+    ke_reference: Optional[float] = None,
+    masses: Optional[np.ndarray] = None,
+    verbose: bool = False,
+) -> Tuple["JaxCostMapResult", dict]:
+    """
+    v2 costmap builder — global exponential SDF + non-dimensionalized magnitude.
+
+    Differences from ``build_costmap_jax`` (v1):
+
+    (a) Non-zero gradient everywhere: cost decays exponentially with distance
+        to the nearest floe boundary (decay length ``L``), not a parabola that
+        is zero outside the floe radius. MBD rollouts in open water now see a
+        spatial signal.
+    (b) Per-floe contribution is non-dimensionalized: w_i = clip(ke_i / ke_ref,
+        0, 1), so peak magnitude is bounded by ``peak_cost`` regardless of ice
+        thickness, ship speed, or mass. The same MBD temperature transfers
+        across scenarios.
+    (c) Max over floes (same as v1) — closest dangerous floe dominates.
+
+    Parameters
+    ----------
+    decay_length : characteristic distance L for the exp(-d/L) falloff.
+        If None, defaults to max(ship_length, 3 * median floe radius), which
+        scales the gradient to ship-maneuverability units rather than per-floe
+        units.
+    peak_cost : maximum value the cost field can take (saturating inside the
+        heaviest floe). The whole field is bounded by [base_cost, peak_cost].
+    ke_reference : if None, taken as the median per-floe KE constant for the
+        scene. Pass a fixed value to force a global reference across runs.
+    """
+    centroids   = np.asarray(centroids,   dtype=float)
+    thicknesses = np.asarray(thicknesses, dtype=float)
+    radii       = np.asarray(radii,       dtype=float)
+
+    x_origin = x_min - margin
+    y_origin = y_min - margin
+    width    = (x_max - x_min) + 2.0 * margin
+    height   = (y_max - y_min) + 2.0 * margin
+    cols = max(1, int(np.ceil(width  / resolution)))
+    rows = max(1, int(np.ceil(height / resolution)))
+
+    if verbose:
+        print(f"  [jax-costmap-v2] grid: {rows}×{cols} cells "
+              f"({rows * cols / 1e6:.2f} M), n_elem={len(centroids)}", flush=True)
+
+    n = len(centroids)
+
+    if n > 0:
+        if masses is None:
+            masses_arr = np.pi * radii ** 2 * thicknesses * 920.0
+        else:
+            masses_arr = np.asarray(masses, dtype=float)
+
+        # Per-element KE constant — same physics as v1 but used here only for
+        # *relative* weighting between floes (heavier/thicker = more weight).
+        # The scene-relative normalization (divide by ke_ref) is what makes the
+        # peak O(1) regardless of scenario.
+        M_s = float(ship_mass)
+        m_i = masses_arr.astype(np.float64)
+        v   = max(float(ship_speed), 1e-6)
+        ke_constants = (
+            v * v * m_i * M_s * (m_i + 2.0 * M_s)
+            / (2.0 * (M_s + m_i) ** 2)
+            * float(ke_cost_scale)
+        )
+        if ke_reference is None:
+            # Use scene MAX so only the heaviest floe saturates at w=1; lighter
+            # floes get proportionally smaller weights. Median-based ke_ref
+            # caused field saturation in dense Medea scenes (most floes ≥ ref).
+            ke_ref = float(np.max(ke_constants))
+        else:
+            ke_ref = float(ke_reference)
+        ke_ref = max(ke_ref, 1e-12)
+
+        weights = np.clip(ke_constants / ke_ref, 0.0, 1.0).astype(np.float32)
+
+        L = decay_length
+        if L is None:
+            # Decay length set by ship clearance, not ship length. With long L
+            # the exp falloffs from neighbouring floes overlap and the max
+            # saturates at peak_cost; with short L there is no signal in open
+            # water. ~2*beam (≈ ship width incl. clearance) tracks the
+            # corridor scale the ship must thread.
+            ship_clear = (float(ship_beam) if ship_beam is not None else 18.0) * 2.0
+            L = max(ship_clear, 1.5 * float(np.median(radii)))
+
+        if verbose:
+            print(f"  [jax-costmap-v2] L={L:.1f} m, ke_ref={ke_ref:.3g}, "
+                  f"w∈[{weights.min():.2f},{weights.max():.2f}]", flush=True)
+
+        grid_jax = _rasterize_elements_exp_sdf(
+            jnp.array(centroids, dtype=jnp.float32),
+            jnp.array(radii,     dtype=jnp.float32),
+            jnp.array(weights,   dtype=jnp.float32),
+            float(x_origin), float(y_origin), float(resolution),
+            rows, cols,
+            float(L),
+            float(obs_cost_buffer_factor),
+        )
+        jax.block_until_ready(grid_jax)
+        grid_np = (float(peak_cost) * np.array(grid_jax, dtype=np.float32))
+        grid_np = np.maximum(grid_np, float(base_cost))
+        grid_jax = jnp.array(grid_np, dtype=jnp.float32)
+    else:
+        grid_jax = jnp.full((rows, cols), float(base_cost), dtype=jnp.float32)
+
+    if ship_length is not None and ship_beam is not None and ship_length > 0 and ship_beam > 0:
+        inflation_r = 0.5 * ship_beam + planning_clearance_margin
+        if inflation_r > 0:
+            kernel = _make_disk_kernel(inflation_r, resolution)
+            grid_jax = _dilate_grid_jax(grid_jax, kernel)
+            jax.block_until_ready(grid_jax)
+
+    grid_np = np.array(grid_jax, dtype=np.float32)
+
+    result = JaxCostMapResult(
+        cost_map=grid_np,
+        x_origin=float(x_origin),
+        y_origin=float(y_origin),
+        resolution=float(resolution),
+        rows=int(rows),
+        cols=int(cols),
+        width=float(width),
+        height=float(height),
+        base_cost=float(base_cost),
+        adaptive_velocity=False,
+    )
     bounds = {
         "x_min": float(x_min),
         "x_max": float(x_max),

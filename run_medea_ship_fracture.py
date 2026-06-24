@@ -368,7 +368,7 @@ def main():
     parser.add_argument('--polygon-replan', action='store_true',
                         help='Use polygon-based costmap (same as initial plan) for replanning instead of JAX disk approximation. Slower but matches AUTO-IceNav exactly.')
     parser.add_argument('--mbd-denoising-movie', action='store_true',
-                        help='With --mbd-viz-dir: also save a denoising-evolution MP4 (replan_XXXX_denoising.mp4) for each replan step.')
+                        help='With --mbd-viz-dir: also save a denoising-evolution GIF (replan_XXXX_denoising.gif) for each replan step.')
     # ── Reject-sampling filter ────────────────────────────────────────────
     parser.add_argument('--reject-sampling', action='store_true',
                         help='With diffusion-mpc: at each denoising step resample until all Nsample trajectories are non-OOB and reach the goal. '
@@ -759,7 +759,11 @@ def main():
         else:
             goal_pt = np.array(ship_end[:2])
         est_len = float(np.hypot(goal_pt[0] - ship_start[0], goal_pt[1] - ship_start[1]))
-        n_frames = max(10, int(np.ceil(est_len / (target_speed * dt_sim))))
+        # Budget 2x the straight-line traversal time: the ship's actual path is
+        # longer than the straight line (ice avoidance) and slower than target
+        # speed when in contact with ice, so the straight-line estimate runs
+        # out of frames before the ship reaches the goal.
+        n_frames = max(10, int(np.ceil(2.0 * est_len / (target_speed * dt_sim))))
         print(f"  Target speed: {target_speed:.1f} m/s → n_frames={n_frames} (est. path {est_len:.0f} m, sim time {n_frames*dt_sim:.2f} s)", flush=True)
         # Rebuild ship_trajectory with new n_frames for fixed trajectory (will be replaced by planned path)
         if synthetic_mode:
@@ -1161,7 +1165,14 @@ def main():
                 planning_jax_mbd_goal_x_weight=args.eb_goal_x_weight,
                 planning_jax_mbd_length_weight=args.eb_length_weight,
             )
-        _mbd_replan_counter = [0]  # mutable counter accessible inside closure
+        # Start at 1 so the initial-plan outputs at replan_0000_* are preserved.
+        _mbd_replan_counter = [1]
+        # Snapshot original cell polygons + thicknesses for replan denoising-movie
+        # visualization, so subsequent replans render the same blue-floe style as
+        # replan_0000 (the simulation's live per-element polygons render too faintly
+        # at the full domain scale).
+        _viz_polygons_init = polygons
+        _viz_thicknesses_init = thicknesses
 
         def _replan_callback(frame, world_polygons, centroids, thicknesses, ship_pos_f, ship_heading_f, n_remaining):
             # Rebuild costmap from current ice state (counted as additional planning time)
@@ -1267,8 +1278,8 @@ def main():
                         path_f, start_f, goal, cost_map_f, plan_cfg, start_nu=(2.0, 0.0, 0.0),
                         viz_dir=_mbd_viz_dir,
                         replan_idx=_mbd_replan_counter[0],
-                        viz_world_polygons=world_polygons,
-                        viz_thicknesses=thicknesses,
+                        viz_world_polygons=_viz_polygons_init,
+                        viz_thicknesses=_viz_thicknesses_init,
                         goal_y_line=_replan_goal_line,
                         denoising_movie_dir=_mbd_viz_dir if getattr(args, 'mbd_denoising_movie', False) else None,
                         sample_filter_fn=_replan_filter,

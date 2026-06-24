@@ -37,6 +37,7 @@ import argparse
 import json
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib
@@ -74,6 +75,8 @@ from run_experiment_trial import (
     DT, MAX_SIM_TIME, REPLAN_EVERY, GOAL_TOL,
     DEFAULT_HORIZON,
     EB_C_MAX, EB_MU, EB_KAPPA, PLANNERS,
+    AL_RHO, AL_M_MAX, AL_M_INIT_OOB, AL_RHO_GOAL,
+    AL_RHO_ICE, AL_M_MAX_ICE,
     TERMINAL_GOAL_DISTANCE_WEIGHT,
 )
 
@@ -281,7 +284,7 @@ def _run_trial_for_plot(
                     seed_path, sp, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0), warm_start=warm_start,
                     goal_y_line=None,
-                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    terminal_goal_distance_weight=1.0,
                     use_eb_mbd=True,
                     eb_x_min=float(cost_map.x_origin),
                     eb_x_max=float(cost_map.x_origin + cost_map.width),
@@ -302,9 +305,15 @@ def _run_trial_for_plot(
                     _viz_polys = list(world_polygons)
                     _viz_thicks = np.asarray(thicknesses_cb).copy()
                     first_denoising_done[0] = True
-                # MBD/EB-MBD: no goal-line constraint; terminal Euclidean pull.
-                # MPPI/RSS: keep Big-M goal_y_line (no constraint mechanism).
-                # iLQR: goal_y_line=None so make_terminal_cost uses Euclidean.
+                # MBD: ice in costmap, goal-line enforced by reject filter
+                #      (drops samples with y_T < goal_y_line)  +  terminal
+                #      Euclidean pull.
+                # AL-MBD: ice as AL disk constraints; goal-line as AL
+                #      goal-reach column  +  terminal Euclidean pull.
+                # EB-MBD: hybrid EB+AL — EB barrier on goal-line + OOB,
+                #      AL multipliers on ice disks  +  terminal Euclidean.
+                # MPPI/RSS keep Big-M goal_y_line (no constraint mechanism).
+                # iLQR uses make_terminal_cost with goal_y_line=None.
                 if planner == "mbd":
                     path = optimize_with_diffusion(
                         init, sp, goal, cost_map, plan_cfg,
@@ -313,22 +322,61 @@ def _run_trial_for_plot(
                         goal_y_line_penalty=0.0,
                         terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                         oob_penalty=0.0,
-                        sample_filter_fn=_make_reject_sampling_filter(plan_cfg),
+                        sample_filter_fn=_make_reject_sampling_filter(
+                            plan_cfg, goal_y_line=goal_y),
                         denoising_movie_dir=_dmovie,
                         viz_world_polygons=_viz_polys,
                         viz_thicknesses=_viz_thicks,
                     )
                 elif planner == "eb-mbd":
+                    disks = [
+                        (float(c[0]), float(c[1]), float(r))
+                        for c, r in zip(centroids_cb, radii)
+                    ]
+                    eb_cfg = replace(plan_cfg, planning_jax_mbd_costmap_weight=0.0)
                     path = optimize_with_diffusion(
-                        init, sp, goal, cost_map, plan_cfg,
+                        init, sp, goal, cost_map, eb_cfg,
                         start_nu=(2.0, 0.0, 0.0), warm_start=False,
-                        goal_y_line=None,
+                        goal_y_line=goal_y,
+                        goal_y_line_penalty=0.0,
                         terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                         use_eb_mbd=True,
                         eb_x_min=float(cost_map.x_origin),
                         eb_x_max=float(cost_map.x_origin + cost_map.width),
                         eb_y_min=float(cost_map.y_origin),
                         eb_c_max=EB_C_MAX, eb_mu=EB_MU, eb_kappa=EB_KAPPA,
+                        eb_oob_as_constraint=True,
+                        use_hybrid_eb_al_mbd=True,
+                        hybrid_goal_tolerance=None,
+                        al_rho_ice=AL_RHO_ICE,
+                        al_M_max_ice=AL_M_MAX_ICE,
+                        obstacle_disks=disks,
+                        denoising_movie_dir=_dmovie,
+                        viz_world_polygons=_viz_polys,
+                        viz_thicknesses=_viz_thicks,
+                    )
+                elif planner == "al-mbd":
+                    disks = [
+                        (float(c[0]), float(c[1]), float(r))
+                        for c, r in zip(centroids_cb, radii)
+                    ]
+                    al_cfg = replace(plan_cfg, planning_jax_mbd_costmap_weight=0.0)
+                    path = optimize_with_diffusion(
+                        init, sp, goal, cost_map, al_cfg,
+                        start_nu=(2.0, 0.0, 0.0), warm_start=False,
+                        goal_y_line=goal_y,
+                        goal_y_line_penalty=0.0,
+                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                        oob_penalty=0.0,
+                        use_al_mbd=True,
+                        al_x_min=float(cost_map.x_origin),
+                        al_x_max=float(cost_map.x_origin + cost_map.width),
+                        al_y_min=float(cost_map.y_origin),
+                        al_rho=AL_RHO,
+                        al_M_max=AL_M_MAX,
+                        al_M_init_oob=AL_M_INIT_OOB,
+                        al_rho_goal=AL_RHO_GOAL,
+                        obstacle_disks=disks,
                         denoising_movie_dir=_dmovie,
                         viz_world_polygons=_viz_polys,
                         viz_thicknesses=_viz_thicks,
@@ -338,7 +386,7 @@ def _run_trial_for_plot(
                         init, sp, goal, cost_map, plan_cfg,
                         start_nu=(2.0, 0.0, 0.0), warm_start=False,
                         goal_y_line=None,
-                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                        terminal_goal_distance_weight=1.0,
                         y_bottom=float(Y_LO),
                     )
                 elif planner == "rss":
@@ -346,7 +394,7 @@ def _run_trial_for_plot(
                         init, sp, goal, cost_map, plan_cfg,
                         start_nu=(2.0, 0.0, 0.0), warm_start=False,
                         goal_y_line=None,
-                        terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                        terminal_goal_distance_weight=1.0,
                         y_bottom=float(Y_LO),
                     )
                 elif planner == "ilqr":

@@ -1197,6 +1197,7 @@ def _animation_writer(output_file, fps):
         matplotlib.rcParams["animation.ffmpeg_path"] = ffmpeg_path
         # Faster encoding (slightly larger file); use 'ultrafast' for max speed.
         return FFMpegWriter(fps=fps, extra_args=["-preset", "veryfast"]), output_file
+    return PillowWriter(fps=fps), output_file
 
 
 def _draw_costmap_frame_to_array(data, frame_idx):

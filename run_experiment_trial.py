@@ -79,14 +79,14 @@ from medea_ice_ship.planning import (
 )
 
 # ── Constants ──────────────────────────────────────────────────────────────
-PLANNERS = ["astar", "mbd", "eb-mbd", "astar-eb-mbd", "mppi", "rss", "ilqr"]
+PLANNERS = ["astar", "mbd", "al-mbd", "eb-mbd", "astar-eb-mbd", "mppi", "rss", "ilqr"]
 SEEDS    = [0, 1, 2, 3, 4]
 
 DT            = 0.05      # s — physics timestep (matches RunConfig default)
 MAX_SIM_TIME  = 1800.0    # s
 REPLAN_EVERY  = 30.0      # s
 GOAL_TOL      = 15.0      # m — how close to goal_y_line counts as success
-DEFAULT_HORIZON = 200     # action steps shared by all trajopt planners
+DEFAULT_HORIZON = 150     # action steps shared by all trajopt planners
 
 # Costmap margin for the synthetic 300×700 m map
 COSTMAP_MARGIN = 30.0     # m  (default 200 m is designed for 1400×1400 m maps)
@@ -96,10 +96,27 @@ EB_C_MAX         = 600.0
 EB_MU            = 50000.0
 EB_KAPPA         = 1.0
 
-# Terminal Euclidean goal-distance penalty weight (replaces goal-x cost +
-# path-length cost + goal-line constraint).  Matches the toy scenarios in
-# examples/toy_mbd_scenarios.py.
+# AL-MBD constraint hyperparameters (match toy_mbd_scenarios.py CLI defaults:
+# --al-rho 50, --al-M-max 1000, --al-m-init-oob 0, --al-rho-oob None).  OOB is
+# the only AL constraint column for Block A — ice is routed through the costmap
+# (same as the toy thin_corridor / asymmetric / cluttered scenarios).
+AL_RHO           = 50.0
+AL_M_MAX         = 1000.0
+AL_M_INIT_OOB    = 0.0
+
+# Goal mechanism: each planner enforces the y-line crossing through its
+# natural constraint machinery (reject filter / AL column / EB barrier),
+# and additionally pays a smooth terminal-Euclidean pull to (goal_x, goal_y)
+# so the planner aims for the goal point even before the line is reachable
+# within the horizon.
 TERMINAL_GOAL_DISTANCE_WEIGHT = 1.0
+# Dedicated AL goal-reach column ρ for al-mbd (≫ ρ_ice/ρ_oob).
+AL_RHO_GOAL = 50_000.0
+# Ice AL multipliers used by the hybrid EB+AL eb-mbd path (EB barriers for
+# goal & OOB, AL multipliers for ice).  Match the al-mbd ρ/M_max so the
+# two methods solve identical ice constraints.
+AL_RHO_ICE   = AL_RHO
+AL_M_MAX_ICE = AL_M_MAX
 
 
 # ── Config builder ─────────────────────────────────────────────────────────
@@ -160,9 +177,10 @@ def _make_plan_cfg(planner: str, horizon: int = DEFAULT_HORIZON,
 
     if planner == "ilqr":
         # iLQR uses make_terminal_cost(goal_xy, goal_weight, goal_y_line=None)
-        # which evaluates 1.0 * ||eta_T[:2] - goal_xy|| — matching the terminal
-        # Euclidean cost the MBD planners get via terminal_goal_distance_weight.
-        cfg = replace(cfg, planning_jax_mbd_goal_weight=TERMINAL_GOAL_DISTANCE_WEIGHT)
+        # which evaluates goal_weight * ||eta_T[:2] - goal_xy||.  iLQR keeps
+        # its terminal Euclidean pull (MBD-family planners now use a y-line
+        # crossing penalty instead — see TERMINAL_GOAL_DISTANCE_WEIGHT comment).
+        cfg = replace(cfg, planning_jax_mbd_goal_weight=1.0)
 
     if overrides:
         unknown = [k for k in overrides if not hasattr(cfg, k)]
@@ -191,6 +209,7 @@ def _build_cost_map(centroids, thicknesses, radii, plan_cfg):
         ship_mass=float(plan_cfg.ship_displacement),
         ke_cost_scale=plan_cfg.planning_ke_cost_scale,
         ice_resistance_weight=plan_cfg.planning_ice_resistance_weight,
+        adaptive_velocity=plan_cfg.planning_adaptive_velocity,
     )
     return cost_map
 
@@ -230,18 +249,21 @@ def _straight_line_path(start_pose):
 
 # ── Reject-sampling filter (standard MBD) ─────────────────────────────────
 
-def _make_reject_sampling_filter(plan_cfg):
+def _make_reject_sampling_filter(plan_cfg, goal_y_line: Optional[float] = None):
     """
-    Build a sample_filter_fn for standard MBD: at each denoising step, drop
-    samples whose hull or trajectory exits the map (left/right via hull-corner
-    check, bottom via ship-centre y).  Goal-reaching is not enforced here —
-    the terminal Euclidean cost provides the goal pull.  No replacement;
-    invalid samples are simply discarded.  Matches the reject filter in
-    examples/toy_mbd_scenarios.py.
+    Build a sample_filter_fn for standard MBD.  Drops, at every denoising
+    step, samples whose hull or trajectory exits the map (left/right via
+    hull-corner check, bottom via ship-centre y).  When ``goal_y_line`` is
+    given, also drops samples whose final waypoint has y < goal_y_line —
+    this is how the experiment enforces the goal-line crossing for vanilla
+    MBD (the AL/EB variants enforce it via their respective constraint
+    machinery).  Samples are discarded without replacement; when all are
+    rejected the planner keeps Ybar_c unchanged for that step.
     """
     _x_lo = float(X_LO)
     _x_hi = float(X_HI)
     _y_lo = float(Y_LO)
+    _goal_y = None if goal_y_line is None else float(goal_y_line)
     _half_l = plan_cfg.ship_length / 2.0
     _half_w = plan_cfg.ship_beam / 2.0
     _dx = np.array([0.0,  _half_l,  _half_l, -_half_l, -_half_l], dtype=np.float32)
@@ -258,7 +280,10 @@ def _make_reject_sampling_filter(plan_cfg):
                   - s[:, :, None] * _dy[None, None, :])
         hull_oob = ((hull_x < _x_lo) | (hull_x > _x_hi)).any(axis=(1, 2))
         y_oob = (ys < _y_lo).any(axis=1)
-        return ~(hull_oob | y_oob)
+        invalid = hull_oob | y_oob
+        if _goal_y is not None:
+            invalid = invalid | (ys[:, -1] < _goal_y)
+        return ~invalid
 
     return sample_filter_fn
 
@@ -366,7 +391,7 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
                 start_nu=(2.0, 0.0, 0.0),
                 warm_start=warm_start,
                 goal_y_line=None,
-                terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                terminal_goal_distance_weight=1.0,
                 use_eb_mbd=True,
                 eb_x_min=float(cost_map.x_origin),
                 eb_x_max=float(cost_map.x_origin + cost_map.width),
@@ -381,10 +406,12 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
             cost_map = _build_cost_map(centroids, thicknesses, radii, plan_cfg)
 
             if planner == "mbd":
-                # Standard MBD: costmap integral + terminal Euclidean goal pull
-                # (no goal-line constraint, no big-M).  OOB on left/right/bottom
-                # is enforced by reject-sampling — invalid samples are dropped
-                # without replacement.
+                # Standard MBD:
+                #   ice    = costmap integral (cost, costmap_weight=1, default)
+                #   goal   = reject filter drops samples whose final y is
+                #            below goal_y_line  +  smooth terminal Euclidean
+                #   OOB    = reject filter drops samples whose hull leaves
+                #            the map (no Big-M; oob_penalty=0.0)
                 path = optimize_with_diffusion(
                     init_path, start_pose, goal, cost_map, plan_cfg,
                     start_nu=(2.0, 0.0, 0.0),
@@ -393,19 +420,30 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
                     goal_y_line_penalty=0.0,
                     terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                     oob_penalty=0.0,
-                    sample_filter_fn=_make_reject_sampling_filter(plan_cfg),
+                    sample_filter_fn=_make_reject_sampling_filter(
+                        plan_cfg, goal_y_line=goal_y),
                 )
 
             elif planner == "eb-mbd":
-                # EB-MBD: same cost as vanilla MBD (costmap + terminal Euclidean),
-                # OOB on left/right/bottom enforced by the emerging log-barrier
-                # constraint.  With goal_y_line=None the EB constraint is wired
-                # to make_oob_constraint_fn(x_min, x_max, y_min).
+                # EB-MBD (hybrid EB + AL):
+                #   ice    = AL multipliers on per-floe disks (al_rho_ice,
+                #            al_M_max_ice; routed via use_hybrid_eb_al_mbd)
+                #   goal   = main EB barrier on y_T >= goal_y_line  +  smooth
+                #            terminal Euclidean
+                #   OOB    = separate EB barrier (eb_oob_as_constraint=True)
+                # Costmap weight zeroed because ice lives in the AL
+                # constraint, not in J(Y).
+                disks = [
+                    (float(c[0]), float(c[1]), float(r))
+                    for c, r in zip(centroids, radii)
+                ]
+                eb_cfg = replace(plan_cfg, planning_jax_mbd_costmap_weight=0.0)
                 path = optimize_with_diffusion(
-                    init_path, start_pose, goal, cost_map, plan_cfg,
+                    init_path, start_pose, goal, cost_map, eb_cfg,
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
-                    goal_y_line=None,
+                    goal_y_line=goal_y,
+                    goal_y_line_penalty=0.0,
                     terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
                     use_eb_mbd=True,
                     eb_x_min=float(cost_map.x_origin),
@@ -414,6 +452,43 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
                     eb_c_max=EB_C_MAX,
                     eb_mu=EB_MU,
                     eb_kappa=EB_KAPPA,
+                    eb_oob_as_constraint=True,
+                    use_hybrid_eb_al_mbd=True,
+                    hybrid_goal_tolerance=None,
+                    al_rho_ice=AL_RHO_ICE,
+                    al_M_max_ice=AL_M_MAX_ICE,
+                    obstacle_disks=disks,
+                )
+
+            elif planner == "al-mbd":
+                # AL-MBD:
+                #   ice    = AL multipliers on per-floe disks
+                #   goal   = dedicated AL goal-reach column (al_rho_goal,
+                #            goal_y_line)  +  smooth terminal Euclidean
+                #   OOB    = AL column 0 (al_x_min/max/y_min)
+                # Costmap weight zeroed (ice in constraints, not cost).
+                disks = [
+                    (float(c[0]), float(c[1]), float(r))
+                    for c, r in zip(centroids, radii)
+                ]
+                al_cfg = replace(plan_cfg, planning_jax_mbd_costmap_weight=0.0)
+                path = optimize_with_diffusion(
+                    init_path, start_pose, goal, cost_map, al_cfg,
+                    start_nu=(2.0, 0.0, 0.0),
+                    warm_start=False,
+                    goal_y_line=goal_y,
+                    goal_y_line_penalty=0.0,
+                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    oob_penalty=0.0,
+                    use_al_mbd=True,
+                    al_x_min=float(cost_map.x_origin),
+                    al_x_max=float(cost_map.x_origin + cost_map.width),
+                    al_y_min=float(cost_map.y_origin),
+                    al_rho=AL_RHO,
+                    al_M_max=AL_M_MAX,
+                    al_M_init_oob=AL_M_INIT_OOB,
+                    al_rho_goal=AL_RHO_GOAL,
+                    obstacle_disks=disks,
                 )
 
             elif planner == "mppi":
@@ -426,7 +501,7 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
                     goal_y_line=None,
-                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    terminal_goal_distance_weight=1.0,
                     y_bottom=float(Y_LO),
                 )
 
@@ -438,7 +513,7 @@ def _make_replan_callback(planner: str, plan_cfg, radii, planning_times: list):
                     start_nu=(2.0, 0.0, 0.0),
                     warm_start=False,
                     goal_y_line=None,
-                    terminal_goal_distance_weight=TERMINAL_GOAL_DISTANCE_WEIGHT,
+                    terminal_goal_distance_weight=1.0,
                     y_bottom=float(Y_LO),
                 )
 

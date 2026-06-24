@@ -37,6 +37,13 @@ Usage
   # Custom params
   uv run python examples/toy_mbd_scenarios.py --scenario sequential_gates --method eb_mbd \\
       --eb-c-max 2000 --eb-mu 60000
+
+  # Reproduce the icebreaker full-map EB-MBD configuration exactly
+  # (see docs/EB_MBD_ICEBREAKER_SETUP.md — goal_y_line barrier + goal_x soft
+  #  cost + one-sided OOB barrier hard from step 0; pass --nsample 2048 to
+  #  match the icebreaker sample budget too).
+  uv run python examples/toy_mbd_scenarios.py --scenario thin_corridor \\
+      --method eb_mbd_icebreaker --nsample 2048
 """
 from __future__ import annotations
 
@@ -52,6 +59,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
+import jax.numpy as jnp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -64,7 +72,13 @@ from scipy.ndimage import maximum_filter
 from medea_ice_ship.config import get_default_run_config
 from medea_ice_ship.jax_costmap import JaxCostMapResult, build_costmap_jax
 from medea_ice_ship.jax_dial_mpc_planner import dial_mpc_optimize
-from medea_ice_ship.jax_mbd_planner import jax_mbd_optimize, rrt_path_on_costmap, astar_path_on_costmap
+from medea_ice_ship.jax_mbd_planner import (
+    jax_mbd_optimize,
+    rrt_path_on_costmap,
+    astar_path_on_costmap,
+    make_waypoint_cost_fn,
+    run_waypoint_mbd,
+)
 from medea_ice_ship.planning import create_medea_lattice_planner, plan_path
 from medea_ice_ship.visualization import _animation_writer
 from dpdem.planning.cost_map import CostMap as DpdemCostMap
@@ -164,9 +178,17 @@ def _build_thin_corridor(run_cfg, inflate=True):
 
 
 def _build_sequential_gates(run_cfg, inflate=True):
-    """Two rectangular blocks: right gate at lower level, left gate at upper."""
-    BLOCK1 = (0.0, 600.0, 400.0, 550.0)    # leaves right gate x=[600,800] (200 m)
-    BLOCK2 = (200.0, 800.0, 800.0, 950.0)  # leaves left gate  x=[0,200]   (200 m)
+    """Two rectangular blocks: right gate at lower level, left gate at upper.
+
+    Each block extends 100 m PAST the OOB wall on the side adjacent to it
+    (BLOCK1 left past x_min, BLOCK2 right past x_max).  This eliminates the
+    zero-width corridor between the block edge and the OOB wall that AL-MBD
+    can otherwise exploit (g_ice = g_oob = 0 simultaneously on the edge).
+    The visible domain (xlim) is unchanged because we clip the plot to
+    [X_MIN-WALL_W-5, X_MAX+WALL_W+5].
+    """
+    BLOCK1 = (-100.0, 600.0, 400.0, 550.0)   # right gate x=[600,800] (200 m)
+    BLOCK2 = ( 200.0, 900.0, 800.0, 950.0)   # left  gate x=[0,200]   (200 m)
     cm = _rect_costmap([BLOCK1, BLOCK2], run_cfg, inflate=inflate)
     return cm, {"rects": [BLOCK1, BLOCK2], "disks": []}
 
@@ -664,27 +686,152 @@ def generate_eb_barrier_movie(diag: dict, out_path: str) -> None:
     print(f"  Saved: {out_path}", flush=True)
 
 
+# ── EB-MBD per-constraint schedule plot ─────────────────────────────────────────
+
+def generate_eb_per_constraint_plot(diag: dict, out_path: str) -> None:
+    """Per-constraint barrier-offset + alive-fraction evolution for EB-MBD.
+
+    Constraint convention follows the EB wiring in jax_mbd_optimize when
+    --eb-decouple-oob is set + obstacle_rects is provided:
+      main barrier (c_s)      → rect/gate constraint (gates emerge late)
+      oob barrier (c_s_oob)   → OOB (hard from step 0 when eb_c_max_oob=0)
+      ice barrier (c_s_ice)   → separate ice barrier (when wired)
+
+    Renders one curve per active constraint group.  Skips the plot if there's
+    nothing beyond the main barrier (degenerate to existing barrier movie).
+    """
+    offsets_main = diag.get("barrier_offsets", [])
+    offsets_oob  = diag.get("barrier_offsets_oob", [])
+    offsets_ice  = diag.get("barrier_offsets_ice", [])
+    alive_main   = diag.get("alive_fracs", [])
+    alive_oob    = diag.get("alive_fracs_oob", [])
+    alive_ice    = diag.get("alive_fracs_ice", [])
+    if not offsets_main:
+        print("  No EB barrier data — skipping per-constraint plot.", flush=True)
+        return
+    if not offsets_oob and not offsets_ice:
+        print("  No decoupled EB constraints — skipping per-constraint plot.", flush=True)
+        return
+
+    n_steps = len(offsets_main)
+    steps   = np.arange(n_steps)
+
+    series = []     # (label, c_s array, alive array, colour)
+    # Main barrier: in the AL-parity setup this is the rect/gate schedule.
+    series.append(("Gate (rect)", np.asarray(offsets_main),
+                   np.asarray(alive_main) if alive_main else None, "tab:orange"))
+    if offsets_oob:
+        series.append(("OOB", np.asarray(offsets_oob),
+                       np.asarray(alive_oob) if alive_oob else None, "tab:blue"))
+    if offsets_ice:
+        series.append(("Ice", np.asarray(offsets_ice),
+                       np.asarray(alive_ice) if alive_ice else None, "tab:green"))
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    for label, c_arr, _, color in series:
+        axes[0].plot(steps, c_arr, color=color, label=label, lw=2)
+    axes[0].set_ylabel("Barrier offset c_s [m]")
+    axes[0].set_title("EB-MBD: Per-constraint barrier schedule")
+    axes[0].legend(fontsize=8, loc="best"); axes[0].grid(True, alpha=0.3)
+
+    for label, _, alive_arr, color in series:
+        if alive_arr is None:
+            continue
+        axes[1].plot(steps, alive_arr * 100, color=color, label=label, lw=2)
+    axes[1].axhline(100, color="black", lw=0.8, ls=":")
+    axes[1].set_ylabel("Alive samples [%]   (g + c_s > 0)")
+    axes[1].set_xlabel("Diffusion step (N → 1)")
+    axes[1].set_ylim(-2, 105)
+    axes[1].legend(fontsize=8, loc="best"); axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"  Saved: {out_path}", flush=True)
+
+
 # ── AL-MBD multiplier plot ───────────────────────────────────────────────────────
 
 def generate_al_multiplier_plot(diag: dict, out_path: str) -> None:
-    mul_means  = diag.get("multiplier_means", [])
-    mul_maxes  = diag.get("multiplier_maxes", [])
-    violations = diag.get("constraint_violations", [])
-    if not mul_means:
-        print("  No AL multiplier data — skipping.", flush=True)
+    """Per-column multiplier + violation evolution.
+
+    Column convention (set by jax_mbd_optimize's AL constraint construction):
+      col 0   → OOB (left/right/bottom box from make_al_per_step_constraints_fn)
+      col 1+  → rectangle obstacles (one column per rect from
+                make_rect_obstacles_al_fn), labelled "Gate k" here.
+
+    Falls back to the legacy aggregate plot when per-column data is absent.
+    """
+    means_pc = diag.get("multiplier_means_per_col", [])
+    maxes_pc = diag.get("multiplier_maxes_per_col", [])
+    viol_pc  = diag.get("constraint_violations_per_col", [])
+
+    if not means_pc:
+        # Legacy aggregate fallback
+        mul_means  = diag.get("multiplier_means", [])
+        mul_maxes  = diag.get("multiplier_maxes", [])
+        violations = diag.get("constraint_violations", [])
+        if not mul_means:
+            print("  No AL multiplier data — skipping.", flush=True)
+            return
+        steps = np.arange(len(mul_means))
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        axes[0].plot(steps, mul_means, label="Mean multiplier", color="steelblue")
+        axes[0].plot(steps, mul_maxes, label="Max multiplier",  color="tomato", ls="--")
+        axes[0].set_ylabel("Multiplier M")
+        axes[0].set_title("AL-MBD: Multiplier evolution across diffusion steps")
+        axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
+        axes[1].plot(steps, violations, color="darkorange", label="Mean violation")
+        axes[1].axhline(0, color="black", lw=0.8, ls="--")
+        axes[1].set_ylabel("Violation (m, mean)")
+        axes[1].set_xlabel("Diffusion step (N → 1)")
+        axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=120)
+        plt.close(fig)
+        print(f"  Saved: {out_path}", flush=True)
         return
-    steps = np.arange(len(mul_means))
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    axes[0].plot(steps, mul_means, label="Mean multiplier", color="steelblue")
-    axes[0].plot(steps, mul_maxes, label="Max multiplier",  color="tomato", ls="--")
-    axes[0].set_ylabel("Multiplier M")
-    axes[0].set_title("AL-MBD: Multiplier evolution across diffusion steps")
-    axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
-    axes[1].plot(steps, violations, color="darkorange", label="Mean constraint violation")
-    axes[1].axhline(0, color="black", lw=0.8, ls="--")
-    axes[1].set_ylabel("Violation (m, mean)")
-    axes[1].set_xlabel("Diffusion step (N → 1)")
-    axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
+
+    means_pc = np.asarray(means_pc)   # (N_steps, n_g)
+    maxes_pc = np.asarray(maxes_pc)
+    viol_pc  = np.asarray(viol_pc)
+    n_steps, n_g = means_pc.shape
+    steps = np.arange(n_steps)
+
+    def _label(j: int) -> str:
+        if j == 0:
+            return "OOB"
+        return f"Gate {j}"
+
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+              "tab:brown", "tab:pink", "tab:olive", "tab:cyan"]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+
+    # Top: mean multiplier per column
+    for j in range(n_g):
+        c = colors[j % len(colors)]
+        axes[0].plot(steps, means_pc[:, j], color=c, label=_label(j))
+    axes[0].set_ylabel("Mean multiplier (over H steps)")
+    axes[0].set_title("AL-MBD: Per-constraint multiplier and violation evolution")
+    axes[0].legend(fontsize=8, loc="best"); axes[0].grid(True, alpha=0.3)
+
+    # Middle: max multiplier per column
+    for j in range(n_g):
+        c = colors[j % len(colors)]
+        axes[1].plot(steps, maxes_pc[:, j], color=c, label=_label(j))
+    axes[1].set_ylabel("Max multiplier (over H steps)")
+    axes[1].legend(fontsize=8, loc="best"); axes[1].grid(True, alpha=0.3)
+
+    # Bottom: mean constraint violation per column
+    for j in range(n_g):
+        c = colors[j % len(colors)]
+        axes[2].plot(steps, viol_pc[:, j], color=c, label=_label(j))
+    axes[2].axhline(0, color="black", lw=0.8, ls="--")
+    axes[2].set_ylabel("Mean violation (m)")
+    axes[2].set_xlabel("Diffusion step (N → 1)")
+    axes[2].legend(fontsize=8, loc="best"); axes[2].grid(True, alpha=0.3)
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -760,22 +907,42 @@ def run_one_method(
         cost_map_search = cost_map
 
     # Method flags
-    use_eb       = method == "eb_mbd"
-    use_eb_rrt   = method == "eb_rrt_mbd"
-    use_eb_astar = method == "eb_astar_mbd"
-    use_al       = method == "al_mbd"
-    use_rej      = method == "reject_mbd"
+    use_eb_hybrid     = method == "al_mbd_eb_hybrid"
+    # eb_mbd_icebreaker mirrors docs/EB_MBD_ICEBREAKER_SETUP.md exactly:
+    # goal_y_line barrier + goal_x_weight=1 soft cost + one-sided OOB barrier
+    # (hard from step 0), no terminal Euclidean penalty.
+    use_eb_icebreaker = method == "eb_mbd_icebreaker"
+    use_eb            = (method == "eb_mbd") or use_eb_hybrid or use_eb_icebreaker
+    use_eb_rrt        = method == "eb_rrt_mbd"
+    use_eb_astar      = method == "eb_astar_mbd"
+    use_al_goalhard   = method == "al_mbd_goalhard"
+    use_al            = (method == "al_mbd") or use_al_goalhard
+    use_rej           = method == "reject_mbd"
     _algo_map = {
-        "mbd":          "MBD",
-        "eb_mbd":       "EB-MBD",
-        "eb_rrt_mbd":   "EB-RRT-MBD",
-        "eb_astar_mbd": "EB-A*-MBD",
-        "reject_mbd":   "Reject-MBD",
-        "al_mbd":       "AL-MBD",
+        "mbd":               "MBD",
+        "eb_mbd":            "EB-MBD",
+        "eb_mbd_icebreaker": "EB-MBD-icebreaker",
+        "eb_rrt_mbd":        "EB-RRT-MBD",
+        "eb_astar_mbd":      "EB-A*-MBD",
+        "reject_mbd":        "Reject-MBD",
+        "al_mbd":            "AL-MBD",
+        "al_mbd_goalhard":   "AL-MBD-goalhard",
+        "al_mbd_eb_hybrid":  "AL-EB-hybrid",
     }
     algo_name = _algo_map.get(method, method.upper())
 
-    sample_filter_fn = _make_reject_filter(cost_map, run_cfg) if use_rej else None
+    # For the icebreaker EB configuration the soft goal-x term is the only
+    # cost beyond costmap_integral, so we override run_cfg locally to enable
+    # planning_jax_mbd_goal_x_weight=1.0 (toy default zeroes it because the
+    # other methods use a terminal Euclidean penalty instead).
+    if use_eb_icebreaker:
+        run_cfg = replace(run_cfg, planning_jax_mbd_goal_x_weight=1.0)
+
+    # Reject-MBD wires the filter into vanilla MBD; the EB+AL hybrid uses it
+    # for OOB rejection (replacing the EB OOB barrier). Both share the
+    # _make_reject_filter implementation (hull-aware OOB + y_min check).
+    sample_filter_fn = (_make_reject_filter(cost_map, run_cfg)
+                        if (use_rej or use_eb_hybrid) else None)
 
     # Geometric warm start: RRT or A* path for warm-started methods
     rrt_lattice_path = None
@@ -834,9 +1001,21 @@ def run_one_method(
         # EB barrier for EB-*-MBD, last-step clause for AL-MBD) and the
         # goal-x soft cost.  Replaced by a single smooth terminal cost
         # weight * ||traj[-1, :2] - goal_xy||.
-        goal_y_line=None,
+        # goalhard variant enables the dedicated AL goal-reach column; the
+        # EB+AL hybrid uses goal_y_line for the EB goal barrier UNLESS
+        # --no-goal-barrier is set (then the goal lives only in the terminal
+        # Euclidean cost). All other methods keep the soft terminal cost.
+        goal_y_line=(
+            None if (use_eb_hybrid and args.no_goal_barrier)
+            else GOAL_LINE if (use_al_goalhard or use_eb_hybrid or use_eb_icebreaker)
+            else None
+        ),
         goal_y_line_penalty=0.0,
-        terminal_goal_distance_weight=args.terminal_goal_distance_weight,
+        # Icebreaker EB setup uses goal_x_weight (read from run_cfg) as the
+        # only soft goal cost — terminal Euclidean penalty must be 0.
+        terminal_goal_distance_weight=(
+            0.0 if use_eb_icebreaker else args.terminal_goal_distance_weight
+        ),
         # No Big-M OOB penalty.  Reject-MBD enforces OOB via its reject filter,
         # EB-MBD via the emerging barrier, AL-MBD via dual-ascent constraints.
         # Vanilla MBD gets no OOB handling (by design).
@@ -849,17 +1028,67 @@ def run_one_method(
         cost_truncate_y=Y_MAX,
         sample_filter_fn=sample_filter_fn,
         max_resample_iters=None,
-        # EB-MBD (also active for EB-RRT-MBD, EB-A*-MBD)
+        # EB-MBD (also active for EB-RRT-MBD, EB-A*-MBD, and the EB+AL hybrid)
         use_eb_mbd=use_eb or use_eb_rrt or use_eb_astar,
+        # Hybrid EB + AL: goal & OOB via EB barriers, ice via AL multipliers.
+        # The toy script feeds geo_info["rects"] as obstacle_rects (via the
+        # --ice-as-constraint flag); the planner builds the AL ice column from
+        # those when use_hybrid_eb_al_mbd=True.
+        use_hybrid_eb_al_mbd=use_eb_hybrid,
+        al_rho_ice=args.al_rho,
+        al_M_max_ice=args.al_M_max,
+        hybrid_goal_tolerance=args.hybrid_goal_tolerance,
         eb_x_min=X_MIN, eb_x_max=X_MAX, eb_y_min=Y_MIN,
         eb_c_max=args.eb_c_max, eb_mu=args.eb_mu, eb_kappa=args.eb_kappa,
         eb_oob_cost=args.eb_oob_cost,
+        # Hybrid forces a separate OOB barrier (eb_oob_as_constraint=True);
+        # combined with eb_c_max_oob=0 this is "OOB hard from step 0".
+        # The icebreaker EB setup also uses a one-sided OOB barrier.
+        eb_oob_as_constraint=use_eb_hybrid or use_eb_icebreaker,
+        eb_decouple_oob=args.eb_decouple_oob,
+        # eb_mbd_icebreaker forces a strict OOB margin that clamps to 0
+        # almost immediately: 50 m safety margin at step 0 (i_rev=N-1), driven
+        # to < 1 m by step ~14/50 (≈ first quarter) with κ_oob=10 (independent
+        # of the goal/main schedule which keeps κ=1, so the goal barrier still
+        # relaxes 1500 → 0 linearly). Either CLI flag overrides the defaults.
+        eb_c_max_oob=(
+            args.eb_c_max_oob if (args.eb_c_max_oob != 0.0 or not use_eb_icebreaker)
+            else -50.0
+        ),
+        eb_kappa_oob=(
+            args.eb_kappa_oob if args.eb_kappa_oob is not None
+            else (10.0 if use_eb_icebreaker else None)
+        ),
         # AL-MBD
         use_al_mbd=use_al,
         al_x_min=X_MIN, al_x_max=X_MAX, al_y_min=Y_MIN,
         al_rho=args.al_rho, al_M_max=args.al_M_max,
-        # Hard rectangular obstacles (EB/AL only)
-        obstacle_rects=sc.obstacle_rects,
+        al_M_init_oob=args.al_m_init_oob,
+        al_rho_oob=args.al_rho_oob,
+        # AL-MBD z-score variant (al_mbd_zscore_reference.md). When --al-zscore
+        # is set we also default to the reference base cost (controlled by
+        # --al-reference-cost). Both default off so legacy al_mbd behaviour
+        # is unchanged.
+        use_al_zscore=(use_al and args.al_zscore),
+        al_zscore_temperature=args.al_zscore_temperature,
+        use_al_reference_cost=(use_al and args.al_reference_cost),
+        # Dedicated goal-reach AL column (ρ_goal ≫ ρ_ice). Only set when the
+        # caller explicitly requests the goalhard variant — otherwise leave
+        # None so legacy al_mbd behaviour is unchanged.
+        al_rho_goal=(args.al_rho_goal if use_al_goalhard else None),
+        # Hard obstacles (EB/AL only).  When --ice-as-constraint is set we
+        # fall back to the geometry stored in geo_info so each scenario's ice
+        # gets routed as an AL constraint instead of a cost-map term.
+        obstacle_rects=(
+            sc.obstacle_rects if sc.obstacle_rects is not None
+            else (geo_info.get("rects") or None)
+                 if (args.ice_as_constraint or use_eb_hybrid)
+            else None
+        ),
+        obstacle_disks=(
+            (geo_info.get("disks") or None)
+            if (args.ice_as_constraint or use_eb_hybrid) else None
+        ),
     )
     planning_time = time.perf_counter() - _t0
 
@@ -933,6 +1162,10 @@ def run_one_method(
     if use_eb or use_eb_rrt or use_eb_astar:
         print("  Generating EB barrier movie...", flush=True)
         generate_eb_barrier_movie(diag, str(out_dir / "eb_barrier_schedule.mp4"))
+        print("  Generating EB per-constraint schedule plot...", flush=True)
+        generate_eb_per_constraint_plot(
+            diag, str(out_dir / "eb_per_constraint_schedule.png"),
+        )
 
     if use_al:
         print("  Generating AL-MBD multiplier plot...", flush=True)
@@ -1356,6 +1589,159 @@ def run_lattice_method(
     return metrics
 
 
+# ── Waypoint-MBD runner ─────────────────────────────────────────────────────────
+# Reframes MBD as direct optimisation over (x, y) waypoints with fixed endpoints
+# (start, goal). No dynamics rollout; the trajectory IS the polyline scored
+# against the AUTO-IceNav KE costmap. Heading is synthesised post-hoc from the
+# path tangent so downstream plot helpers can consume the (H+1, 3) format.
+
+def run_waypoint_method(
+    sc: ScenarioCfg,
+    cost_map,
+    geo_info: dict,
+    run_cfg,
+    args,
+    out_dir: Path,
+) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    algo_name = "waypoint_mbd"
+
+    start_xy = (float(sc.start[0]), float(sc.start[1]))
+    goal_xy  = (float(sc.goal[0]),  float(sc.goal[1]))
+    chord_len = math.hypot(goal_xy[0] - start_xy[0], goal_xy[1] - start_xy[1])
+
+    n_interior  = int(args.waypoint_n_interior)
+    lat_scale   = args.waypoint_lat_scale_frac   * chord_len
+    along_scale = args.waypoint_along_scale_frac * chord_len / (n_interior + 1)
+
+    grid = jnp.asarray(cost_map.cost_map, dtype=jnp.float32)
+    meta = {
+        "x_origin":   cost_map.x_origin,
+        "y_origin":   cost_map.y_origin,
+        "resolution": cost_map.resolution,
+        "rows":       cost_map.rows,
+        "cols":       cost_map.cols,
+    }
+
+    cost_fn = make_waypoint_cost_fn(
+        grid, meta,
+        start_xy=start_xy, goal_xy=goal_xy,
+        n_interior=n_interior,
+        along_scale=along_scale,
+        lat_scale=lat_scale,
+        n_dense_per_seg=int(args.waypoint_dense_per_seg),
+        costmap_weight=1.0,
+        length_weight=float(args.waypoint_length_weight),
+        oob_penalty=float(args.waypoint_oob_penalty),
+    )
+
+    print(f"\n[{sc.name}] Running waypoint_mbd "
+          f"(n_interior={n_interior}, lat_scale={lat_scale:.1f} m, "
+          f"along_scale={along_scale:.2f} m, "
+          f"Nsample={args.nsample}, Ndiffuse={args.ndiffuse}) ...", flush=True)
+
+    _t0 = time.perf_counter()
+    Y_final, cost_means_j, cost_mins_j = run_waypoint_mbd(
+        cost_fn,
+        n_interior=n_interior,
+        D=2,
+        Nsample=int(args.nsample),
+        Ndiffuse=int(args.ndiffuse),
+        temperature=float(args.temperature),
+        beta0=float(run_cfg.planning_jax_mbd_beta0),
+        betaT=float(run_cfg.planning_jax_mbd_betaT),
+        seed=int(args.waypoint_seed),
+    )
+    planning_time = time.perf_counter() - _t0
+    cost_means = np.asarray(cost_means_j)
+    cost_mins  = np.asarray(cost_mins_j)
+
+    # Reconstruct world polyline from the optimised normalised offsets.
+    start_arr = np.array(start_xy, dtype=np.float32)
+    goal_arr  = np.array(goal_xy,  dtype=np.float32)
+    chord     = goal_arr - start_arr
+    e_along   = chord / (np.linalg.norm(chord) + 1e-8)
+    e_lat     = np.array([-e_along[1], e_along[0]], dtype=np.float32)
+    frac      = np.arange(1, n_interior + 1, dtype=np.float32) / float(n_interior + 1)
+    P0        = start_arr[None] + frac[:, None] * chord[None]
+    Y_np      = np.asarray(Y_final)
+    offset    = (Y_np[:, 0:1] * along_scale) * e_along + (Y_np[:, 1:2] * lat_scale) * e_lat
+    interior  = P0 + offset
+    path_xy   = np.concatenate([start_arr[None], interior, goal_arr[None]], axis=0)
+
+    # Post-hoc heading from forward tangent; last vertex copies its predecessor.
+    diffs        = np.diff(path_xy, axis=0)
+    headings_seg = np.arctan2(diffs[:, 1], diffs[:, 0])
+    headings     = np.concatenate([headings_seg, headings_seg[-1:]])
+    mean_traj    = np.column_stack([path_xy, headings]).astype(np.float32)
+    best_traj    = mean_traj   # no separate sample-best tracked
+
+    # Metrics (same structure as run_one_method).
+    path_length = float(np.sum(np.linalg.norm(diffs, axis=1)))
+    traj_cost   = float(sum(cost_map.get_cost_world(float(x), float(y))
+                            for x, y in mean_traj[:, :2]))
+    _ys = mean_traj[:, 1]; _xs = mean_traj[:, 0]
+    _cross    = int(np.argmax(_ys >= GOAL_LINE)) if np.any(_ys >= GOAL_LINE) else -1
+    x_at_goal = float(mean_traj[_cross, 0]) if _cross >= 0 else float("nan")
+    _oob_xs   = (_xs < X_MIN) | (_xs > X_MAX)
+    _oob_ys   = (_ys < Y_MIN)
+    traj_oob  = bool(np.any(_oob_xs | _oob_ys))
+    reaches_goal_clean = _cross >= 0 and X_MIN <= x_at_goal <= X_MAX and not traj_oob
+
+    metrics = {
+        "method":        algo_name,
+        "planning_time": planning_time,
+        "traj_cost":     traj_cost,
+        "path_length":   path_length,
+        "reaches_goal":  reaches_goal_clean,
+        "traj_oob":      traj_oob,
+        "x_at_goal":     x_at_goal,
+        "goal_x":        sc.goal[0],
+    }
+
+    print(f"\n{'─'*58}", flush=True)
+    print(f"  PLANNING METRICS  ({algo_name})  —  {sc.name}", flush=True)
+    print(f"{'─'*58}", flush=True)
+    print(f"  Planning time  : {planning_time:.1f} s", flush=True)
+    print(f"  Traj cost      : {traj_cost:.1f}  (raw costmap)", flush=True)
+    print(f"  Path length    : {path_length:.1f} m  (straight line ≈ {chord_len:.0f} m)", flush=True)
+    print(f"  Reaches goal   : {'yes' if reaches_goal_clean else 'NO'}"
+          f"{' (OOB!)' if _cross >= 0 and not reaches_goal_clean else ''}", flush=True)
+    if _cross >= 0:
+        print(f"  x at goal      : {x_at_goal:.1f} m  (goal x = {sc.goal[0]:.0f} m)", flush=True)
+    print(f"  OOB violation  : {'YES' if traj_oob else 'no'}", flush=True)
+    if len(cost_means):
+        print(f"  Diffusion cost : mean {float(cost_means[0]):.2f} → "
+              f"{float(cost_means[-1]):.2f}   "
+              f"min {float(cost_mins[0]):.2f} → {float(cost_mins[-1]):.2f}", flush=True)
+    print(f"{'─'*58}\n", flush=True)
+
+    plot_costmap(cost_map, geo_info, sc, str(out_dir / "costmap.png"))
+    plot_result(cost_map, geo_info, sc, mean_traj, best_traj,
+                float(cost_means[-1]) if len(cost_means) else float("nan"),
+                float(cost_mins[-1])  if len(cost_mins)  else float("nan"),
+                algo_name, str(out_dir / "result.png"),
+                rrt_path=None, warmstart_traj=None)
+
+    if len(cost_means):
+        fig, ax = plt.subplots(figsize=(6.5, 3.5))
+        steps = np.arange(len(cost_means))
+        ax.plot(steps, cost_means, label="mean", color="C0", lw=1.5)
+        ax.plot(steps, cost_mins,  label="min",  color="C2", lw=1.5)
+        ax.set_xlabel("Diffusion step (early → late)")
+        ax.set_ylabel("Cost")
+        ax.set_title(f"Waypoint-MBD cost vs diffusion step — {sc.name}")
+        if float(cost_means.min()) > 0 and float(cost_means.max()) / max(float(cost_means.min()), 1e-9) > 50:
+            ax.set_yscale("log")
+        ax.grid(True, alpha=0.3); ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / "cost_trace.png", dpi=120)
+        plt.close(fig)
+
+    print(f"  Done. Outputs in {out_dir}", flush=True)
+    return metrics
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1368,8 +1754,10 @@ def main():
         required=True,
         help="Scenario to run",
     )
-    _method_choices = ["mbd", "eb_mbd", "eb_rrt_mbd", "eb_astar_mbd", "reject_mbd",
-                       "al_mbd", "lattice", "dial_mpc"]
+    _method_choices = ["mbd", "eb_mbd", "eb_mbd_icebreaker",
+                       "eb_rrt_mbd", "eb_astar_mbd", "reject_mbd",
+                       "al_mbd", "al_mbd_goalhard", "al_mbd_eb_hybrid",
+                       "lattice", "dial_mpc", "waypoint_mbd"]
     parser.add_argument(
         "--method",
         choices=_method_choices,
@@ -1397,9 +1785,81 @@ def main():
     # Default 0.0 so OOB is handled purely by EB barriers (EB-MBD) or AL
     # constraints (AL-MBD).  Backup: previous default was 5.0.
     parser.add_argument("--eb-oob-cost", type=float, default=0.0)
+    # Decouple OOB barrier from rect/gate barrier: when set + obstacle_rects
+    # is provided, constraint_fn becomes rect-only (gates emerge late under
+    # the eb_c_max schedule) and OOB gets its own barrier with eb_c_max_oob=0
+    # so it is hard from step 0.  AL-parity analog of --al-rho-oob.
+    parser.add_argument("--eb-decouple-oob", action="store_true",
+                        help="EB-MBD: route OOB through its own barrier "
+                             "(hard from step 0) and reserve eb_c_max for "
+                             "the rect/gate schedule (gates emerge late).")
+    # OOB barrier offset budget. Default 0 = nominal-hard (any waypoint at
+    # the wall is dead). Negative value enforces a safety margin |eb_c_max_oob|
+    # at step 0 that linearly relaxes to 0 by the final step under the
+    # standard (s/S)^κ schedule — i.e. OOB is even harder early on.
+    parser.add_argument("--eb-c-max-oob", type=float, default=0.0)
+    # Separate κ for the OOB barrier (the goal/main barrier keeps using
+    # --eb-kappa). When combined with a negative --eb-c-max-oob, a steeper
+    # κ_oob makes the safety margin clamp to 0 in the first few diffusion
+    # steps instead of relaxing linearly over the whole schedule. None means
+    # "reuse --eb-kappa".  Used in particular by eb_mbd_icebreaker.
+    parser.add_argument("--eb-kappa-oob", type=float, default=None)
     # AL-MBD
     parser.add_argument("--al-rho",   type=float, default=50.0)
     parser.add_argument("--al-M-max", type=float, default=1000.0)
+    # Warm-start value for column 0 of the AL multiplier matrix (the OOB
+    # column built by make_al_per_step_constraints_fn).  Default 0.0 leaves
+    # the cold-start behaviour intact; set to e.g. 500 to make OOB hard
+    # nearly from the first diffusion step.  Rect/ice columns (1+) remain
+    # cold-started so their dual ascent can ramp under the α̅ᵢ schedule.
+    parser.add_argument("--al-m-init-oob", type=float, default=0.0)
+    # Per-column ρ for the OOB column (col 0 of g).  When None (default)
+    # OOB uses the same ρ as rect/ice columns and uniform ρ scaling has no
+    # effect on sample ordering in the all-infeasible regime.  Set this
+    # >> al_rho (e.g. 5000) to make samples with smaller OOB violations
+    # dominate the softmax winner even when no sample is fully feasible.
+    parser.add_argument("--al-rho-oob", type=float, default=None)
+    # ρ for the dedicated goal-reach AL column (al_mbd_goalhard only).  Set
+    # MUCH larger than --al-rho so the augmented Lagrangian dual ascent on the
+    # goal residual outpaces ice penalties, forcing the planner to prioritise
+    # reaching the goal y-line even at the cost of some ice contact.
+    parser.add_argument("--al-rho-goal", type=float, default=50000.0)
+    # Hybrid EB+AL only: when set, removes the EB goal barrier so the goal
+    # is enforced ONLY via the terminal Euclidean cost (no constraint). The
+    # planner builds a trivial constraint_fn that returns a constant, so the
+    # barrier term drops out of the softmax weights.
+    parser.add_argument("--no-goal-barrier", action="store_true")
+    # Hybrid EB+AL only: tolerance (m) for a goal-POINT EB constraint
+    # (g = tol − ‖x_T − goal_xy‖).  When omitted (default), the hybrid uses
+    # the legacy y-line constraint (g = y_T − goal_y_line).  Pass a number
+    # to switch to the goal-point ball formulation instead.
+    parser.add_argument("--hybrid-goal-tolerance", type=float, default=None)
+    # When set, treat every scenario's ice as AL constraints (not as a cost-
+    # map term) by (1) zeroing planning_jax_mbd_costmap_weight and (2)
+    # routing geo_info["rects"]/["disks"] into AL constraint columns.  Use
+    # together with --al-rho-oob to make OOB hard from step 0 while ice
+    # constraints emerge under the α̅ᵢ schedule.  AL-MBD only.
+    parser.add_argument("--ice-as-constraint", action="store_true")
+    # AL-MBD z-score softmax weighting (al_mbd_zscore_reference.md). Swaps
+    # the standard softmax(-L/lambda) with softmax(-(L - mean(L))/std(L)/lambda).
+    # NOTE: z-scoring rescales L to ~unit variance, so lambda must shrink
+    # proportionally for the weights to discriminate feasible from infeasible
+    # samples — use --al-zscore-temperature to override the temperature inside
+    # the z-score normalization (defaults to --temperature if not set).
+    parser.add_argument("--al-zscore", action="store_true",
+                        help="AL-MBD: use z-score softmax weighting "
+                             "(softmax(-(L-mean(L))/std(L)/lambda)). AL-MBD only.")
+    parser.add_argument("--al-zscore-temperature", type=float, default=None,
+                        help="Temperature lambda used inside the z-score "
+                             "normalization (defaults to --temperature). The "
+                             "reference uses a much smaller value than the "
+                             "standard MBD temperature.")
+    # AL-MBD reference base cost: per-step distance-to-goal + 0.1*||u|| +
+    # 20*terminal distance.  Drops the costmap integral and goal-line big-M.
+    parser.add_argument("--al-reference-cost", action="store_true",
+                        help="AL-MBD: use the reference J(Y) from "
+                             "al_mbd_zscore_reference.md (per-step + action + "
+                             "terminal). AL-MBD only.")
     # DIAL-MPC (paper-named hyperparameters, defaults from dial-mpc/dial_config.py
     # adapted for this scenario suite's larger horizon).
     parser.add_argument("--dial-hnode",                   type=int,   default=25,
@@ -1423,6 +1883,24 @@ def main():
     parser.add_argument("--inflation", action="store_true",
                         help="Re-enable ship-beam dilation of costmap obstacles "
                              "(off by default — see comment in source)")
+    # waypoint_mbd
+    parser.add_argument("--waypoint-n-interior",       type=int,   default=30,
+                        help="Number of interior (free) waypoints; endpoints are fixed")
+    parser.add_argument("--waypoint-lat-scale-frac",   type=float, default=0.5,
+                        help="Lateral offset bound as a fraction of chord length "
+                             "(default 0.5 → up to ±half-chord lateral deviation)")
+    parser.add_argument("--waypoint-along-scale-frac", type=float, default=0.5,
+                        help="Along-chord offset bound as a fraction of one knot "
+                             "spacing (default 0.5 → ±half a knot slot)")
+    parser.add_argument("--waypoint-dense-per-seg",    type=int,   default=20,
+                        help="Sub-samples per polyline segment for cost integration")
+    parser.add_argument("--waypoint-length-weight",    type=float, default=0.0,
+                        help="Coefficient on path-length term in waypoint cost")
+    parser.add_argument("--waypoint-oob-penalty",      type=float, default=0.0,
+                        help="Big-M cost added per dense sample whose x lands "
+                             "outside the costmap x-extent (matches the legacy "
+                             "MBD OOB penalty mechanism). 0 disables.")
+    parser.add_argument("--waypoint-seed",             type=int,   default=0)
     args = parser.parse_args()
 
     if args.method is None and not args.run_all_methods:
@@ -1456,6 +1934,21 @@ def main():
         # Backup: planning_jax_mbd_length_weight=1.0,
         planning_jax_mbd_length_weight=0.0,
     )
+    # --al-reference-cost drops the costmap integral by construction (the
+    # reference J is per-step goal-pull + action + terminal, no costmap), so
+    # we also need to route ice through AL constraints — otherwise the
+    # planner has zero ice signal.  Force --ice-as-constraint in that case.
+    if args.al_reference_cost and not args.ice_as_constraint:
+        print("  [AL ref-cost] forcing --ice-as-constraint (reference J has "
+              "no costmap term; ice must be wired through AL constraints).",
+              flush=True)
+        args.ice_as_constraint = True
+    if args.ice_as_constraint or "al_mbd_eb_hybrid" in (args.method or []):
+        # Drop the costmap integral from the base cost so ice is enforced
+        # purely through AL multipliers on the rect/disk constraints below.
+        # The EB+AL hybrid implicitly requires this too — it routes ice to
+        # AL multipliers, OOB+goal to EB barriers, and asks for J=0.
+        run_cfg = replace(run_cfg, planning_jax_mbd_costmap_weight=0.0)
 
     # Two costmaps:
     #   cost_map        — un-inflated, used by MBD cost evaluation (hull sampling
@@ -1487,6 +1980,8 @@ def main():
                                    cost_map_search=cost_map_search)
         elif method == "dial_mpc":
             m = run_dial_mpc_method(sc, cost_map, geo_info, run_cfg, args, method_dir)
+        elif method == "waypoint_mbd":
+            m = run_waypoint_method(sc, cost_map, geo_info, run_cfg, args, method_dir)
         else:
             m = run_one_method(method, sc, cost_map, geo_info, run_cfg, args, method_dir,
                                cost_map_search=cost_map_search)

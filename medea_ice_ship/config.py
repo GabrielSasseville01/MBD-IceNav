@@ -293,7 +293,7 @@ class RunConfig:
     # Much faster (DFS-like depth-first toward goal) but paths may be suboptimal.
     planning_greedy: bool = False
     # Receding horizon (AUTO-IceNav style): replan every this many simulated seconds (converted to frames at runtime via dt).
-    planning_replan_every_n_seconds: float = 30.0
+    planning_replan_every_n_seconds: float = 60.0
     # If True, refine A* path with NLP (path length + costmap integral + curvature); requires casadi.
     planning_use_path_optimizer: bool = False
     # Path optimizer: number of waypoints (including start/goal).
@@ -312,6 +312,11 @@ class RunConfig:
     planning_ridge_cost_weight: float = 0.0
     # Ship speed [m/s] for KE cost.
     planning_ship_speed: float = 4.0
+    # If True, MBD-family planners use the rollout's emergent ν to scale the
+    # KE cost cell-by-cell at query time (cells store the per-v² coefficient).
+    # If False, the cells bake in planning_ship_speed (legacy behaviour).
+    # A* uses build_costmap_from_ice_state (separate path) and is unaffected.
+    planning_adaptive_velocity: bool = True
     # Target ship speed [m/s] when planning. If planning_use_target_speed, n_frames is derived so
     # path is traversed at this speed (realistic icebreaker ~4 m/s). Also used in KE collision cost.
     planning_target_speed: float = 4.0
